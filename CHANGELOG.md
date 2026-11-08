@@ -3,6 +3,7 @@
 Fixes, and the market now follows your save.
 
 - **The real grid from your save.** At every Team HQ, Silly Season reads who sits in each seat of your career. Transfers made with the Career Mode Editor, other addons' line-ups and a season already under way all reach the market, and drivers it didn't know join it with their game names.
+- **Careers already in a later season** (2030 in a 2026 career) get the right year: the market follows the game's season, contracts move on with it and veterans no longer on the grid have retired. A market saved in the wrong year by 1.0.0 is mended at the next Team HQ.
 - **Your driver is always found,** a created driver and 2026 careers included (no more "Who are you?").
 - **My Team:** your own team shows in the F7 hub, and your team-mate is protected: no other team signs him.
 - **A new career keeps its market.** The game gives a new career a temporary id until its first save. The market now follows the change, and a career you left before that save finds its market again at the next load.

@@ -386,8 +386,6 @@ void begin_career(const events::Context &ctx, bool fresh)
             g_loaded = false;
             return;
         }
-        if (view && view->year > 0 && view->year != g_state.year)
-            g_state.year = view->year; // an existing career met the addon after its first season
         g_state.season_index = -1;     // the first idle Team HQ says where the career is
         log("[silly-season] career %s (%s): new market for %d, %zu drivers, %zu teams", id.c_str(), group.c_str(),
             g_state.year, g_state.drivers.size(), g_state.teams.size());
@@ -1304,6 +1302,40 @@ void note_session_end(const events::Context &ctx)
     g_session_type = -1;
 }
 
+// g_lock held. A career met in a later season than the baseline's (2030 in a 2026 career): the market's
+// year follows the game's season index, the contracts move on with it and the veterans no longer on the
+// grid have retired. Also mends a market saved by 1.0.0, which stayed in the baseline's year.
+bool realign_year(int season_index)
+{
+    int base = static_cast<int>(g_baseline["careers"][g_state.group]["year"].as_int(0));
+    if (base <= 0 || season_index <= 0)
+        return false;
+    int expected = base + season_index, delta = expected - g_state.year;
+    if (delta <= 0)
+        return false;
+    int retired = 0;
+    g_state.year = expected;
+    for (auto &[id, d] : g_state.drivers) {
+        if (d.contract > 0)
+            d.contract += delta;
+        if (!d.team.empty() && d.contract < expected)
+            d.contract = expected;
+        if (d.team.empty() && !d.retired && d.kind == "f1" && id != g_state.player && !g_state.shielded(id) &&
+            d.age(expected) >= 36) {
+            d.retired = true; // gone from the grid by now
+            ++retired;
+        }
+    }
+    for (ss::Deal &deal : g_state.deals) {
+        deal.year += delta;
+        deal.until += delta;
+    }
+    g_state.preview_year = 0; // the season preview is written again for the right year
+    log("[silly-season] career in season index %d: the market moves from %d to %d (contracts +%d, %d veteran(s) off the "
+        "grid retired)", season_index, expected - delta, expected, delta, retired);
+    return true;
+}
+
 // g_lock held: a fresh market for the loaded career, when the saved one turns out to be another career's
 void reset_market(const char *why, int season_index)
 {
@@ -1317,8 +1349,7 @@ void reset_market(const char *why, int season_index)
         g_loaded = false;
         return;
     }
-    if (season_index > 0)
-        g_state.year += season_index;
+    (void)season_index; // the first visit sets the year from the game's season (realign_year)
     g_state.career = id;
     g_state.group = group;
     g_state.season_index = -1; // the first visit takes the career where it is
@@ -1413,8 +1444,11 @@ void on_hub()
         g_weekend_raced = 0;
         g_weekend_season = -1;
         g_race_ended = g_session_typed = false;
+        if (g_state.season_index >= 0 && g_state.season_index == pos->season_index && realign_year(pos->season_index))
+            ss::season_preview(g_state, s); // a market saved in the wrong year: its preview for the right one
         if (g_state.season_index < 0) {
             // first visit: take the career where it is, without replaying the rounds already raced
+            realign_year(pos->season_index);
             g_state.season_index = pos->season_index;
             g_state.round = std::max(g_state.round, completed);
             g_state.round_base = g_state.round; // no results exist for the rounds raced before

@@ -157,6 +157,22 @@ int main(int argc, char **argv)
         check(g_ov.has_player && g_ov.player_team == "My Team" && g_ov.teammate == "Liam Lawson", "the hub shows the player's own team");
     }
 
+    std::printf("a career met in its fifth season (2029 in a 2025 career)\n");
+    {
+        g_state.group = "f1_career_2025";
+        int before = g_state.driver("max_verstappen")->contract;
+        check(realign_year(4), "the market moves on");
+        check(g_state.year == 2029, "the market's year is 2029");
+        const ss::Driver *v = g_state.driver("max_verstappen");
+        check(v->contract == before + 4 && v->contract >= 2029, "Verstappen's contract moves on four years");
+        check(!realign_year(4), "a second visit changes nothing");
+        bool veterans_off = true;
+        for (const auto &[id, d] : g_state.drivers)
+            if (d.team.empty() && d.kind == "f1" && d.age(2029) >= 36 && !d.retired && !g_state.shielded(id) && id != g_state.player)
+                veterans_off = false;
+        check(veterans_off, "veterans off the grid have retired");
+    }
+
     std::printf("rows that don't look like a grid are left alone\n");
     fake::rows.clear();
     fake::add_row(1, 1, 0, false);
