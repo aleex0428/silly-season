@@ -118,6 +118,24 @@ int main(int argc, char **argv)
     check(g_state.player == "lewis_hamilton" && g_state.player_team == "ferrari", "the player is Hamilton at Ferrari");
     check(g_state.protected_ids.empty(), "nobody is protected");
 
+    std::printf("an eleventh team the baseline doesn't have (Konnersport): its drivers stay where they are\n");
+    grid_rows("", "", "lewis_hamilton");
+    fake::add_row(102, 104, 0, false);
+    fake::add_row(127, 104, 1, false);
+    fake::publish();
+    ok = sync_real_grid();
+    check(ok, "the rows are read");
+    {
+        std::string jackson = driver_for_stat(102);
+        check(g_state.shielded(jackson) && g_state.shielded(driver_for_stat(127)), "both Konnersport drivers are protected");
+        ss::Settings s;
+        update_overlay(s);
+        bool listed = false;
+        for (const UiDriver &u : g_ov.free_agents)
+            listed = listed || u.name == g_state.driver(jackson)->name;
+        check(!listed, "they aren't listed as free agents");
+    }
+
     std::printf("My Team: the human and his team-mate race for a team the baseline doesn't have\n");
     fake::rows.clear();
     for (const ss::Team &t : g_state.teams)

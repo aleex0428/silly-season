@@ -2668,7 +2668,7 @@ std::string report_driver_market(const State &st, const Settings &s)
 {
     std::vector<const Driver *> free;
     for (const auto &[id, d] : st.drivers)
-        if (d.team.empty() && !d.retired && d.kind != "player" && (d.kind != "legend" || s.legends))
+        if (d.team.empty() && !d.retired && d.kind != "player" && !st.shielded(id) && (d.kind != "legend" || s.legends))
             free.push_back(&d);
     std::sort(free.begin(), free.end(), [](const Driver *a, const Driver *b) { return a->potential() > b->potential(); });
     std::string out = text::h_market(L(s)) + "\n";

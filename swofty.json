@@ -262,7 +262,7 @@
       "id": "game_market",
       "type": "choice",
       "label": "Who runs the market",
-      "description": "Silly Season (recommended): the game stops retiring and sacking drivers on its own, so only Silly Season moves them. The game: the game's own retirements and sackings run as well; they can clash with Silly Season's plans and its grid wins at each new season. Applies after restarting the game.",
+      "description": "Silly Season (recommended): the game stops retiring and sacking drivers on its own. The game: its own moves run too and can clash with Silly Season's. Applies after restarting the game.",
       "values": [
         {
           "value": "silly_season",

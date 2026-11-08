@@ -302,6 +302,22 @@ bool load_saved(const std::string &career)
 // taken here and checked at the first Team HQ (same player, not ahead of the game), else started afresh.
 std::string g_adopted_from;
 
+// A career saved before the core named careers by their save slot ("f1_career_2025.driver_career:<guid>")
+// kept its market under the career tracker's key ("dc-00070000"): take it, checked at the first Team HQ.
+bool adopt_tracker_key(const std::string &id)
+{
+    career::State cs{};
+    if (career::state(&cs) != career::Result::ok || !cs.key[0])
+        return false;
+    std::string key(cs.key, strnlen(cs.key, sizeof cs.key));
+    if (key == id || !load_saved(key))
+        return false;
+    g_adopted_from = key;
+    log("[silly-season] career %s: no market under this id; taking the one saved under the career's older id %s, checked "
+        "at Team HQ", id.c_str(), key.c_str());
+    return true;
+}
+
 bool adopt_provisional(const std::string &id, const std::string &group)
 {
     json::Value list = read_provisional();
@@ -361,7 +377,8 @@ void begin_career(const events::Context &ctx, bool fresh)
         return; // created, then loaded: same career
     g_state = ss::State{};
     g_adopted_from.clear();
-    bool have = !fresh && !id.empty() && (load_saved(id) || (!provisional_id(id) && adopt_provisional(id, group)));
+    bool have = !fresh && !id.empty() &&
+                (load_saved(id) || adopt_tracker_key(id) || (!provisional_id(id) && adopt_provisional(id, group)));
     if (!have) {
         std::string err;
         if (!ss::init(g_state, g_baseline, group, seed_for(id), &err)) {
@@ -701,12 +718,13 @@ std::string db_label(uint32_t stat)
     if (!built && db::available()) {
         built = true;
         db::Cursor c{};
-        for (db::Result r = db::open("drivers", &c); r == db::Result::ok; r = db::step(&c)) {
+        for (db::Result r = db::open("entrants.drivers", &c); r == db::Result::ok; r = db::step(&c)) {
             db::Value v{};
             const char *label = db::row_name(&c);
-            if (label && db::cell(&c, "stat_id", &v) == db::Result::ok && v.tag == SWOFTY_DB_INT)
+            if (label && db::cell(&c, "stat_id", &v) == db::Result::ok)
                 labels.emplace(static_cast<uint32_t>(v.i), label);
         }
+        log("[silly-season] game database: %zu driver label(s) in entrants.drivers", labels.size());
     }
     auto it = labels.find(stat);
     return it == labels.end() ? std::string() : it->second;
@@ -757,8 +775,16 @@ std::string known_driver(uint32_t stat)
 // the market's driver for a stat id, added from the game database when the baseline doesn't have him
 std::string driver_for_stat(uint32_t stat)
 {
-    if (std::string id = known_driver(stat); !id.empty())
+    if (std::string id = known_driver(stat); !id.empty()) {
+        // a driver added before his game name could be read ("Driver 102"): name him now
+        ss::Driver *d = g_state.driver(id);
+        if (d && id.rfind("stat_", 0) == 0 && d->name == "Driver " + std::to_string(stat))
+            if (std::string label = db_label(stat); !label.empty()) {
+                d->name = name_from_label(label);
+                log("[silly-season] real grid: driver stat %u is %s", stat, d->name.c_str());
+            }
         return id;
+    }
     std::string label = db_label(stat);
     std::string id = label.empty() ? "stat_" + std::to_string(stat) : label;
     if (!g_state.driver(id)) {
@@ -799,6 +825,7 @@ bool sync_real_grid()
             have_human = true;
         }
     std::string own_mate;
+    std::vector<std::string> elsewhere; // drivers of teams Silly Season doesn't know (Konnersport, another addon's)
     std::vector<ss::GridCar> cars;
     std::vector<std::string> moved;
     size_t unknown_teams = 0;
@@ -816,10 +843,12 @@ bool sync_real_grid()
             driver = driver_for_stat(s.driver);
         }
         if (team.empty()) {
-            if (have_human && s.team == human_team && !s.human)
+            if (have_human && s.team == human_team && !s.human) {
                 own_mate = driver; // the player's own team
-            else if (!s.human)
+            } else if (!s.human) {
                 ++unknown_teams;
+                elsewhere.push_back(driver);
+            }
             continue;
         }
         if (!s.human) {
@@ -844,6 +873,8 @@ bool sync_real_grid()
     g_state.protected_ids.clear();
     if (!own_mate.empty())
         g_state.protected_ids.insert(own_mate);
+    for (const std::string &id : elsewhere)
+        g_state.protected_ids.insert(id); // they race for a team the market doesn't plan: not free agents
     g_own_team_name.clear();
     if (have_human && player_team.empty()) {
         g_own_team_name = "My Team";
@@ -1091,7 +1122,7 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
     std::sort(o.drivers.begin(), o.drivers.end(), [](const UiDriver &a, const UiDriver &b) { return a.value > b.value; });
 
     for (const auto &[id, d] : st.drivers)
-        if (d.team.empty() && !d.retired && !d.retiring && d.kind != "player" && (d.kind != "legend" || s.legends)) {
+        if (d.team.empty() && !d.retired && !d.retiring && d.kind != "player" && !st.shielded(id) && (d.kind != "legend" || s.legends)) {
             UiDriver u = ui_driver(d);
             for (auto it = st.history.rbegin(); it != st.history.rend(); ++it)
                 if (it->driver == id && !it->from.empty()) {
