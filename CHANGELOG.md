@@ -1,7 +1,10 @@
 # 1.0.1
 
-Fixes.
+Fixes, and the market now follows your save.
 
+- **The real grid from your save.** At every Team HQ, Silly Season reads who sits in each seat of your career. Transfers made with the Career Mode Editor, other addons' line-ups and a season already under way all reach the market, and drivers it didn't know join it with their game names.
+- **Your driver is always found,** a created driver and 2026 careers included (no more "Who are you?").
+- **My Team:** your own team shows in the F7 hub, and your team-mate is protected: no other team signs him.
 - **A new career keeps its market.** The game gives a new career a temporary id until its first save. The market now follows the change, and a career you left before that save finds its market again at the next load.
 - **Careers don't mix.** Two careers with the same driver could share a saved market. If the saved market is ahead of the career you load, a fresh one starts.
 - **Race count.** A weekend counts once its race is run. Practice or qualifying alone no longer moves the market a race forward.

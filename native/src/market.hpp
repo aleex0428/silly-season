@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -205,6 +206,10 @@ struct State {
     int next_press_id = 1;
     int player_loyalty = 0;      // -2 (wants out) .. +2 (committed), from the player's answers
     std::string teammate_wish;   // the driver the player asked for
+    // drivers the market leaves alone: the team-mate in the player's own My Team team, whom the game
+    // shows outside every team the market knows. Set from the game's grid at each Team HQ; not saved.
+    std::set<std::string> protected_ids;
+    bool shielded(const std::string &id) const { return protected_ids.count(id) != 0; }
 
     std::vector<std::string> f2_table; // this season's F2 order, best first
     int f2_reported = 0;         // 1: mid-season leader reported, 2: champion reported

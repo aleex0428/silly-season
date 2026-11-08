@@ -84,6 +84,9 @@ The news comes to you without opening any menu:
   driver level. Real results will count once the core exposes them (telemetry).
 - **When a race counts:** once the weekend's race is run. Practice or qualifying alone doesn't move the market.
 - **Your seat is never touched.** Your team-mate can change unless you turn on **Protect my team-mate**.
+- **The grid comes from your save:** at every Team HQ Silly Season reads who sits in each seat, so transfers made with
+  the Career Mode Editor, other addons' line-ups and a season already under way are part of the market. In My Team your
+  own team shows in the hub and your team-mate is never signed by another team.
 
 ### Press conferences
 
@@ -201,7 +204,9 @@ python -I ../_swofty-ref/tools/pack_addon.py . dist
   Playing that career without it lets the game's grid drift away from the market.
 - **Two careers with the same driver** can share one id on the current Swofty core. If a saved market is ahead of the
   career you load, Silly Season starts a fresh market for it rather than mixing them.
-- **My Team:** your own team isn't part of the market, so Silly Season doesn't know who your team-mate is.
+- **Reading the grid** uses the game's entrant rows as Swofty's experimental game headers lay them out. If a game update
+  moves them, Silly Season notices, keeps its own grid and says so in the log (`real grid: not read`).
+- **My Team:** the market doesn't plan your own team: your seats and your team-mate stay yours.
 - **Who runs the market = Silly Season** empties the game's own retirement and sacking lists (the `career.market`
   record, experimental in Swofty). If something looks wrong, switch it to **The game** and restart.
 - **Banner and hub:** they use Swofty's experimental overlay. With frame generation on (DLSS Frame Generation or FSR) it

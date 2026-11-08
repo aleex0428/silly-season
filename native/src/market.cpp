@@ -569,7 +569,7 @@ struct Plan {
 
 bool eligible(const Driver &d, const State &st, const Settings &s)
 {
-    if (d.retired || d.retiring || d.id == st.player || d.kind == "player")
+    if (d.retired || d.retiring || d.id == st.player || d.kind == "player" || st.shielded(d.id))
         return false;
     if (d.kind == "legend" && !s.legends)
         return false;
@@ -1037,7 +1037,7 @@ void midseason(State &st, const Settings &s, Rng &r, int round)
             const Driver *in = nullptr;
             float best = -1e9f;
             for (const auto &[id, c] : st.drivers) {
-                if (!c.team.empty() || c.retired || c.retiring || c.id == st.player || c.kind == "player")
+                if (!c.team.empty() || c.retired || c.retiring || c.id == st.player || c.kind == "player" || st.shielded(c.id))
                     continue;
                 if (c.kind == "legend" && !s.legends)
                     continue;
@@ -1206,7 +1206,8 @@ void maybe_standin(State &st, const Settings &s, Rng &r, int completed)
     const Driver *in = nullptr;
     float best = -1e9f;
     for (const auto &[id, c] : st.drivers) {
-        if (!c.team.empty() || c.retired || c.retiring || c.kind == "legend" || c.kind == "player" || c.id == st.player)
+        if (!c.team.empty() || c.retired || c.retiring || c.kind == "legend" || c.kind == "player" || c.id == st.player ||
+            st.shielded(c.id))
             continue;
         float sc = c.reserve_of == t->id ? 100.0f : c.academy == t->family ? 50.0f : 0.0f;
         sc += value(c) * 0.1f;
@@ -1307,7 +1308,7 @@ void f2_update(State &st, const Settings &s, Rng &r, int round, bool final)
     Rng luck(mix(st.seed, 0xf2f2ull ^ static_cast<uint64_t>(st.year)));
     std::vector<std::pair<float, std::string>> field;
     for (const auto &[id, d] : st.drivers) {
-        if (!d.team.empty() || d.retired || d.kind != "f2" || d.age(st.year) > 27)
+        if (!d.team.empty() || d.retired || d.kind != "f2" || d.age(st.year) > 27 || st.shielded(d.id))
             continue;
         float score = d.overall() * 0.7f + d.potential() * 0.2f + static_cast<float>(luck.normal() * 3.0);
         if (final)
@@ -1488,7 +1489,7 @@ void make_talents(State &st, const Settings &s, Rng &r)
     int want = st.season_index <= 0 ? 2 : s.intensity == Intensity::chaos ? 4 : s.intensity == Intensity::lively ? 3 : 2;
     std::vector<Driver *> pool;
     for (auto &[id, d] : st.drivers) {
-        if (d.name_keys.size() != 2 || !d.team.empty() || d.id == st.player)
+        if (d.name_keys.size() != 2 || !d.team.empty() || d.id == st.player || st.shielded(d.id))
             continue;
         bool busy = std::any_of(st.standins.begin(), st.standins.end(), [&](const State::Standin &sb) { return sb.in == d.id; });
         bool young_talent = d.regen && d.age(st.year) < 24;
@@ -1782,7 +1783,7 @@ std::vector<SeatChange> start_new_season(State &st, const Settings &s, std::vect
         }
     }
     for (auto &[id, d] : st.drivers) {
-        if (!d.team.empty() || d.retired)
+        if (!d.team.empty() || d.retired || st.shielded(d.id))
             continue;
         if (d.contract <= st.year + 1)
             d.contract = 0;

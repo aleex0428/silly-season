@@ -9,17 +9,20 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <span>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <string>
 #include <vector>
 
 #include <swofty/career.hpp>
+#include <swofty/db.hpp>
 #include <swofty/events.hpp>
 #include <swofty/hub.hpp>
 #include <swofty/lang.hpp>
@@ -546,6 +549,8 @@ std::string team_by_stat(uint32_t stat)
     return {};
 }
 
+std::string known_driver(uint32_t stat); // the real grid's lookup (below)
+
 // g_lock held. Puts the player in his team in the model (once, or when he changes team)
 void sync_player()
 {
@@ -558,12 +563,7 @@ void sync_player()
     std::string team = team_by_stat(team_stat);
     if (team.empty())
         team = team_by_stat(cs.player_team);
-    std::string driver;
-    for (const auto &[id, d] : g_state.drivers)
-        if (d.stat == static_cast<int>(driver_stat) && d.kind != "pool") {
-            driver = id;
-            break;
-        }
+    std::string driver = known_driver(driver_stat);
     if (driver.empty())
         driver = g_state.player.empty() ? std::string("player") : g_state.player; // a created driver
     const ss::Team *t = g_state.team(team);
@@ -595,6 +595,285 @@ void sync_player()
     ss::sync_grid(g_state, cars);
     log("[silly-season] player: %s drives for %s (career state: driver stat %u, team stat %u)", driver.c_str(),
         team.c_str(), cs.player_driver, cs.player_team);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The real grid. The career entity holds one entrant row per driver of the career: his driver key, his
+// team, his seat and whether he is the human. The core's own seat operations read the same rows, and the
+// SDK's game headers give their layout (swofty/game/career.hpp, entrants.hpp, marked experimental), so
+// Silly Season reads them at every idle Team HQ: transfers made with the Career Mode Editor, other addons'
+// line-ups, a season already under way and the player himself all come from the game. Every read is
+// guarded; rows that don't look like a grid are left alone and the market keeps its own.
+
+struct RealSeat {
+    uint32_t driver = 0, team = 0; // stat ids
+    int seat = 0;
+    bool human = false;
+};
+
+namespace rows {
+constexpr uintptr_t kEntrantsBegin = 0x2e0, kEntrantsEnd = 0x2e8, kBusy = 0x2f8; // CareerEntity
+constexpr size_t kSize = 0x88, kOrdinal = 0x48, kDriver = 0x50, kTeam = 0x58, kVehicle = 0x5c, kPosition = 0x80;
+constexpr uint32_t kNoKey = 0x3fff0000u, kHumanBit = 0x10000000u;
+constexpr size_t kMaxRows = 512;
+
+// a copy from game memory that a bad address can't crash
+bool copy(void *dst, uintptr_t src, size_t n)
+{
+    if (!src || !n)
+        return false;
+    __try {
+        std::memcpy(dst, reinterpret_cast<const void *>(src), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+template <typename T> T at(const std::vector<uint8_t> &buf, size_t off)
+{
+    T v{};
+    std::memcpy(&v, buf.data() + off, sizeof v);
+    return v;
+}
+} // namespace rows
+
+// the race seats of the loaded career; false (with why) when the rows can't be read or don't look right
+bool read_real_grid(std::vector<RealSeat> &out, std::string &why)
+{
+    out.clear();
+    uintptr_t e = reinterpret_cast<uintptr_t>(career::entity());
+    if (!e) {
+        why = "no career entity";
+        return false;
+    }
+    uintptr_t begin = 0, end = 0;
+    uint8_t busy = 0;
+    if (!rows::copy(&begin, e + rows::kEntrantsBegin, sizeof begin) || !rows::copy(&end, e + rows::kEntrantsEnd, sizeof end) ||
+        !rows::copy(&busy, e + rows::kBusy, sizeof busy)) {
+        why = "the career entity is unreadable";
+        return false;
+    }
+    if (busy) {
+        why = "the game is updating the rows";
+        return false;
+    }
+    if (!begin || end <= begin || (end - begin) % rows::kSize || (end - begin) / rows::kSize > rows::kMaxRows) {
+        why = "the rows don't look like an entrant list";
+        return false;
+    }
+    std::vector<uint8_t> buf(end - begin);
+    if (!rows::copy(buf.data(), begin, buf.size())) {
+        why = "the rows are unreadable";
+        return false;
+    }
+    std::set<std::pair<uint32_t, int>> seats;
+    size_t humans = 0;
+    for (size_t off = 0; off < buf.size(); off += rows::kSize) {
+        uint32_t ordinal = rows::at<uint32_t>(buf, off + rows::kOrdinal), driver = rows::at<uint32_t>(buf, off + rows::kDriver),
+                 team = rows::at<uint32_t>(buf, off + rows::kTeam), vehicle = rows::at<uint32_t>(buf, off + rows::kVehicle);
+        uint16_t position = rows::at<uint16_t>(buf, off + rows::kPosition);
+        bool teamless = (team & 0xffff0000u) == rows::kNoKey, car = (vehicle & 0xffff0000u) != rows::kNoKey;
+        int seat = (position >> 8) ? (position & 0xff) : -1;
+        if (teamless || !car || seat < 0 || seat > 1)
+            continue; // a reserve, a free agent or a driver without a car
+        RealSeat s{driver >> 16, team >> 16, seat, (ordinal & rows::kHumanBit) != 0};
+        if (!seats.insert({s.team, s.seat}).second) {
+            why = "two drivers on one seat";
+            return false;
+        }
+        humans += s.human ? 1 : 0;
+        out.push_back(s);
+    }
+    if (out.size() < 16 || out.size() > 26 || humans > 1) {
+        why = std::to_string(out.size()) + " race seats and " + std::to_string(humans) + " human(s) don't look like a grid";
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+// a driver label from the game database, for a driver the baseline doesn't know (another addon's)
+std::string db_label(uint32_t stat)
+{
+    static std::unordered_map<uint32_t, std::string> labels;
+    static bool built = false;
+    if (!built && db::available()) {
+        built = true;
+        db::Cursor c{};
+        for (db::Result r = db::open("drivers", &c); r == db::Result::ok; r = db::step(&c)) {
+            db::Value v{};
+            const char *label = db::row_name(&c);
+            if (label && db::cell(&c, "stat_id", &v) == db::Result::ok && v.tag == SWOFTY_DB_INT)
+                labels.emplace(static_cast<uint32_t>(v.i), label);
+        }
+    }
+    auto it = labels.find(stat);
+    return it == labels.end() ? std::string() : it->second;
+}
+
+// "2025-williams_carlos_sainz-jr" or "carlos_sainz-jr" -> "Carlos Sainz Jr"
+std::string name_from_label(std::string label)
+{
+    if (size_t dash = label.find('-'); dash != std::string::npos && dash > 0 && std::isdigit(static_cast<unsigned char>(label[0])))
+        label.erase(0, dash + 1);
+    if (size_t us = label.find('_'); us != std::string::npos && label.find('_', us + 1) != std::string::npos)
+        label.erase(0, us + 1); // a team prefix ("williams_carlos_sainz")
+    std::string out;
+    bool up = true;
+    for (char ch : label) {
+        if (ch == '_' || ch == '-') {
+            out += ' ';
+            up = true;
+        } else {
+            out += up ? static_cast<char>(std::toupper(static_cast<unsigned char>(ch))) : ch;
+            up = false;
+        }
+    }
+    return out;
+}
+
+// the market's driver for a stat id: the baseline's own list first (Carlos Sainz is stat 0, which is also
+// what a driver with no stat id holds), then a driver added earlier from the game; "" when unknown
+std::string known_driver(uint32_t stat)
+{
+    static std::unordered_map<uint32_t, std::string> by_stat;
+    static bool built = false;
+    if (!built && g_baseline_ok) {
+        built = true;
+        if (const json::Object *o = g_baseline["drivers"].if_object())
+            for (const auto &[id, v] : *o)
+                if (v["stat"].is_int())
+                    by_stat.emplace(static_cast<uint32_t>(v["stat"].as_int()), id);
+    }
+    if (auto it = by_stat.find(stat); it != by_stat.end() && g_state.driver(it->second))
+        return it->second;
+    for (const auto &[id, d] : g_state.drivers)
+        if (stat != 0 && d.stat == static_cast<int>(stat) && d.kind != "player" && d.kind != "pool")
+            return id;
+    return {};
+}
+
+// the market's driver for a stat id, added from the game database when the baseline doesn't have him
+std::string driver_for_stat(uint32_t stat)
+{
+    if (std::string id = known_driver(stat); !id.empty())
+        return id;
+    std::string label = db_label(stat);
+    std::string id = label.empty() ? "stat_" + std::to_string(stat) : label;
+    if (!g_state.driver(id)) {
+        ss::Driver d;
+        d.id = id;
+        d.name = label.empty() ? "Driver " + std::to_string(stat) : name_from_label(label);
+        d.kind = "f1";
+        d.stat = static_cast<int>(stat);
+        d.born = g_state.year - 27;
+        g_state.drivers.emplace(id, d);
+        log("[silly-season] real grid: driver stat %u is not in the baseline; added as %s", stat, d.name.c_str());
+    }
+    return id;
+}
+
+std::string g_own_team_name;      // the player's own My Team team, shown in the hub ("" when he drives for a known team)
+std::string g_real_grid_said;     // the last outcome logged
+
+// g_lock held: the market takes the game's grid; false when it can't be read (the caller falls back)
+bool sync_real_grid()
+{
+    std::vector<RealSeat> seats;
+    std::string why;
+    if (!read_real_grid(seats, why)) {
+        std::string said = "unread: " + why;
+        if (said != g_real_grid_said) {
+            g_real_grid_said = said;
+            log("[silly-season] real grid: not read (%s); the market keeps its own grid", why.c_str());
+        }
+        return false;
+    }
+    // the player's team, and his team-mate when the team is his own (My Team): no team of the baseline
+    uint32_t human_team = 0;
+    bool have_human = false;
+    for (const RealSeat &s : seats)
+        if (s.human) {
+            human_team = s.team;
+            have_human = true;
+        }
+    std::string own_mate;
+    std::vector<ss::GridCar> cars;
+    std::vector<std::string> moved;
+    size_t unknown_teams = 0;
+    std::string player, player_team;
+    for (const RealSeat &s : seats) {
+        std::string team = team_by_stat(s.team);
+        std::string driver;
+        if (s.human) {
+            driver = known_driver(s.driver);
+            if (driver.empty())
+                driver = g_state.player.empty() ? std::string("player") : g_state.player; // a created driver
+            player = driver;
+            player_team = team;
+        } else {
+            driver = driver_for_stat(s.driver);
+        }
+        if (team.empty()) {
+            if (have_human && s.team == human_team && !s.human)
+                own_mate = driver; // the player's own team
+            else if (!s.human)
+                ++unknown_teams;
+            continue;
+        }
+        if (!s.human) {
+            const ss::Driver *d = g_state.driver(driver);
+            if (d && d->team != team)
+                moved.push_back((d->name.empty() ? driver : d->name) + " -> " + team);
+        }
+        cars.push_back({driver, team, s.human});
+    }
+    // more than a team's worth of cars on unknown teams: the team ids don't match this career (another
+    // addon's teams?), and syncing would empty the market's seats. Leave the market as it is.
+    if (unknown_teams > 2) {
+        std::string said = "unmatched: " + std::to_string(unknown_teams);
+        if (said != g_real_grid_said) {
+            g_real_grid_said = said;
+            log("[silly-season] real grid: %zu cars race for teams Silly Season doesn't know; the market keeps its own grid",
+                unknown_teams);
+        }
+        return false;
+    }
+    // the player's own team: the market leaves its seats alone
+    g_state.protected_ids.clear();
+    if (!own_mate.empty())
+        g_state.protected_ids.insert(own_mate);
+    g_own_team_name.clear();
+    if (have_human && player_team.empty()) {
+        g_own_team_name = "My Team";
+        g_state.player = player;
+        g_state.player_team.clear();
+    }
+    ss::sync_grid(g_state, cars);
+    if (have_human && player_team.empty()) {
+        // sync_grid only seats the known teams: the player keeps his own team
+        g_state.player = player;
+        g_state.player_team.clear();
+        if (ss::Driver *mate = g_state.driver(own_mate)) {
+            mate->team.clear();
+            mate->seat = -1;
+        }
+    }
+    char said[200];
+    std::snprintf(said, sizeof said, "%zu seats, player %s (%s)%s%s, %zu on teams Silly Season doesn't know", seats.size(),
+                  player.empty() ? "-" : player.c_str(), player_team.empty() ? (have_human ? "own team" : "-") : player_team.c_str(),
+                  own_mate.empty() ? "" : ", team-mate ", own_mate.c_str(), unknown_teams);
+    if (said != g_real_grid_said || !moved.empty()) {
+        g_real_grid_said = said;
+        std::string list;
+        for (size_t i = 0; i < moved.size() && i < 8; ++i)
+            list += (i ? ", " : "") + moved[i];
+        log("[silly-season] real grid: %s%s%s", said, moved.empty() ? "" : "; the market follows the game: ", list.c_str());
+    }
+    if (!have_human)
+        sync_player(); // no row says who the human is: the career state does
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -832,6 +1111,17 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
             if (o.f2.size() < 22)
                 o.f2.push_back(ui_driver(*d));
 
+    if (!st.player.empty() && !g_own_team_name.empty() && !team_of(st.player_team)) {
+        o.has_player = true;
+        o.player_team = g_own_team_name;
+        o.player_code = "YOU";
+        o.player_col = 0x5E5CE6;
+        for (const std::string &id : st.protected_ids)
+            o.teammate = dname(id);
+        if (const ss::Driver *me = st.driver(st.player))
+            o.player_contract = me->contract;
+        o.loyalty = st.player_loyalty;
+    }
     if (!st.player.empty())
         if (const ss::Team *t = team_of(st.player_team)) {
             o.has_player = true;
@@ -1001,7 +1291,8 @@ void reset_market(const char *why, int season_index)
     g_state.career = id;
     g_state.group = group;
     g_state.season_index = -1; // the first visit takes the career where it is
-    sync_player();
+    if (!sync_real_grid())
+        sync_player();
 }
 
 // Team HQ is idle: catch up with the season, apply seat changes, queue the news
@@ -1034,7 +1325,8 @@ void on_hub()
     }
     follow_career_id();
     std::string player_before = g_state.player;
-    sync_player();
+    if (!sync_real_grid())
+        sync_player();
     if (!g_adopted_from.empty() && !player_before.empty() && player_before != "player" && player_before != g_state.player) {
         reset_market("the market taken from a provisional id was another driver's", career::current_round() ? career::current_round()->season_index : 0);
         if (!g_loaded)
@@ -1402,6 +1694,8 @@ SWOFTY_ON_LOAD
         g_hub_idle = false;
         clear_texts();
         g_talent_ratings_year = 0;
+        g_own_team_name.clear();
+        g_real_grid_said.clear();
         std::lock_guard ov_lock(g_ov_lock);
         g_ov.career = false;
         g_ov.banners.clear();
