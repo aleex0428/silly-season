@@ -6,6 +6,8 @@ Fixes, and the market now follows your save.
 - **Careers already in a later season** (2030 in a 2026 career) get the right year: the market follows the game's season, contracts move on with it and veterans no longer on the grid have retired. A market saved in the wrong year by 1.0.0 is mended at the next Team HQ.
 - **Your driver is always found,** a created driver and 2026 careers included (no more "Who are you?").
 - **My Team:** your own team shows in the F7 hub, and your team-mate is protected: no other team signs him.
+- **Teams Silly Season doesn't know** (Konnersport, another addon's): their drivers stay where they are and aren't listed as free agents.
+- **Your market survives Swofty's new career ids.** Swofty now names careers by their save slot; a career started with 1.0.0 finds the market it saved under its old id.
 - **A new career keeps its market.** The game gives a new career a temporary id until its first save. The market now follows the change, and a career you left before that save finds its market again at the next load.
 - **Careers don't mix.** Two careers with the same driver could share a saved market. If the saved market is ahead of the career you load, a fresh one starts.
 - **Race count.** A weekend counts once its race is run. Practice or qualifying alone no longer moves the market a race forward.
