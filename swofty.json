@@ -1,0 +1,309 @@
+{
+  "schema_version": 1,
+  "id": "alexs.silly-season",
+  "name": "Silly Season",
+  "version": "1.0.1",
+  "author": "Alex Sánchez",
+  "description": "A living driver market for Career mode: rumours, talks, signings, retirements, sackings, press conferences, F2 and new talents, with inbox mails, breaking news and a market panel (F7).",
+  "license": "MIT",
+  "repository": "https://github.com/aleex0428/silly-season",
+  "icon": "icon.png",
+  "kind": [
+    "native",
+    "database",
+    "text"
+  ],
+  "category": "career",
+  "compat": {
+    "game": "f1_25",
+    "launcher": ">=1.8.16"
+  },
+  "experimental_features": [
+    "overlay"
+  ],
+  "options": [
+    {
+      "id": "menu",
+      "type": "choice",
+      "label": "Silly Season",
+      "description": "Change this value to open each market report: news, rumours, done deals, next season's grid, contracts, free agents and history.",
+      "values": [
+        {
+          "value": "cerrar",
+          "label": "Pick a report"
+        },
+        {
+          "value": "noticias",
+          "label": "Latest news"
+        },
+        {
+          "value": "rumores",
+          "label": "Rumours"
+        },
+        {
+          "value": "fichajes",
+          "label": "Done deals"
+        },
+        {
+          "value": "parrilla",
+          "label": "Next season's grid"
+        },
+        {
+          "value": "contratos",
+          "label": "Contracts"
+        },
+        {
+          "value": "bolsa",
+          "label": "Driver stock"
+        },
+        {
+          "value": "prensa",
+          "label": "Press conference"
+        },
+        {
+          "value": "f2",
+          "label": "Formula 2"
+        },
+        {
+          "value": "tecnicos",
+          "label": "Technical directors"
+        },
+        {
+          "value": "mercado",
+          "label": "Free agents"
+        },
+        {
+          "value": "historial",
+          "label": "History"
+        }
+      ],
+      "default": "cerrar",
+      "binds": "native",
+      "hidden": true
+    },
+    {
+      "id": "press_answer",
+      "type": "choice",
+      "label": "Press conference",
+      "description": "When the press asks you about the market, pick your answer here (1, 2 or 3). Open the \"Press conference\" report first to read the question, or answer with F7.",
+      "values": [
+        {
+          "value": "-",
+          "label": "Not answered"
+        },
+        {
+          "value": "1",
+          "label": "Answer 1"
+        },
+        {
+          "value": "2",
+          "label": "Answer 2"
+        },
+        {
+          "value": "3",
+          "label": "Answer 3"
+        }
+      ],
+      "default": "-",
+      "binds": "native",
+      "hidden": true
+    },
+    {
+      "id": "intensity",
+      "type": "choice",
+      "label": "Market intensity",
+      "description": "Realistic: few, logical moves. Lively: more signings and surprises. Chaos: anything can happen.",
+      "values": [
+        {
+          "value": "realista",
+          "label": "Realistic"
+        },
+        {
+          "value": "movido",
+          "label": "Lively"
+        },
+        {
+          "value": "caos",
+          "label": "Chaos"
+        }
+      ],
+      "default": "realista",
+      "binds": "native"
+    },
+    {
+      "id": "rumours",
+      "type": "choice",
+      "label": "Rumours",
+      "description": "How many rumours appear each race weekend. Some are true, some are not.",
+      "values": [
+        {
+          "value": "off",
+          "label": "No rumours"
+        },
+        {
+          "value": "pocos",
+          "label": "Few"
+        },
+        {
+          "value": "normal",
+          "label": "Normal"
+        },
+        {
+          "value": "muchos",
+          "label": "Many"
+        }
+      ],
+      "default": "normal",
+      "binds": "native"
+    },
+    {
+      "id": "midseason",
+      "type": "toggle",
+      "label": "Mid-season changes",
+      "description": "Impatient teams can sack an underperforming driver and promote a reserve or a youngster.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "standins",
+      "type": "toggle",
+      "label": "Stand-ins",
+      "description": "Now and then a driver misses a race through injury or illness and the team calls up its reserve driver.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "talents",
+      "type": "toggle",
+      "label": "New talents",
+      "description": "Every season invented young drivers with their own names arrive in F2, so the market never runs dry.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "press",
+      "type": "toggle",
+      "label": "Press conferences",
+      "description": "The press asks you about your future, your team-mate and the signings. Your answers shape the market.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "protect_teammate",
+      "type": "toggle",
+      "label": "Protect my team-mate",
+      "description": "Your team-mate never changes. Your own seat is never touched.",
+      "default": false,
+      "binds": "native"
+    },
+    {
+      "id": "legends",
+      "type": "toggle",
+      "label": "Legends on the market",
+      "description": "Senna, Schumacher, Häkkinen and other icons can return to the grid.",
+      "default": false,
+      "binds": "native"
+    },
+    {
+      "id": "emails",
+      "type": "toggle",
+      "label": "Market emails",
+      "description": "A paddock insider writes to you every race weekend: a market preview before practice, a radar after the race and the new grid when the season closes. Applies after restarting the game.",
+      "default": true,
+      "binds": "db"
+    },
+    {
+      "id": "headlines",
+      "type": "toggle",
+      "label": "Breaking news banner and panel (F7)",
+      "description": "A breaking news banner appears with every signing, retirement or sacking. F7, or Back + Y on a controller, opens the market panel outside sessions.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "effects",
+      "type": "toggle",
+      "label": "Panel effects (F7)",
+      "description": "Shadows, glows and animations in the market panel and the banner. Turn off for a lighter panel on slower PCs.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "news",
+      "type": "choice",
+      "label": "Pop-ups back at Team HQ",
+      "description": "Which news also appear as a pop-up when you return to Team HQ.",
+      "values": [
+        {
+          "value": "todas",
+          "label": "All"
+        },
+        {
+          "value": "oficiales",
+          "label": "Official only"
+        },
+        {
+          "value": "ninguna",
+          "label": "None"
+        }
+      ],
+      "default": "ninguna",
+      "binds": "native"
+    },
+    {
+      "id": "progression",
+      "type": "toggle",
+      "label": "Driver progression (experimental)",
+      "description": "Every winter young drivers improve and veterans fade. Writes the ratings into the career.",
+      "default": false,
+      "binds": "native"
+    },
+    {
+      "id": "game_market",
+      "type": "choice",
+      "label": "Who runs the market",
+      "description": "Silly Season (recommended): the game stops retiring and sacking drivers on its own, so only Silly Season moves them. The game: the game's own retirements and sackings run as well; they can clash with Silly Season's plans and its grid wins at each new season. Applies after restarting the game.",
+      "values": [
+        {
+          "value": "silly_season",
+          "label": "Silly Season"
+        },
+        {
+          "value": "game",
+          "label": "The game"
+        }
+      ],
+      "default": "silly_season",
+      "binds": "native"
+    }
+  ],
+  "hub_tab": {
+    "name": "silly_season",
+    "title": "Silly Season",
+    "options": [
+      "menu",
+      "press_answer",
+      "intensity",
+      "rumours",
+      "midseason",
+      "protect_teammate"
+    ],
+    "data_group": "f1_career_2026"
+  },
+  "operations": {
+    "database": [
+      "db/emails.json"
+    ],
+    "assets": [
+      "assets/lang.json"
+    ],
+    "native": [
+      {
+        "dll": "native/silly_season.dll",
+        "files": [
+          "data/"
+        ]
+      }
+    ]
+  }
+}

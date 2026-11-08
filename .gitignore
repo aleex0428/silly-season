@@ -1,0 +1,10 @@
+# build output: the package, MSVC objects and the compiled plugin (build it with native\build.bat)
+dist/
+native/build/
+native/*.dll
+native/*.exp
+native/*.lib
+native/*.obj
+native/*.pdb
+*.swoftyaddon
+__pycache__/

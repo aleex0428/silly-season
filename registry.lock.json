@@ -1,0 +1,15 @@
+{
+  "generated_by": "swofty dev pack 1.8.16",
+  "provides": {
+    "career.market": [
+      "alexs.silly-season/quiet"
+    ],
+    "hub.tab": [
+      {
+        "id": "alexs.silly-season/silly_season_2025",
+        "label": "Silly Season"
+      }
+    ]
+  },
+  "needs": []
+}

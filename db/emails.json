@@ -1,0 +1,218 @@
+{
+ "schema_version": 1,
+ "fields": {
+  "emails.triggers.trigger[_metadata_=practice_1].group": [
+   "_metadata_",
+   "conditions",
+   "laptop_opened_vo",
+   "num_days_cooldown",
+   "receiver",
+   "stat_id",
+   "messages._message_instancecount_",
+   "messages.message_0._metadata_",
+   "messages.message_0.accolade_category",
+   "messages.message_0.attachment",
+   "messages.message_0.extra1_button",
+   "messages.message_0.extra2_button",
+   "messages.message_0.from_contact",
+   "messages.message_0.message_body",
+   "messages.message_0.message_body_type",
+   "messages.message_0.message_deletion",
+   "messages.message_0.message_importance",
+   "messages.message_0.rivalry_email_type",
+   "messages.message_0.rivalry_type",
+   "messages.message_0.subject",
+   "messages.message_0.team_accolade_category"
+  ],
+  "emails.triggers.trigger[_metadata_=post_race].group": [
+   "_metadata_",
+   "conditions",
+   "laptop_opened_vo",
+   "num_days_cooldown",
+   "receiver",
+   "stat_id",
+   "messages._message_instancecount_",
+   "messages.message_0._metadata_",
+   "messages.message_0.accolade_category",
+   "messages.message_0.attachment",
+   "messages.message_0.extra1_button",
+   "messages.message_0.extra2_button",
+   "messages.message_0.from_contact",
+   "messages.message_0.message_body",
+   "messages.message_0.message_body_type",
+   "messages.message_0.message_deletion",
+   "messages.message_0.message_importance",
+   "messages.message_0.rivalry_email_type",
+   "messages.message_0.rivalry_type",
+   "messages.message_0.subject",
+   "messages.message_0.team_accolade_category"
+  ],
+  "emails.triggers.trigger[_metadata_=driver_moves_finalised].group": [
+   "_metadata_",
+   "conditions",
+   "laptop_opened_vo",
+   "num_days_cooldown",
+   "receiver",
+   "stat_id",
+   "messages._message_instancecount_",
+   "messages.message_0._metadata_",
+   "messages.message_0.accolade_category",
+   "messages.message_0.attachment",
+   "messages.message_0.extra1_button",
+   "messages.message_0.extra2_button",
+   "messages.message_0.from_contact",
+   "messages.message_0.message_body",
+   "messages.message_0.message_body_type",
+   "messages.message_0.message_deletion",
+   "messages.message_0.message_importance",
+   "messages.message_0.rivalry_email_type",
+   "messages.message_0.rivalry_type",
+   "messages.message_0.subject",
+   "messages.message_0.team_accolade_category"
+  ]
+ },
+ "ops": [
+  {
+   "op": "add-row",
+   "when": {
+    "emails": true
+   },
+   "table": "emails.triggers.trigger[_metadata_=practice_1]",
+   "from": "emails.triggers.trigger[_metadata_=practice_1].group[_metadata_=mt_drivermarket_retired]",
+   "stat_id": "keep",
+   "set": {
+    "_metadata_": "silly_season_preview_dc",
+    "conditions": "email_dc_weekendpreview",
+    "stat_id": "254",
+    "num_days_cooldown": "0",
+    "receiver": "Driver",
+    "messages._message_instancecount_": "1",
+    "messages.message_0._metadata_": "silly_season_preview_dc_01",
+    "messages.message_0.from_contact": "marc_priestley",
+    "messages.message_0.subject": "lng_silly_season_mail_preview_subject",
+    "messages.message_0.message_body": "lng_silly_season_mail_preview_body",
+    "messages.message_0.message_importance": "eMedium"
+   }
+  },
+  {
+   "op": "add-row",
+   "when": {
+    "emails": true
+   },
+   "table": "emails.triggers.trigger[_metadata_=practice_1]",
+   "from": "emails.triggers.trigger[_metadata_=practice_1].group[_metadata_=mt_drivermarket_retired]",
+   "stat_id": "keep",
+   "set": {
+    "_metadata_": "silly_season_preview_mt",
+    "conditions": "email_mt_weekendpreview",
+    "stat_id": "255",
+    "num_days_cooldown": "0",
+    "receiver": "Driver",
+    "messages._message_instancecount_": "1",
+    "messages.message_0._metadata_": "silly_season_preview_mt_01",
+    "messages.message_0.from_contact": "marc_priestley",
+    "messages.message_0.subject": "lng_silly_season_mail_preview_subject",
+    "messages.message_0.message_body": "lng_silly_season_mail_preview_body",
+    "messages.message_0.message_importance": "eMedium"
+   }
+  },
+  {
+   "op": "add-row",
+   "when": {
+    "emails": true
+   },
+   "table": "emails.triggers.trigger[_metadata_=post_race]",
+   "from": "emails.triggers.trigger[_metadata_=post_race].group[_metadata_=dc_rivalry_teammate_intensified]",
+   "stat_id": "keep",
+   "set": {
+    "_metadata_": "silly_season_radar_dc",
+    "conditions": "email_dc_weekendpreview",
+    "stat_id": "256",
+    "num_days_cooldown": "0",
+    "receiver": "Driver",
+    "messages._message_instancecount_": "1",
+    "messages.message_0._metadata_": "silly_season_radar_dc_01",
+    "messages.message_0.from_contact": "marc_priestley",
+    "messages.message_0.subject": "lng_silly_season_mail_radar_subject",
+    "messages.message_0.message_body": "lng_silly_season_mail_radar_body",
+    "messages.message_0.message_importance": "eLow",
+    "messages.message_0.attachment": "none",
+    "messages.message_0.extra2_button": "none",
+    "messages.message_0.rivalry_email_type": "eNone",
+    "messages.message_0.rivalry_type": "eNone"
+   }
+  },
+  {
+   "op": "add-row",
+   "when": {
+    "emails": true
+   },
+   "table": "emails.triggers.trigger[_metadata_=post_race]",
+   "from": "emails.triggers.trigger[_metadata_=post_race].group[_metadata_=dc_rivalry_teammate_intensified]",
+   "stat_id": "keep",
+   "set": {
+    "_metadata_": "silly_season_radar_mt",
+    "conditions": "email_mt_weekendpreview",
+    "stat_id": "257",
+    "num_days_cooldown": "0",
+    "receiver": "Driver",
+    "messages._message_instancecount_": "1",
+    "messages.message_0._metadata_": "silly_season_radar_mt_01",
+    "messages.message_0.from_contact": "marc_priestley",
+    "messages.message_0.subject": "lng_silly_season_mail_radar_subject",
+    "messages.message_0.message_body": "lng_silly_season_mail_radar_body",
+    "messages.message_0.message_importance": "eLow",
+    "messages.message_0.attachment": "none",
+    "messages.message_0.extra2_button": "none",
+    "messages.message_0.rivalry_email_type": "eNone",
+    "messages.message_0.rivalry_type": "eNone"
+   }
+  },
+  {
+   "op": "add-row",
+   "when": {
+    "emails": true
+   },
+   "table": "emails.triggers.trigger[_metadata_=driver_moves_finalised]",
+   "from": "emails.triggers.trigger[_metadata_=driver_moves_finalised].group[_metadata_=dc_drivermoves]",
+   "stat_id": "keep",
+   "set": {
+    "_metadata_": "silly_season_grid_dc",
+    "conditions": "email_dc_weekendpreview",
+    "stat_id": "258",
+    "num_days_cooldown": "0",
+    "receiver": "Driver",
+    "messages._message_instancecount_": "1",
+    "messages.message_0._metadata_": "silly_season_grid_dc_01",
+    "messages.message_0.from_contact": "marc_priestley",
+    "messages.message_0.subject": "lng_silly_season_mail_grid_subject",
+    "messages.message_0.message_body": "lng_silly_season_mail_grid_body",
+    "messages.message_0.message_importance": "eHigh",
+    "messages.message_0.attachment": "none"
+   }
+  },
+  {
+   "op": "add-row",
+   "when": {
+    "emails": true
+   },
+   "table": "emails.triggers.trigger[_metadata_=driver_moves_finalised]",
+   "from": "emails.triggers.trigger[_metadata_=driver_moves_finalised].group[_metadata_=dc_drivermoves]",
+   "stat_id": "keep",
+   "set": {
+    "_metadata_": "silly_season_grid_mt",
+    "conditions": "email_mt_weekendpreview",
+    "stat_id": "259",
+    "num_days_cooldown": "0",
+    "receiver": "Driver",
+    "messages._message_instancecount_": "1",
+    "messages.message_0._metadata_": "silly_season_grid_mt_01",
+    "messages.message_0.from_contact": "marc_priestley",
+    "messages.message_0.subject": "lng_silly_season_mail_grid_subject",
+    "messages.message_0.message_body": "lng_silly_season_mail_grid_body",
+    "messages.message_0.message_importance": "eHigh",
+    "messages.message_0.attachment": "none"
+   }
+  }
+ ]
+}

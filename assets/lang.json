@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "ops": [
+    {
+      "op": "lang.default",
+      "language": "*",
+      "key": "lng_silly_season_mail_preview_subject",
+      "value": "Silly Season: market preview"
+    },
+    {
+      "op": "lang.default",
+      "language": "*",
+      "key": "lng_silly_season_mail_preview_body",
+      "value": "The driver market is quiet this week."
+    },
+    {
+      "op": "lang.default",
+      "language": "*",
+      "key": "lng_silly_season_mail_radar_subject",
+      "value": "Silly Season: market radar"
+    },
+    {
+      "op": "lang.default",
+      "language": "*",
+      "key": "lng_silly_season_mail_radar_body",
+      "value": "No news on the driver market."
+    },
+    {
+      "op": "lang.default",
+      "language": "*",
+      "key": "lng_silly_season_mail_grid_subject",
+      "value": "Silly Season: the new grid"
+    },
+    {
+      "op": "lang.default",
+      "language": "*",
+      "key": "lng_silly_season_mail_grid_body",
+      "value": "Next season's grid is settled."
+    }
+  ]
+}
