@@ -1,3 +1,9 @@
+# 1.1.1
+
+- **Installs on every launcher that can run it.** 1.1.0 asked for launcher 1.8.16 or later, but its manifest links the source code, which launchers before 1.8.19 refuse. Silly Season now asks for launcher **1.8.36** or later.
+- **Tagged "Steam" in the Addon Browser:** the copy of the game it was tested on, instead of "Not tested".
+- **F7 panel and banner:** the README no longer says they need `SWOFTY_OVERLAY_FG=1` with Frame Generation (the launcher draws them since 1.8.25). If they never show on an NVIDIA card with DLSS, update the launcher to 1.8.38.
+
 # 1.1.0
 
 - **History mode for Progressive Career on the Swofty Seasons.** Silly Season now plays along with Progressive's real seasons (2015 to 2026): it tells next year's real moves through the season as rumours, talks and official signings, announces the real retirements and the real mid-season stand-ins at the right race, and closes each season with the real grid. It never touches a seat while the real years last: Progressive puts each line-up on the grid. Each year's team names, car pace and driver ratings come from Progressive's data, and the drivers of the season addons (Vettel, Räikkönen, Kubica, Schumacher...) are part of the market. From 2026 on, Silly Season's own market takes over.

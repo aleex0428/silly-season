@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "alexs.silly-season",
   "name": "Silly Season",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Alex Sánchez",
   "description": "A living driver market for Career mode: rumours, talks, signings, retirements, sackings, press conferences, F2 and new talents, with inbox mails, breaking news and a market panel (F7).",
   "license": "MIT",
@@ -16,7 +16,10 @@
   "category": "career",
   "compat": {
     "game": "f1_25",
-    "launcher": ">=1.8.16"
+    "launcher": ">=1.8.36",
+    "platforms": [
+      "steam"
+    ]
   },
   "experimental_features": [
     "overlay"

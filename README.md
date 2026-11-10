@@ -4,8 +4,8 @@ A living driver market for F1 25's **Career mode**. Through the season rumours a
 signings, others are denied. Veterans announce their retirement, impatient teams sack underperforming drivers and the
 academies promote their F2 youngsters. When a new season starts, the game's grid really changes.
 
-- **Addon:** `alexs.silly-season` 1.1.0
-- **Requires:** Swofty Launcher 1.8.16 or later and F1 25 on Steam
+- **Addon:** `alexs.silly-season` 1.1.1
+- **Requires:** Swofty Launcher 1.8.36 or later and F1 25 on Steam (tested on the Steam copy)
 - **Careers:** Driver Career and My Team (where the game makes the moves: see Known limits) for 2026 (`f1_career_2026`) and 2025 (`f1_career_2025`), and Progressive
   Career on the Swofty Seasons (`swofty.swofty-seasons-progressive`) in history mode. Careers from other addons keep
   their own market.
@@ -262,8 +262,8 @@ python -I ../_swofty-ref/tools/pack_addon.py . dist
   had already read about turns into a "DEAL OFF" story.
 - **Who runs the market = Silly Season** empties the game's own retirement and sacking lists (the `career.market`
   record, experimental in Swofty). If something looks wrong, switch it to **The game** and restart.
-- **Banner and hub:** they use Swofty's experimental overlay. With frame generation on (DLSS Frame Generation or FSR) it
-  may not draw unless `SWOFTY_OVERLAY_FG=1`.
+- **Banner and hub:** they use Swofty's experimental overlay. It draws with Frame Generation on since launcher 1.8.25.
+  If the F7 panel or the banner never shows on an NVIDIA card with DLSS, update the launcher to 1.8.38 or later.
 - **Stand-ins:** the Swofty core takes the regular driver off the grid while the reserve races and signs him again when
   he returns, so in the game's data his contract becomes a new one. Silly Season keeps the original contract. Turn off
   **Stand-ins** if you prefer.
