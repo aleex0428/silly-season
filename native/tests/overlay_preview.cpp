@@ -443,6 +443,13 @@ int main(int argc, char **argv)
                                 t.id == "williams" && k == 1});
         ss::sync_grid(g_state, cars);
     }
+    // the game's ratings screen, as the plugin reads it at Team HQ: the player's from a 2026-11-10 screenshot, the
+    // rest a little above the market's model (the game counts perks and the car in)
+    ss::observe_game_ratings(g_state, "player", 91, 81, 89, 73, 81, 94);
+    for (auto &[id, d] : g_state.drivers)
+        if (!d.team.empty() && id != "player" && !d.regen)
+            ss::observe_game_ratings(g_state, id, std::min(99.0f, d.overall() + 2.0f), d.experience, d.racecraft,
+                                     60.0f + static_cast<float>(id.size() % 30), d.awareness, d.pace);
     ss::season_preview(g_state, s);
     uint64_t seed = 7;
     for (int r = 1; r <= rounds; ++r) {
@@ -494,13 +501,141 @@ int main(int argc, char **argv)
         std::snprintf(name, sizeof name, "hub_%02d.svg", i);
         preview::save(dir / name);
     }
+    // 1.1.0 phase 4: a driver's card and a team's card over the hub
+    {
+        auto card = [&](int kind, const std::string &id, int on_tab, const char *file) {
+            preview::begin();
+            tab = on_tab;
+            menu_y = -1;
+            scroll = scroll_target = 0;
+            opened_at = tab_at = past;
+            ui4::modal = 0;
+            ui4::modal_back.clear();
+            // the page first, so the card opens from its list (it shows "N / M" and steps through it)
+            draw_board(reinterpret_cast<ov::Paint *>(1), in, 0.016f);
+            preview::out.clear();
+            preview::begin();
+            ui4::open_from_list(kind, id);
+            ui4::modal_at = past;
+            draw_board(reinterpret_cast<ov::Paint *>(1), in, 0.016f);
+            preview::save(dir / file);
+            ui4::modal = 0;
+        };
+        // the champion's card when the season has one (it shows the honours), else the most valuable driver's
+        std::string champion;
+        for (const ss::State::Award &a : g_state.awards)
+            if (a.key == "champion" && g_ov.card(a.who))
+                champion = a.who;
+        if (!champion.empty())
+            card(ui4::K_DRIVER, champion, P_DRIVERS, "card_driver.svg");
+        else if (!g_ov.drivers.empty())
+            card(ui4::K_DRIVER, g_ov.drivers.front().id, P_DRIVERS, "card_driver.svg");
+        if (!g_ov.grid.empty())
+            card(ui4::K_TEAM, g_ov.grid.front().id, P_GRID, "card_team.svg");
+        // the global search, a few letters typed
+        preview::begin();
+        tab = P_PADDOCK;
+        menu_y = -1;
+        scroll = scroll_target = 0;
+        opened_at = tab_at = past;
+        ui4::open_search();
+        ui4::gquery = "le";
+        ui4::modal_at = past;
+        draw_board(reinterpret_cast<ov::Paint *>(1), in, 0.016f);
+        preview::save(dir / "search.svg");
+        ui4::modal = 0;
+        // the press, just answered
+        preview::begin();
+        tab = P_PRESS;
+        opened_at = tab_at = past;
+        answered_at = Clock::now() - std::chrono::seconds(1);
+        answered_q = g_ov.press_question.empty() ? std::string("\"Do you see yourself at Williams next season?\"") : g_ov.press_question;
+        answered_a = "\"I'm one hundred percent committed to Williams.\"";
+        bool was_pending = g_ov.press_pending;
+        g_ov.press_pending = false;
+        draw_board(reinterpret_cast<ov::Paint *>(1), in, 0.016f);
+        preview::save(dir / "press_sent.svg");
+        g_ov.press_pending = was_pending;
+        answered_a.clear();
+        // the grid reveal, all teams in
+        preview::begin();
+        ui4::reveal_at = Clock::now() - std::chrono::seconds(9);
+        draw_reveal(reinterpret_cast<ov::Paint *>(1), in);
+        preview::save(dir / "reveal.svg");
+        // a bombshell signing's card
+        preview::begin();
+        ui4::signing = {"Max Verstappen", "Red Bull Racing", "RBR", "Mercedes", "MER", "60 M€", 0x3671C6, 0x27F4D2, 2029, 28, 95};
+        ui4::signing_at = Clock::now() - std::chrono::milliseconds(2500);
+        draw_signing(reinterpret_cast<ov::Paint *>(1));
+        preview::save(dir / "signing.svg");
+        // the Team HQ widget
+        preview::begin();
+        ui4::widget_at = Clock::now() - std::chrono::seconds(2);
+        draw_widget(reinterpret_cast<ov::Paint *>(1));
+        preview::save(dir / "widget.svg");
+        // 1.1.0 overlays, each a few seconds in
+        auto shot = [&](const char *file, auto &&draw) {
+            preview::begin();
+            draw();
+            preview::save(dir / file);
+        };
+        ovl::farewell = {"Fernando Alonso", "Aston Martin", "AST", 0x229971, 22, 410, 32, 106, 2, 44};
+        ovl::at = Clock::now() - std::chrono::milliseconds(3200);
+        shot("farewell.svg", [&] { draw_farewell(reinterpret_cast<ov::Paint *>(1)); });
+        ovl::strip = {"DEADLINE DAY: TWO RACES LEFT", "Two races left before the 2026 grid is set, with 2 seats still to fill: Aston Martin, Alpine.", 2};
+        ovl::at = Clock::now() - std::chrono::milliseconds(1800);
+        shot("strip.svg", [&] { draw_strip(reinterpret_cast<ov::Paint *>(1)); });
+        g_ov.report = {1, g_ov.round, g_ov.rounds, 14, 3, 2, 1, 71.4f, 0.8f, {}};
+        for (size_t i = 0; i < g_ov.news.size() && i < 3; ++i)
+            g_ov.report.headlines.push_back(g_ov.news[i].title);
+        ovl::at = Clock::now() - std::chrono::milliseconds(2500);
+        shot("report.svg", [&] { draw_report(reinterpret_cast<ov::Paint *>(1)); });
+        {
+            bool pending = g_ov.press_pending;
+            if (!pending) {
+                g_ov.press_pending = true;
+                g_ov.press_question = "\"Do you see yourself at Williams next season?\"";
+                g_ov.press_answers = {"\"I'm one hundred percent committed to Williams.\"", "\"I'll listen to every offer. I want to win.\"",
+                                      "\"Right now I'm only thinking about the next race.\""};
+            }
+            ovl::press_answered = -1;
+            ovl::at = Clock::now() - std::chrono::milliseconds(2000);
+            shot("press_popup.svg", [&] { draw_press_popup(reinterpret_cast<ov::Paint *>(1), in); });
+            g_ov.press_pending = pending;
+        }
+        ovl::alert = {"Ferrari", "FER", 0xE8002D, 72};
+        ovl::alert_at = Clock::now() - std::chrono::milliseconds(1500);
+        shot("alert.svg", [&] { draw_alert(reinterpret_cast<ov::Paint *>(1)); });
+        {
+            // the ceremony with three awards, the second being handed out
+            std::vector<UiAward> saved = g_ov.awards;
+            g_ov.awards = {{g_ov.year, "improved", "Isack Hadjar", "value +6.2"}, {g_ov.year, "rookie", "Andrea Kimi Antonelli", "116 pts, 1 podiums"},
+                           {g_ov.year, "champion", "Lando Norris", "372 pts, 7 wins"}};
+            g_ov.awards_pending = g_ov.year;
+            ovl::at = Clock::now() - std::chrono::milliseconds(3900);
+            shot("awards.svg", [&] { draw_awards(reinterpret_cast<ov::Paint *>(1), in); });
+            g_ov.awards = saved;
+        }
+        {
+            g_ov.cover_pending = g_ov.year + 1;
+            g_ov.cover_moves.clear();
+            for (const UiMove &m : g_ov.history)
+                if (g_ov.cover_moves.size() < 6)
+                    g_ov.cover_moves.push_back(m);
+            ovl::at = Clock::now() - std::chrono::seconds(5);
+            shot("cover.svg", [&] { draw_cover(reinterpret_cast<ov::Paint *>(1), in); });
+        }
+    }
     // the banner, two seconds in
     preview::begin();
     ss::NewsItem n;
     n.kind = "official";
+    n.driver = "carlos_sainz-jr";
+    n.to = g_ov.teams.size() > 2 ? g_ov.teams[2].id : std::string();
     n.title = lang == "en" ? "OFFICIAL: NEW SIGNING" : "OFICIAL: NUEVO FICHAJE";
     n.body = lang == "en" ? "Carlos Sainz joins Ferrari from Williams on a deal until 2027. The team calls it \"the missing piece\"."
                           : "Carlos Sainz ficha por Ferrari desde Williams con contrato hasta 2027. El equipo lo llama \"la pieza que faltaba\".";
+    g_ov.banners.clear(); // this story first: a driver and a team, the banner's full look
     g_ov.banners.push_back(n);
     banner_on = false;
     draw_banner(reinterpret_cast<ov::Paint *>(1));

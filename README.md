@@ -4,10 +4,25 @@ A living driver market for F1 25's **Career mode**. Through the season rumours a
 signings, others are denied. Veterans announce their retirement, impatient teams sack underperforming drivers and the
 academies promote their F2 youngsters. When a new season starts, the game's grid really changes.
 
-- **Addon:** `alexs.silly-season` 1.0.1
+- **Addon:** `alexs.silly-season` 1.1.0
 - **Requires:** Swofty Launcher 1.8.16 or later and F1 25 on Steam
-- **Careers:** Driver Career and My Team for 2026 (`f1_career_2026`) and 2025 (`f1_career_2025`).
-  Careers from other addons, such as Progressive Career, keep their own market.
+- **Careers:** Driver Career and My Team (where the game makes the moves: see Known limits) for 2026 (`f1_career_2026`) and 2025 (`f1_career_2025`), and Progressive
+  Career on the Swofty Seasons (`swofty.swofty-seasons-progressive`) in history mode. Careers from other addons keep
+  their own market.
+
+## New in 1.1.0
+
+The biggest update so far. In short (every change is in [CHANGELOG.md](CHANGELOG.md)):
+
+- **The real season:** race results, standings and secret meetings come from your career, and the hub shows the game's
+  own driver ratings.
+- **A deeper market:** driver personalities, team plans, the domino effect, deadline day, outlets that keep score,
+  season awards, academies and reserve drivers, sister-team swaps, sponsors and team principals.
+- **History mode** for Progressive Career on the Swofty Seasons (2015 to 2026).
+- **A new F7 hub** with 17 pages, driver and team cards, search, and new overlays.
+- **Other addons:** their drivers join the market, My Team's own team is the twelfth team, and F2 Revamp is supported.
+- **Fixes from your reports:** sackings and signings the game refuses are taken back, My Team no longer announces moves
+  that never happen, and driver progression no longer overwrites the game's ratings.
 
 ## Install
 
@@ -31,20 +46,32 @@ The news comes to you without opening any menu:
 - **BREAKING NEWS banner** (overlay): a broadcast-style lower third with every official signing, retirement or sacking,
   outside sessions.
 - **The market hub: F7** (or **Back + Y** on a controller), outside sessions. A full-screen, broadcast-style panel with a
-  live headline ticker, the transfer window's status, a grouped side menu, animated cards, gauges and charts, and 13 pages:
+  live headline ticker, a season bar, the transfer window's status, a grouped side menu, animated cards, gauges and
+  charts, and 17 pages:
   - **Paddock:** the market at a glance (seats in play, open talks, done deals, unread news), the top stories, your team
-    and contract, and the drivers rising and falling.
-  - **News:** every story as a card, grouped by race, with its kind and an unread marker.
+    and contract, the team keenest on you, the championship's top three and the drivers rising and falling.
+  - **News:** every story as a card, grouped by race, with the updates of one story stacked together.
   - **Press:** the journalist's question and your three answers.
-  - **Rumours:** who goes where, at which stage, and which outlet says so with its reliability.
+  - **Your Future:** your game rating, market value and potential, your value race by race, how keen each team is on
+    you, how your team feels about you and what the paddock says about you.
+  - **Rumours:** who goes where, at which stage, which outlet says so with its reliability, and each story's odds.
   - **Deals:** contracts signed for next season and this season's moves.
-  - **Grid:** next season's projected (or final) grid in team colours, with new arrivals marked.
+  - **Transfer Centre:** every chain of moves, domino by domino, and the signings still waiting for their seat.
+  - **Grid:** next season's projected (or final) grid in team colours, with new arrivals marked. R replays the reveal.
+  - **Standings:** the drivers' and constructors' championships from your career's real results.
   - **Drivers:** a ranking with team, age, value, trend, contract and salary.
   - **Contracts:** who is out of contract this year, next year and later.
   - **Stock:** a chart of every driver's value change over the last race.
-  - **Formula 2**, **Engineers** (technical directors and their level), **Free agents** and **History**.
-  - Q/E, Left/Right or LB/RB change page; Up/Down, the wheel or the d-pad scroll; F7, Esc or B close it. The mouse
+  - **Formula 2**, **Scouting** (who fits your team next season), **Engineers**, **Free agents** (with reserves and
+    academy drivers) and **History** (with the Hall of Fame and records).
+  - **Driver and team cards:** click a driver or a team, or pick one with Up/Down and press Enter/A. Left/Right (LB/RB)
+    steps through the list.
+  - **Search, sort and filter:** / (Y) searches every driver and team; S (X) sorts and F (Y) filters the tables.
+  - Q/E or LB/RB change page; Up/Down, the wheel, the right stick or the d-pad scroll; F7, Esc or B close it. The mouse
     works everywhere.
+- **Overlays at Team HQ, one at a time:** the breaking-news banner, bombshell signing cards, the grid reveal, the awards
+  ceremony, the season cover, farewells, the deadline-day strip, the report after each race, interest alerts, press
+  questions you answer with 1, 2 or 3, and a small market card. None shows during a session or over the F7 panel.
 - **The Team HQ tab shows unread news:** `SILLY SEASON (3)`.
 - **SILLY SEASON tab in Team HQ** (after STANDINGS). The manifest adds it to 2026 careers; for 2025 careers the plugin
   adds it with a `hub.tab` record that reuses the same template.
@@ -80,13 +107,31 @@ The news comes to you without opening any menu:
 - **Contracts:** a driver signed for next year stays. A clearly better team can buy out a top driver's contract, which
   frees his old seat.
 - **Retirements:** from 34, more likely the older and slower the driver. A veteran left without a seat usually retires.
-- **Form:** the current Swofty core can't read race results yet, so Silly Season simulates every race from car and
-  driver level. Real results will count once the core exposes them (telemetry).
+- **Form:** from your career's real race results, read from the game's standings at every Team HQ. If they can't be
+  read, Silly Season simulates the race from car and driver level.
 - **When a race counts:** once the weekend's race is run. Practice or qualifying alone doesn't move the market.
 - **Your seat is never touched.** Your team-mate can change unless you turn on **Protect my team-mate**.
 - **The grid comes from your save:** at every Team HQ Silly Season reads who sits in each seat, so transfers made with
   the Career Mode Editor, other addons' line-ups and a season already under way are part of the market. In My Team your
   own team shows in the hub and your team-mate is never signed by another team.
+
+### History mode: Progressive Career on the Swofty Seasons
+
+Progressive Career moves through the real seasons from 2015 to 2026 and puts each year's real line-up on the grid.
+In its careers Silly Season tells that story instead of writing its own:
+
+- Next year's real moves come out through the season: rumours from the outlets, talks, then the official signing,
+  each at its own moment. Debuts are settled late, as rookies' seats usually are.
+- Real retirements are announced mid-season, and drivers who lose their seat are off the grid when it closes.
+- The real mid-season stand-ins and swaps are announced before their race, scaled to your calendar.
+- The tabloids still print stories that won't happen, and deny them later.
+- Team names, car pace and driver ratings are each year's real ones (from Progressive's data). The season addons'
+  drivers (Vettel, Räikkönen, Kubica, Schumacher, Mazepin...) are part of the market.
+- Silly Season never writes a seat while the real years last: Progressive does. Stand-ins, new talents and sackings
+  of its own stay off.
+- From 2026 on, Progressive leaves the grid free and Silly Season's own market takes over.
+- Silly Season tells the year from the drivers' looks on your grid at the first Team HQ, and reads Progressive's
+  `data/years.json` from the game folder. Without it, Silly Season stays out of the career.
 
 ### Press conferences
 
@@ -206,7 +251,15 @@ python -I ../_swofty-ref/tools/pack_addon.py . dist
   career you load, Silly Season starts a fresh market for it rather than mixing them.
 - **Reading the grid** uses the game's entrant rows as Swofty's experimental game headers lay them out. If a game update
   moves them, Silly Season notices, keeps its own grid and says so in the log (`real grid: not read`).
-- **My Team:** the market doesn't plan your own team: your seats and your team-mate stay yours.
+- **My Team:** Swofty can't change race seats in My Team, so there the game's own market makes the moves. Silly Season
+  tells the rumours, talks and odds, never signs, sacks or retires anyone itself, and reports each move as official once
+  the driver turns up in his new car. Your own team is never touched. With **Who runs the market = Silly Season** the
+  game's retirement and sacking lists are emptied in every mode (the `career.market` record can't tell My Team apart), so
+  in My Team nobody retires or is sacked; choose **The game** if you want the game to do both there.
+- **Driver progression** moves Silly Season's own view of each driver (value, interest, cards). Only the new talents'
+  ratings are written into the game: the game develops its own drivers, and Swofty can't read where it took them.
+- **A seat the game refuses at the new season** is taken back: the market follows the game's grid, and a signing you
+  had already read about turns into a "DEAL OFF" story.
 - **Who runs the market = Silly Season** empties the game's own retirement and sacking lists (the `career.market`
   record, experimental in Swofty). If something looks wrong, switch it to **The game** and restart.
 - **Banner and hub:** they use Swofty's experimental overlay. With frame generation on (DLSS Frame Generation or FSR) it
@@ -218,5 +271,9 @@ python -I ../_swofty-ref/tools/pack_addon.py . dist
   is still its row's, and the initials don't change.
 - **Your future** is flavour: your own seat stays with the game's contract system, because Swofty doesn't move the
   player.
-- The current Swofty core doesn't announce the end of each weekend or season, and doesn't expose the career's ratings.
-  Everything is worked out at Team HQ from the current round.
+- The current Swofty core doesn't announce the end of each weekend or season: everything is worked out at Team HQ from
+  the current round.
+- **Ratings:** Silly Season reads each driver's ratings from the career with the game's own functions (Swofty's
+  experimental game headers), so cards show the game's **Rating** next to the **Market value**. If a game update moves
+  them, it keeps its own numbers and says so in the log (`game ratings: not read`).
+- **Your contract's end year** is Silly Season's estimate: the game doesn't give its contracts an end date it can read.

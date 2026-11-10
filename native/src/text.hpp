@@ -46,6 +46,9 @@ std::string h_clause(Lang l, const std::string &driver);
 // a press question (reply false) or the player's answer (reply true); topic: future, mate, wish, signing
 std::string h_press(Lang l, const std::string &topic, const std::string &about, bool reply);
 std::string h_press_silence(Lang l);
+// the player's secret meeting with another team, as the paddock hears of it
+std::string h_meeting(Lang l, const std::string &team);
+std::string meeting(Lang l, int pick, const std::string &team);
 
 // news bodies; `pick` chooses among phrasings
 std::string rumour(Lang l, int pick, const std::string &driver, const std::string &team, const std::string &from);
@@ -74,7 +77,7 @@ std::string preseason(Lang l, int year, int count, const std::string &list);
 constexpr int kOutlets = 5;
 const char *outlet_name(int i);
 int outlet_reliability(int i);           // 1..5
-std::string outlet_label(Lang l, int i); // "The Pit Wall (fiabilidad alta)"
+std::string outlet_label(Lang l, int i, int rating); // "The Pit Wall (high reliability)", rating 1..5 as seen now
 
 // quotes from the team (by role, never by name), salaries, stand-ins, the season review
 std::string boss_quote(Lang l, int pick, const std::string &driver, const std::string &team, const std::string &kind);
@@ -151,5 +154,79 @@ std::string stage(Lang l, const char *stage);
 std::string kind(Lang l, const std::string &kind);
 std::string free_seat(Lang l);
 std::string unknown_seat(Lang l);
+
+// 1.1.0 phase 3: personality, dominoes, deadline day, strategies, awards, the outlets' record, the scout, numbers
+std::string trait_line(Lang l, int pick, const std::string &trait, const std::string &driver);
+std::string h_swoop(Lang l, const std::string &driver, const std::string &team);
+std::string h_domino(Lang l, int pick, const std::string &next, const std::string &team);
+std::string domino(Lang l, int pick, const std::string &leaver, const std::string &team, const std::string &next,
+                   const std::string &next_from);
+std::string h_refusal(Lang l, int pick, const std::string &driver, const std::string &team);
+std::string refusal(Lang l, int pick, const std::string &driver, const std::string &team, const std::string &from,
+                    bool buyout, const std::string &trait);
+std::string h_deadline(Lang l, int left);
+std::string deadline(Lang l, int year, int left, int open, const std::string &list);
+std::string h_wants_out(Lang l, const std::string &driver, const std::string &team);
+std::string wants_out(Lang l, int pick, const std::string &driver, const std::string &team);
+std::string strategy_name(Lang l, const std::string &key);
+std::string h_strategy(Lang l, const std::string &team, const std::string &now);
+std::string strategy_switch(Lang l, const std::string &team, const std::string &was, const std::string &now);
+std::string h_awards(Lang l, int year);
+std::string award_title(Lang l, const std::string &key);
+std::string award_detail(Lang l, const std::string &key, int a, int b, float c);
+std::string h_media(Lang l);
+std::string media_scorecard(Lang l, const std::string &best, int bh, int bn, int br, const std::string &worst, int wh, int wn,
+                            int wr);
+std::string h_scout(Lang l, int year);
+std::string scout_intro(Lang l, int year);
+std::string scout_status(Lang l, const std::string &status);
+std::string scout_interest(Lang l, int interest);
+std::string h_number(Lang l, const std::string &driver, int number);
+std::string number_line(Lang l, const std::string &driver, const std::string &team, int number);
+
+// 1.1.0 phase 5: new press topics (deadline, a rival's bombshell, the player's renewal, last season's awards)
+std::string q_deadline(Lang l, const std::string &team, int left);
+std::string a_deadline(Lang l, int i);
+std::string r_deadline(Lang l, int i, const std::string &team);
+std::string q_rival(Lang l, const std::string &driver, const std::string &team);
+std::string a_rival(Lang l, int i);
+std::string r_rival(Lang l, int i, const std::string &driver);
+std::string q_renewal(Lang l, const std::string &team);
+std::string a_renewal(Lang l, int i, const std::string &team);
+std::string r_renewal(Lang l, int i, const std::string &team);
+std::string q_award(Lang l, const std::string &driver, const std::string &award, int year);
+std::string a_award(Lang l, int i);
+std::string r_award(Lang l, int i, const std::string &driver);
+// sister-team swaps, sponsors, team principals, farewells
+std::string h_swap(Lang l, const std::string &up, const std::string &senior);
+std::string swap(Lang l, int pick, const std::string &up, const std::string &down, const std::string &senior,
+                 const std::string &junior);
+const char *sponsor_brand(int pick);
+std::string h_sponsor(Lang l, const std::string &team, bool in);
+std::string sponsor(Lang l, int pick, const std::string &team, const std::string &brand, int millions, bool in);
+std::string h_principal(Lang l, const std::string &team);
+std::string principal_out(Lang l, int pick, const std::string &old, const std::string &team, const std::string &fresh,
+                          const std::string &plan);
+std::string h_farewell(Lang l, const std::string &driver);
+std::string farewell(Lang l, const std::string &driver, int seasons, int starts, int wins, int podiums, int titles);
+std::string tribute(Lang l, const std::string &driver, int seasons, int wins); // "Name (12 seasons, 3 wins)"
+// the inbox mails' new sections
+std::string mail_open_seats(Lang l, const std::string &teams);
+std::string h_mail_chains(Lang l);
+std::string mail_media(Lang l, const std::string &outlet, int hits, int stories);
+std::string h_mail_farewells(Lang l);
+// 1.1.0 phase 6: academies and reserves
+std::string h_academy(Lang l, const std::string &driver, const std::string &team);
+std::string academy(Lang l, int pick, const std::string &driver, const std::string &team, int age);
+std::string h_reserves(Lang l, int year);
+std::string reserve_line(Lang l, const std::string &team, const std::string &driver, bool renewed);
+// a driver another addon moved up from F2 (F2 Revamp)
+std::string h_f2_promotion(Lang l, const std::string &driver, const std::string &team);
+std::string f2_promotion(Lang l, const std::string &driver, const std::string &team, int until, const std::string &source);
+// 1.1.0, from player reports: a signing the game refused at the new season, and My Team's market
+std::string h_deal_off(Lang l, const std::string &driver, const std::string &team);
+std::string deal_off(Lang l, const std::string &driver, const std::string &team, const std::string &now_team);
+std::string h_observer(Lang l);
+std::string observer(Lang l);
 
 } // namespace ss::text

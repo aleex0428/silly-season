@@ -203,6 +203,10 @@
     "sauber": [
      "nico_hulkenberg",
      "gabriel_bortoleto"
+    ],
+    "konnersport": [
+     "aiden_jackson",
+     "callie_mayer"
     ]
    },
    "pool": [
@@ -259,6 +263,8 @@
     "zane_maloney"
    ],
    "contracts": {
+    "aiden_jackson": 2026,
+    "callie_mayer": 2026,
     "max_verstappen": 2028,
     "yuki_tsunoda": 2025,
     "lando_norris": 2027,
@@ -535,6 +541,18 @@
    "patience": 0.35,
    "junior": false,
    "colour": 37119
+  },
+  "konnersport": {
+   "name": "Konnersport",
+   "code": "KON",
+   "stat": 104,
+   "prestige": 55,
+   "performance": 64,
+   "family": "konnersport",
+   "patience": 0.45,
+   "junior": false,
+   "colour": 16187136,
+   "optional": true
   }
  },
  "drivers": {
@@ -2289,6 +2307,46 @@
    "awareness_peak": 82.0,
    "experience": 33.0,
    "experience_peak": 53.0
+  },
+  "aiden_jackson": {
+   "home": "konnersport",
+   "kind": "f1",
+   "name": "Aiden Jackson",
+   "nat": "britain",
+   "stat": 102,
+   "born": 1999,
+   "seasons": 2,
+   "academy": "",
+   "initials": "JAC",
+   "female": false,
+   "pace": 87.0,
+   "pace_peak": 87.0,
+   "racecraft": 89.0,
+   "racecraft_peak": 89.0,
+   "awareness": 88.0,
+   "awareness_peak": 88.0,
+   "experience": 85.0,
+   "experience_peak": 85.0
+  },
+  "callie_mayer": {
+   "home": "konnersport",
+   "kind": "f1",
+   "name": "Callie Mayer",
+   "nat": "britain",
+   "stat": 127,
+   "born": 2001,
+   "seasons": 0,
+   "academy": "",
+   "initials": "MAY",
+   "female": false,
+   "pace": 88.0,
+   "pace_peak": 88.0,
+   "racecraft": 90.0,
+   "racecraft_peak": 90.0,
+   "awareness": 78.0,
+   "awareness_peak": 78.0,
+   "experience": 80.0,
+   "experience_peak": 80.0
   },
   "yuki_tsunoda": {
    "kind": "f1",

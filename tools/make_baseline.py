@@ -26,7 +26,8 @@ CAREERS = {
 }
 # entrant references of the 2025 grid that are entrant labels, not driver labels
 ENTRANT_FIX = {"kimi_antonelli": "andrea-kimi_antonelli", "jr": "carlos_sainz-jr"}
-# My Team / story drivers that never race in Driver Career
+# My Team / story drivers that never race in Driver Career (Konnersport's two race drivers come in through
+# OPTIONAL_TEAMS below)
 SKIP = {"aiden_jackson", "callie_mayer", "arron_barnes_konnersport", "noah_visser_konnersport",
         "arron_barnes_zenith", "noah_visser_zenith", "default_driver", "default_player"}
 LEGENDS = {"ayrton_senna", "micheal_schumacher", "jacques_villeneuve", "jenson_button", "mika_hakkinen",
@@ -57,7 +58,14 @@ TEAMS = {
     "haas": ("Haas", 60, 70, "haas", 0.60),
     "sauber": ("Kick Sauber", 66, 66, "audi", 0.60),
     "renault": ("Alpine", 66, 62, "alpine", 0.35),
+    # the eleventh team a 2025 Driver Career can have (entrant list f1_2025_with_konnersport)
+    "konnersport": ("Konnersport", 55, 64, "konnersport", 0.45),
 }
+# teams only some careers have: the market plans them once the game shows them on the grid. The game races
+# Konnersport in the custom team's slot (stat 104, seen in the career's entrant rows), not under its own stat.
+OPTIONAL_TEAMS = {"f1_career_2025": {"konnersport": ["aiden_jackson", "callie_mayer"]}}
+TEAM_STAT = {"konnersport": 104}
+TEAM_CODE = {"konnersport": "KON"}
 # junior academies (driver -> family). A family's teams prefer their own juniors.
 ACADEMY = {
     "isack_hadjar": "redbull", "liam_lawson": "redbull", "arvid_lindblad": "redbull", "yuki_tsunoda": "redbull",
@@ -94,7 +102,7 @@ CONTRACTS = {
            "fernando_alonso": 2026, "lance_stroll": 2027, "oliver_bearman": 2027, "esteban_ocon": 2026,
            "nico_hulkenberg": 2026, "gabriel_bortoleto": 2027, "pierre_gasly": 2028, "franco_colapinto": 2026,
            "sergio_perez": 2027, "valtteri_bottas": 2026},
-    2025: {"max_verstappen": 2028, "yuki_tsunoda": 2025, "lando_norris": 2027, "oscar_piastri": 2026,
+    2025: {"aiden_jackson": 2026, "callie_mayer": 2026, "max_verstappen": 2028, "yuki_tsunoda": 2025, "lando_norris": 2027, "oscar_piastri": 2026,
            "george_russell": 2025, "andrea-kimi_antonelli": 2025, "charles_leclerc": 2029, "lewis_hamilton": 2026,
            "alex_albon": 2026, "carlos_sainz-jr": 2026, "liam_lawson": 2025, "isack_hadjar": 2025,
            "fernando_alonso": 2026, "lance_stroll": 2026, "oliver_bearman": 2026, "esteban_ocon": 2026,
@@ -178,6 +186,10 @@ for group, c in CAREERS.items():
             out["drivers"].setdefault(lab, {"kind": "legend" if lab in LEGENDS else kind})
             if kind == "reserve" and e.get("team"):
                 reserves[lab] = e["team"]  # the team whose reserve driver he is in this career
+    for team, pair in OPTIONAL_TEAMS.get(group, {}).items():
+        seats[team] = list(pair)
+        for lab in pair:
+            out["drivers"].setdefault(lab, {})["home"] = team  # races only while his team is in the career
     for team, pair in seats.items():
         for lab in pair:
             out["drivers"].setdefault(lab, {})["kind"] = "f1"
@@ -196,10 +208,13 @@ def colour(v):
 
 for label, (name, prestige, perf, family, patience) in TEAMS.items():
     t = teams_db[label]
-    out["teams"][label] = {"name": name, "code": t["display_name_code"], "stat": int(t["stat_id"]),
+    out["teams"][label] = {"name": name, "code": t["display_name_code"] or TEAM_CODE.get(label, ""),
+                           "stat": TEAM_STAT.get(label, int(t["stat_id"])),
                            "prestige": prestige, "performance": perf, "family": family, "patience": patience,
                            "junior": label in JUNIOR_TEAMS,
                            "colour": colour(t.get("ui_team_colour") or t.get("primary_colour"))}
+    if any(label in teams for teams in OPTIONAL_TEAMS.values()):
+        out["teams"][label]["optional"] = True
 
 # name keys used by exactly one driver: Silly Season can rename those drivers (new talents) without
 # renaming anyone else

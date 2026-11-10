@@ -31,6 +31,8 @@ if /i "%1"=="test" (
     build\sim_test.exe ..\data\baseline.json 10 %2 || exit /b 1
     cl %FLAGS% tests\grid_test.cpp src\market.cpp src\text.cpp src\names.cpp /Fe:build\grid_test.exe /link /NOLOGO || exit /b 1
     build\grid_test.exe ..\data\baseline.json || exit /b 1
+    cl %FLAGS% tests\history_test.cpp src\market.cpp src\text.cpp src\names.cpp /Fe:build\history_test.exe /link /NOLOGO || exit /b 1
+    build\history_test.exe ..\data\baseline.json || exit /b 1
 )
 if /i "%1"=="preview" (
     cl %FLAGS% /LD tests\core_stub.cpp /Fe:build\swofty_core.dll /link /NOLOGO /NOIMPLIB || exit /b 1

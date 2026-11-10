@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "alexs.silly-season",
   "name": "Silly Season",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "author": "Alex Sánchez",
   "description": "A living driver market for Career mode: rumours, talks, signings, retirements, sackings, press conferences, F2 and new talents, with inbox mails, breaking news and a market panel (F7).",
   "license": "MIT",
@@ -160,7 +160,7 @@
       "id": "midseason",
       "type": "toggle",
       "label": "Mid-season changes",
-      "description": "Impatient teams can sack an underperforming driver and promote a reserve or a youngster.",
+      "description": "Impatient teams can sack an underperforming driver mid-season and bring in a free agent the game lets race.",
       "default": true,
       "binds": "native"
     },
@@ -254,7 +254,7 @@
       "id": "progression",
       "type": "toggle",
       "label": "Driver progression (experimental)",
-      "description": "Every winter young drivers improve and veterans fade. Writes the ratings into the career.",
+      "description": "Every winter young drivers improve and veterans fade in the market's view (value, interest, cards). Only new talents' ratings are written into the game, which develops its own drivers.",
       "default": false,
       "binds": "native"
     },
@@ -274,6 +274,132 @@
         }
       ],
       "default": "silly_season",
+      "binds": "native"
+    },
+    {
+      "id": "personality",
+      "type": "toggle",
+      "label": "Driver personalities",
+      "description": "Each driver is ambitious, loyal or after the money. It shapes who renews, who turns a team down, who asks to leave and how much a driver costs.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "team_plans",
+      "type": "toggle",
+      "label": "Team plans",
+      "description": "Each team follows a plan: title push, contender, rebuild, youth or survival. It shapes who they sign and how patient they are. Off: the plain rules of 1.0.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "deadline_day",
+      "type": "toggle",
+      "label": "Deadline day",
+      "description": "The last two races before next season's grid is set: deals close fast, a surprise swoop can land, and the panel, ticker and banner count down.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "signing_cards",
+      "type": "toggle",
+      "label": "Bombshell signing cards",
+      "description": "When a star signs for a team at least as good as his, a full card shows the move instead of the usual banner.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "grid_reveal",
+      "type": "toggle",
+      "label": "Grid reveal",
+      "description": "Once next season's grid is final, the next Team HQ visit reveals it team by team on a full screen. Press R on the Grid page (F7) to see it again.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "hq_widget",
+      "type": "toggle",
+      "label": "Team HQ market card",
+      "description": "A small card in a corner of Team HQ for a few seconds: unread news, the latest headline and the deadline countdown.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "car_numbers",
+      "type": "toggle",
+      "label": "Racing numbers for new talents",
+      "description": "New talents pick a racing number of their own when they reach F1. If another driver holds it, the next one is tried.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "living_market",
+      "type": "toggle",
+      "label": "Living paddock",
+      "description": "Sister teams swap drivers mid-season, sponsors come and go, prize money moves the budgets, and team principals can be sacked. Off: fixed budgets, no swaps, no new bosses.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "press_popup",
+      "type": "toggle",
+      "label": "Press questions on screen",
+      "description": "When the press has a question, it shows at Team HQ with the three answers: press 1, 2 or 3 to answer, or F7 to read it in the panel.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "race_report",
+      "type": "toggle",
+      "label": "Report after each race",
+      "description": "Back at Team HQ after a race, a card sums up what changed: your value, new rumours, done deals and the teams following you.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "awards_show",
+      "type": "toggle",
+      "label": "Awards ceremony",
+      "description": "When the season closes, the next Team HQ visit hands out the season awards one by one on a full screen.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "season_cover",
+      "type": "toggle",
+      "label": "Season cover",
+      "description": "The first Team HQ visit of each season opens with its cover: every team's plan and the winter's moves.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "panel_size",
+      "type": "choice",
+      "label": "Panel size (F7)",
+      "description": "How big the market panel draws on screen. Small fits more on a laptop; large reads better from the sofa.",
+      "values": [
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "normal",
+          "label": "Normal"
+        },
+        {
+          "value": "large",
+          "label": "Large"
+        }
+      ],
+      "default": "normal",
+      "binds": "native"
+    },
+    {
+      "id": "academies",
+      "type": "toggle",
+      "label": "Academies and reserves",
+      "description": "Teams sign young drivers to their academies and a reserve driver each winter, bring rookies in through their second or partner team (Racing Bulls, Haas) and call the best of them up for stand-ins.",
+      "default": true,
       "binds": "native"
     }
   ],

@@ -184,8 +184,34 @@ std::string h_press(Lang l, const std::string &topic, const std::string &about, 
     if (topic == "wish")
         return reply ? (l.es ? "ELIGES COMPAÑERO" : "YOU NAME YOUR TEAM-MATE")
                      : (l.es ? "¿QUIÉN A TU LADO? PREGUNTA LA PRENSA" : "WHO NEXT TO YOU? THE PRESS ASK");
+    if (topic == "deadline")
+        return reply ? (l.es ? "HABLAS DEL DEADLINE DAY" : "YOU ON DEADLINE DAY")
+                     : (l.es ? "DEADLINE DAY: LA PRENSA TE PREGUNTA" : "DEADLINE DAY: THE PRESS ASK YOU");
+    if (topic == "renewal")
+        return reply ? (l.es ? "HABLAS DE TU RENOVACIÓN" : "YOU ON YOUR NEW DEAL")
+                     : (l.es ? "¿RENUEVAS? PREGUNTA LA PRENSA" : "NEW DEAL? THE PRESS ASK");
     return fmt(reply ? (l.es ? "HABLAS DE %1" : "YOU ON %1") : (l.es ? "LA PRENSA PREGUNTA POR %1" : "THE PRESS ASK ABOUT %1"),
                who(about));
+}
+
+std::string h_meeting(Lang l, const std::string &team)
+{
+    return fmt(l.es ? "REUNIÓN SECRETA CON %1" : "SECRET MEETING WITH %1?", where(team));
+}
+
+std::string meeting(Lang l, int pick, const std::string &team)
+{
+    static const char *const es[] = {
+        "Tu entorno fue visto con gente de %1 lejos del paddock. Nadie quiere hablar todavía.",
+        "%1 y tu mánager se han reunido en secreto, según varias fuentes. En tu equipo no hacen comentarios.",
+        "Una cena discreta con la cúpula de %1 ha encendido el paddock. ¿Te estás buscando la salida?",
+    };
+    static const char *const en[] = {
+        "Your camp was seen with %1 people away from the paddock. Nobody wants to talk yet.",
+        "%1 and your manager have met in secret, several sources say. Your team won't comment.",
+        "A quiet dinner with %1's top brass has the paddock talking. Are you looking for a way out?",
+    };
+    return fmt(l.es ? choose(es, pick) : choose(en, pick), team);
 }
 
 std::string h_press_silence(Lang l) { return l.es ? "SIN COMENTARIOS" : "NO COMMENT"; }
@@ -360,9 +386,8 @@ const char *outlet_name(int i)
 
 int outlet_reliability(int i) { return (i % kOutlets + kOutlets) % kOutlets + 1; }
 
-std::string outlet_label(Lang l, int i)
+std::string outlet_label(Lang l, int i, int r)
 {
-    int r = outlet_reliability(i);
     const char *level = l.es ? (r >= 4 ? "fiabilidad alta" : r == 3 ? "fiabilidad media" : "fiabilidad baja")
                              : (r >= 4 ? "high reliability" : r == 3 ? "medium reliability" : "low reliability");
     return std::string(outlet_name(i)) + " (" + level + ")";
@@ -737,10 +762,247 @@ std::string kind(Lang l, const std::string &k)
         return l.es ? "sustituto" : "stand-in";
     if (k == "left")
         return l.es ? "sin asiento" : "no seat";
+    if (k == "promoted")
+        return l.es ? "sube al equipo grande" : "promoted";
+    if (k == "demoted")
+        return l.es ? "baja al filial" : "demoted";
     return k;
 }
 
 std::string free_seat(Lang l) { return l.es ? "(libre)" : "(open)"; }
 std::string unknown_seat(Lang l) { return l.es ? "¿?" : "?"; }
+
+// ---------------------------------------------------------------------------------------------------
+// 1.1.0 phase 3
+
+std::string trait_line(Lang l, int pick, const std::string &trait, const std::string &driver)
+{
+    if (trait == "ambition") {
+        static const char *const es[] = {"%1 siempre ha ido a donde está el coche más rápido.", "En el paddock lo tienen claro: %1 solo piensa en ganar."};
+        static const char *const en[] = {"%1 has always gone where the fastest car is.", "The paddock knows it: %1 only thinks about winning."};
+        return fmt(l.es ? choose(es, pick) : choose(en, pick), driver);
+    }
+    if (trait == "loyalty") {
+        static const char *const es[] = {"%1 es de los que no cambian de equipo a la primera.", "La lealtad de %1 es conocida en todo el paddock."};
+        static const char *const en[] = {"%1 isn't one to switch teams at the first offer.", "%1's loyalty is well known around the paddock."};
+        return fmt(l.es ? choose(es, pick) : choose(en, pick), driver);
+    }
+    static const char *const es[] = {"Dicen que la oferta económica ha sido decisiva para %1.", "%1 no ha escondido nunca que el contrato importa."};
+    static const char *const en[] = {"The money is said to have sealed it for %1.", "%1 has never hidden that the contract matters."};
+    return fmt(l.es ? choose(es, pick) : choose(en, pick), driver);
+}
+
+std::string h_swoop(Lang l, const std::string &driver, const std::string &team)
+{
+    return fmt(l.es ? "GOLPE DE ÚLTIMA HORA: %1 A %2" : "DEADLINE-DAY SWOOP: %1 TO %2", who(driver), where(team));
+}
+
+std::string h_domino(Lang l, int pick, const std::string &next, const std::string &team)
+{
+    static const char *const es[] = {"EFECTO DOMINÓ: %1 EN LA RECÁMARA DE %2", "%2 MUEVE FICHA: %1"};
+    static const char *const en[] = {"DOMINO EFFECT: %1 NEXT FOR %2", "%2 MOVE FAST: %1"};
+    return fmt(l.es ? choose(es, pick) : choose(en, pick), who(next), where(team));
+}
+
+std::string domino(Lang l, int pick, const std::string &leaver, const std::string &team, const std::string &next,
+                   const std::string &next_from)
+{
+    std::string from = next_from.empty() ? std::string() : (l.es ? " (" + next_from + ")" : " (" + next_from + ")");
+    static const char *const es[] = {
+        "La marcha de %1 deja un hueco en %2, y no ha tardado en moverse: %3%4 ya negocia para ocupar su asiento.",
+        "Una ficha arrastra a la siguiente. Con %1 fuera, %2 ha abierto conversaciones con %3%4.",
+    };
+    static const char *const en[] = {
+        "%1's move leaves a gap at %2, and they haven't waited: %3%4 is already in talks for the seat.",
+        "One domino knocks the next. With %1 on the way out, %2 have opened talks with %3%4.",
+    };
+    return fmt(l.es ? choose(es, pick) : choose(en, pick), leaver, team, next, from);
+}
+
+std::string h_refusal(Lang l, int pick, const std::string &driver, const std::string &team)
+{
+    static const char *const es[] = {"%1 DICE NO A %2", "%2 SE QUEDA SIN %1", "PORTAZO DE %1 A %2"};
+    static const char *const en[] = {"%1 SAYS NO TO %2", "%2 KNOCKED BACK BY %1", "%1 TURNS DOWN %2"};
+    return fmt(l.es ? choose(es, pick) : choose(en, pick), who(driver), where(team));
+}
+
+std::string refusal(Lang l, int pick, const std::string &driver, const std::string &team, const std::string &from,
+                    bool buyout, const std::string &trait)
+{
+    if (buyout) {
+        static const char *const es[] = {"%2 intentó pagar la salida de %1, pero %1 ha preferido quedarse en %3.",
+                                         "No hubo forma: %1 rechaza la oferta de %2 y sigue comprometido con %3."};
+        static const char *const en[] = {"%2 tried to buy %1 out, but %1 would rather stay at %3.",
+                                         "No way through: %1 turns down %2's offer and stays committed to %3."};
+        return fmt(l.es ? choose(es, pick) : choose(en, pick), driver, team, from.empty() ? (l.es ? "su equipo" : "his team") : from);
+    }
+    if (trait == "money") {
+        static const char *const es[] = {"%1 rechaza la oferta de %2: los números no le cuadran."};
+        static const char *const en[] = {"%1 turns down %2's offer: the numbers didn't add up."};
+        return fmt(l.es ? choose(es, pick) : choose(en, pick), driver, team);
+    }
+    static const char *const es[] = {"%1 rechaza a %2: aspira a un coche capaz de ganar.",
+                                     "%2 quería a %1, pero el piloto espera algo mejor."};
+    static const char *const en[] = {"%1 turns %2 down: the target is a car that can win.",
+                                     "%2 wanted %1, but the driver is holding out for something better."};
+    return fmt(l.es ? choose(es, pick) : choose(en, pick), driver, team);
+}
+
+std::string h_deadline(Lang l, int left)
+{
+    if (left <= 1)
+        return l.es ? "DEADLINE DAY: ÚLTIMA CARRERA" : "DEADLINE DAY: ONE RACE LEFT";
+    return l.es ? "DEADLINE DAY: QUEDAN 2 CARRERAS" : "DEADLINE DAY: TWO RACES LEFT";
+}
+
+std::string deadline(Lang l, int year, int left, int open, const std::string &list)
+{
+    std::string races = left <= 1 ? (l.es ? "Una carrera" : "One race") : (l.es ? "Dos carreras" : "Two races");
+    if (open == 0)
+        return fmt(l.es ? "%1 para cerrar la parrilla de %2. Todos los asientos parecen atados, pero aún puede saltar la sorpresa."
+                        : "%1 left before the %2 grid is set. Every seat looks settled, but there's still time for a surprise.",
+                   races, num(year));
+    return fmt(l.es ? "%1 para cerrar la parrilla de %2 y quedan %3 asientos por decidir: %4. Se esperan movimientos rápidos."
+                    : "%1 left before the %2 grid is set, with %3 seats still to fill: %4. Expect things to move fast.",
+               races, num(year), num(open), list);
+}
+
+std::string h_wants_out(Lang l, const std::string &driver, const std::string &team)
+{
+    return fmt(l.es ? "%1 QUIERE SALIR DE %2" : "%1 WANTS OUT OF %2", who(driver), where(team));
+}
+
+std::string wants_out(Lang l, int pick, const std::string &driver, const std::string &team)
+{
+    static const char *const es[] = {"%1 tiene contrato con %2, pero su entorno deja claro que quiere un coche ganador ya.",
+                                     "Paciencia agotada: %1 ha pedido a %2 que le deje marcharse a final de año."};
+    static const char *const en[] = {"%1 is under contract at %2, but the camp makes it clear: it's a winning car or nothing.",
+                                     "Patience gone: %1 has asked %2 to be released at the end of the year."};
+    return fmt(l.es ? choose(es, pick) : choose(en, pick), driver, team);
+}
+
+std::string strategy_name(Lang l, const std::string &k)
+{
+    if (k == "title")
+        return l.es ? "A por el título" : "Title push";
+    if (k == "rebuild")
+        return l.es ? "Reconstrucción" : "Rebuild";
+    if (k == "youth")
+        return l.es ? "Cantera" : "Youth";
+    if (k == "survival")
+        return l.es ? "Supervivencia" : "Survival";
+    return l.es ? "Aspirantes" : "Contenders";
+}
+
+std::string h_strategy(Lang l, const std::string &team, const std::string &now)
+{
+    if (now == "title")
+        return fmt(l.es ? "%1 VA A POR EL TÍTULO" : "%1 GO FOR THE TITLE", where(team));
+    if (now == "survival")
+        return fmt(l.es ? "%1, EN MODO SUPERVIVENCIA" : "%1 IN SURVIVAL MODE", where(team));
+    return fmt(l.es ? "%1 SE RECONSTRUYE" : "%1 START A REBUILD", where(team));
+}
+
+std::string strategy_switch(Lang l, const std::string &team, const std::string &was, const std::string &now)
+{
+    std::string a = strategy_name(l, was), b = strategy_name(l, now);
+    if (now == "title")
+        return fmt(l.es ? "%1 cambia de plan (%2 > %3): con el coche que tiene, solo vale ganar. Buscarán pilotos probados."
+                        : "%1 change course (%2 > %3): with this car, only winning will do. Proven drivers are the target.",
+                   team, a, b);
+    if (now == "survival")
+        return fmt(l.es ? "%1 cambia de plan (%2 > %3): el dinero manda y los pilotos con patrocinio ganan enteros."
+                        : "%1 change course (%2 > %3): money rules now, and drivers with sponsors move up the list.",
+                   team, a, b);
+    return fmt(l.es ? "%1 cambia de plan (%2 > %3): mirarán a largo plazo y a los pilotos jóvenes."
+                    : "%1 change course (%2 > %3): they'll look long term, and at young drivers.",
+               team, a, b);
+}
+
+std::string h_awards(Lang l, int year) { return (l.es ? "PREMIOS DE LA TEMPORADA " : "SEASON AWARDS ") + num(year); }
+
+std::string award_title(Lang l, const std::string &key)
+{
+    if (key == "champion")
+        return l.es ? "Campeón" : "Champion";
+    if (key == "constructors")
+        return l.es ? "Constructores" : "Constructors";
+    if (key == "rookie")
+        return l.es ? "Novato del año" : "Rookie of the year";
+    if (key == "overachiever")
+        return l.es ? "Más que su coche" : "Beat the car";
+    return l.es ? "El que más ha crecido" : "Most improved";
+}
+
+std::string award_detail(Lang l, const std::string &key, int a, int b, float c)
+{
+    char buf[64];
+    if (key == "champion") {
+        std::snprintf(buf, sizeof buf, l.es ? "%d pts, %d victorias" : "%d pts, %d wins", a, b);
+    } else if (key == "constructors") {
+        std::snprintf(buf, sizeof buf, "%d pts", a);
+    } else if (key == "rookie") {
+        std::snprintf(buf, sizeof buf, l.es ? "%d pts, %d podios" : "%d pts, %d podiums", a, b);
+    } else if (key == "overachiever") {
+        std::snprintf(buf, sizeof buf, l.es ? "%d pts, %d puestos por encima de su coche" : "%d pts, %d places above his car", a, b);
+    } else {
+        std::snprintf(buf, sizeof buf, l.es ? "valor +%.1f" : "value +%.1f", static_cast<double>(c));
+    }
+    return buf;
+}
+
+std::string h_media(Lang l) { return l.es ? "QUIÉN ACERTÓ EN EL MERCADO" : "MEDIA SCORECARD"; }
+
+std::string media_scorecard(Lang l, const std::string &best, int bh, int bn, int br, const std::string &worst, int wh, int wn, int wr)
+{
+    char buf[400];
+    std::snprintf(buf, sizeof buf,
+                  l.es ? "%s acertó %d de %d historias esta temporada (fiabilidad %d/5). %s, solo %d de %d (fiabilidad %d/5)."
+                       : "%s got %d of %d stories right this season (reliability %d/5). %s managed only %d of %d (reliability %d/5).",
+                  best.c_str(), bh, bn, br, worst.c_str(), wh, wn, wr);
+    return buf;
+}
+
+std::string h_scout(Lang l, int year) { return (l.es ? "INFORME DEL OJEADOR " : "SCOUT REPORT ") + num(year); }
+
+std::string scout_intro(Lang l, int year)
+{
+    return fmt(l.es ? "Tu ojeador ha preparado la lista de candidatos para tu segundo asiento en %1:"
+                    : "Your scout's shortlist for your second seat in %1:",
+               num(year));
+}
+
+std::string scout_status(Lang l, const std::string &status)
+{
+    if (status == "f2")
+        return "F2";
+    if (status == "expiring")
+        return l.es ? "acaba contrato" : "out of contract";
+    return l.es ? "libre" : "free agent";
+}
+
+std::string scout_interest(Lang l, int interest)
+{
+    if (interest >= 2)
+        return l.es ? "muy interesado" : "keen";
+    if (interest == 1)
+        return l.es ? "dispuesto a escuchar" : "open to it";
+    return l.es ? "difícil de convencer" : "hard sell";
+}
+
+std::string h_number(Lang l, const std::string &driver, int number)
+{
+    return fmt(l.es ? "%1 LLEVARÁ EL #%2" : "#%2 FOR %1", who(driver), num(number));
+}
+
+std::string number_line(Lang l, const std::string &driver, const std::string &team, int number)
+{
+    return fmt(l.es ? "%1 ya tiene número para su etapa en la F1: correrá con el #%3 en %2."
+                    : "%1 has a number for life in F1: the #%3 on the %2 car.",
+               driver, team, num(number));
+}
+
+// 1.1.0 phase 5
+#include "text5.inl"
 
 } // namespace ss::text
