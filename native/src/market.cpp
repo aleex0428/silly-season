@@ -747,7 +747,17 @@ void sync_grid(State &st, const std::vector<GridCar> &shown)
             if (c.team == sb.team && c.driver == sb.in)
                 c.driver = sb.out;
     std::map<std::string, std::vector<std::string>> by_team;
+    // 1.1.2: one seat per driver. A read that names a driver twice (the player's row naming his team-mate) keeps the
+    // human's car, else the first; the other seat stays empty instead of showing the same driver twice
+    std::set<std::string> placed;
+    for (const GridCar &c : cars)
+        if (c.human && !c.driver.empty())
+            placed.insert(c.driver);
+    std::set<std::string> humans = placed;
+    placed.clear();
     for (const GridCar &c : cars) {
+        if (!c.driver.empty() && ((!c.human && humans.count(c.driver)) || !placed.insert(c.driver).second))
+            continue;
         if (c.human) {
             st.player = c.driver;
             st.player_team = c.team;

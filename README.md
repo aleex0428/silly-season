@@ -4,7 +4,7 @@ A living driver market for F1 25's **Career mode**. Through the season rumours a
 signings, others are denied. Veterans announce their retirement, impatient teams sack underperforming drivers and the
 academies promote their F2 youngsters. When a new season starts, the game's grid really changes.
 
-- **Addon:** `alexs.silly-season` 1.1.1
+- **Addon:** `alexs.silly-season` 1.1.2
 - **Requires:** Swofty Launcher 1.8.36 or later and F1 25 on Steam (tested on the Steam copy)
 - **Careers:** Driver Career and My Team (where the game makes the moves: see Known limits) for 2026 (`f1_career_2026`) and 2025 (`f1_career_2025`), and Progressive
   Career on the Swofty Seasons (`swofty.swofty-seasons-progressive`) in history mode. Careers from other addons keep

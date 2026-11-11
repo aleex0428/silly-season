@@ -19,6 +19,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <swofty/career.hpp>
@@ -432,6 +433,9 @@ bool f2_phase()
 }
 
 void begin_market(const std::string &group, const std::string &id, bool fresh);
+namespace game_pool {
+void start(const std::string &group); // game_pool.inl: read the career's driver lists in the background
+}
 
 // a career of a data group the baseline knows
 void begin_career(const events::Context &ctx, bool fresh)
@@ -502,6 +506,8 @@ void begin_market(const std::string &group, const std::string &id, bool fresh)
         real_people_in(g_state);
     g_real_now = g_state.real;
     g_loaded = true;
+    if (!g_real_career)
+        game_pool::start(group); // ready by the first Team HQ, which then doesn't wait for it
     g_weekends_ended = 0;
     g_season_ended = g_moves_finalised = false;
     g_results.clear();
@@ -825,6 +831,7 @@ std::vector<RealSeat> g_last_seats;                     // the rows last read, t
 // 1.1.0 phase 5: each driver's career row as the game holds it (stat id -> S race seat, F free agent, R reserve,
 // M more than one row), from the last read
 std::unordered_map<uint32_t, char> g_row_class;
+std::unordered_map<uint32_t, std::string> g_row_raw; // 1.1.2: each driver's row as read (hex), by stat id
 
 namespace rows {
 constexpr uintptr_t kEntrantsBegin = 0x2e0, kEntrantsEnd = 0x2e8, kBusy = 0x2f8; // CareerEntity
@@ -885,6 +892,7 @@ bool read_real_grid(std::vector<RealSeat> &out, std::string &why)
     std::set<std::pair<uint32_t, int>> seats;
     size_t humans = 0;
     g_row_class.clear();
+    g_row_raw.clear();
     for (size_t off = 0; off < buf.size(); off += rows::kSize) {
         uint32_t ordinal = rows::at<uint32_t>(buf, off + rows::kOrdinal), driver = rows::at<uint32_t>(buf, off + rows::kDriver),
                  team = rows::at<uint32_t>(buf, off + rows::kTeam), vehicle = rows::at<uint32_t>(buf, off + rows::kVehicle);
@@ -898,6 +906,11 @@ bool read_real_grid(std::vector<RealSeat> &out, std::string &why)
             auto [it, fresh] = g_row_class.emplace(driver >> 16, cls);
             if (!fresh)
                 it->second = 'M';
+            // 1.1.2: the whole row, for the log line of a driver who leaves the grid (what a retirement looks like)
+            char hex[rows::kSize * 2 + 1];
+            for (size_t b = 0; b < rows::kSize; ++b)
+                std::snprintf(hex + b * 2, 3, "%02x", buf[off + b]);
+            g_row_raw[driver >> 16] = hex;
         }
         if (teamless || !car || seat < 0 || seat > 1)
             continue; // a reserve, a free agent or a driver without a car
@@ -1039,6 +1052,7 @@ std::string driver_for_stat(uint32_t stat)
 
 std::string g_own_team_name;      // the player's own My Team team, shown in the hub ("" when he drives for a known team)
 std::string g_real_grid_said;     // the last outcome logged
+int g_dup_logged = 0;              // 1.1.2: times the player's row named another car's driver (logged 3 times)
 std::string g_rows_said;          // the last row count logged
 
 // g_lock held, after a read of the career's rows: the drivers the game takes for a race seat now. The market's
@@ -1083,6 +1097,13 @@ void take_row_classes()
     }
 }
 
+// 1.1.2: an id the market keeps for the player that is really another car's driver (a save of 1.1.1 or earlier
+// where the player took the team-mate's identity)
+bool shared_player(const std::string &id, const std::vector<RealSeat> &seats)
+{
+    return std::any_of(seats.begin(), seats.end(), [&](const RealSeat &o) { return !o.human && known_driver(o.driver) == id; });
+}
+
 // g_lock held: the market takes the game's grid; false when it can't be read (the caller falls back)
 bool sync_real_grid()
 {
@@ -1124,8 +1145,21 @@ bool sync_real_grid()
         std::string driver;
         if (s.human) {
             driver = known_driver(s.driver);
+            // 1.1.2: the human's row can name the same driver as another car's row (a created driver in a 2025
+            // career): then he is a driver of his own, never the team-mate, or the hub showed "You" in both seats
+            bool shared = std::any_of(seats.begin(), seats.end(), [&](const RealSeat &o) {
+                return !o.human && (o.driver == s.driver || (!driver.empty() && known_driver(o.driver) == driver));
+            });
+            if (shared) {
+                if (g_dup_logged++ < 3)
+                    log("[silly-season] real grid: the player's row names %s (stat %u), as another car does; he is his own driver",
+                        driver.empty() ? "nobody" : driver.c_str(), s.driver);
+                driver.clear();
+            }
             if (driver.empty())
-                driver = g_state.player.empty() ? std::string("player") : g_state.player; // a created driver
+                driver = g_state.player.empty() || g_state.driver(g_state.player) == nullptr || shared_player(g_state.player, seats)
+                             ? std::string("player")
+                             : g_state.player; // a created driver
             player = driver;
             player_team = team;
         } else {
@@ -1175,11 +1209,27 @@ bool sync_real_grid()
     }
     // an observer career (My Team): where everyone was, so the moves the game made can be told
     std::map<std::string, std::string> before;
-    if (g_state.observer)
-        for (const auto &[id, d] : g_state.drivers)
-            if (!d.team.empty())
-                before[id] = d.team;
+    for (const auto &[id, d] : g_state.drivers)
+        if (!d.team.empty())
+            before[id] = d.team;
     ss::sync_grid(g_state, cars);
+    // 1.1.2: a driver who left the grid since the last read, as the game holds him now (a retired driver may keep
+    // his row: what tells him apart is what this line is for). A handful per read, and only when the grid is whole.
+    if (cars.size() >= 16) {
+        int told = 0;
+        for (const auto &[id, team] : before) {
+            const ss::Driver *d = g_state.driver(id);
+            if (!d || !d->team.empty() || id == g_state.player || told >= 6)
+                continue;
+            ++told;
+            uint32_t stat = static_cast<uint32_t>(d->stat);
+            auto cls = g_row_class.find(stat);
+            auto raw = g_row_raw.find(stat);
+            log("[silly-season] real grid: %s (stat %u) left %s; career row: %s%s%s", id.c_str(), stat, team.c_str(),
+                cls == g_row_class.end() ? "none" : std::string(1, cls->second).c_str(), raw == g_row_raw.end() ? "" : ", ",
+                raw == g_row_raw.end() ? "" : raw->second.c_str());
+        }
+    }
     if (have_human && player_team.empty()) {
         // sync_grid only seats the known teams: the player keeps his own team
         g_state.player = player;

@@ -161,12 +161,29 @@ bool icon(const std::string &label)
     return false;
 }
 
+// entrants.drivers in one pass: label -> its row (1.1.2: a lookup per driver walked the whole table each time,
+// and with a hundred drivers from other addons the first Team HQ after a load stalled for 12-14 s)
+const std::unordered_map<std::string, db::Cursor> &driver_rows()
+{
+    static std::unordered_map<std::string, db::Cursor> map;
+    static bool built = false;
+    if (built || !db::available())
+        return map;
+    built = true;
+    db::Cursor c{};
+    for (db::Result r = db::open("entrants.drivers", &c); r == db::Result::ok; r = db::step(&c))
+        if (const char *label = db::row_name(&c))
+            map.emplace(label, c);
+    return map;
+}
+
 // one driver of the game by his label, from entrants.drivers and his statistics; false when he has no row
 bool driver(const std::string &label, const std::string &kind, ss::GameDriver &g)
 {
-    db::Cursor c{};
-    if (db::row("entrants.drivers", label, &c) != db::Result::ok)
+    auto row = driver_rows().find(label);
+    if (row == driver_rows().end())
         return false;
+    db::Cursor c = row->second;
     auto cell = [&](const char *field) {
         db::Value v{};
         return db::cell(&c, field, &v) == db::Result::ok ? text_of(v) : std::string();
@@ -273,17 +290,70 @@ std::vector<ss::GameDriver> read(const std::string &group, std::string &why)
     return out;
 }
 
+// The reading runs on a thread of its own (the database can be read from any thread), once per data group while
+// the game runs: the game database doesn't change after boot. Team HQ only takes the result, so it never waits.
+struct Work {
+    std::mutex lock;   // the results, and which groups are being read
+    std::mutex read;   // one read at a time (the indexes above are built by the first)
+    std::map<std::string, std::pair<std::vector<ss::GameDriver>, std::string>> done;
+    std::set<std::string> running;
+};
+Work &work()
+{
+    static Work w;
+    return w;
+}
+
+// start reading a group's lists in the background, unless it was read or is being read
+void start(const std::string &group)
+{
+    if (group.empty() || !db::available())
+        return;
+    {
+        std::lock_guard l(work().lock);
+        if (work().done.count(group) || !work().running.insert(group).second)
+            return;
+    }
+    std::thread([group] {
+        std::vector<ss::GameDriver> list;
+        std::string why;
+        {
+            std::lock_guard r(work().read);
+            list = read(group, why);
+        }
+        std::lock_guard l(work().lock);
+        work().running.erase(group);
+        if (!list.empty() || db::available())
+            work().done[group] = {std::move(list), std::move(why)};
+    }).detach();
+}
+
+// the group's lists once read; false while they are still being read (or haven't been asked for)
+bool take(const std::string &group, std::vector<ss::GameDriver> &list, std::string &why)
+{
+    std::lock_guard l(work().lock);
+    auto it = work().done.find(group);
+    if (it == work().done.end())
+        return false;
+    list = it->second.first;
+    why = it->second.second;
+    return true;
+}
+
 } // namespace game_pool
 
-// g_lock held: the career's drivers the market doesn't know join it (once per career load)
+// g_lock held: the career's drivers the market doesn't know join it (once per career load). The lists are read in
+// the background (game_pool::start, from the career's load); until they are, the next Team HQ tries again.
 void adopt_game_pool(const char *where)
 {
     if (g_pool_read || g_real_career || !g_loaded)
         return;
     std::string why;
-    std::vector<ss::GameDriver> list = game_pool::read(g_state.group, why);
-    if (list.empty() && !db::available())
-        return; // try again at the next Team HQ
+    std::vector<ss::GameDriver> list;
+    if (!game_pool::take(g_state.group, list, why)) {
+        game_pool::start(g_state.group);
+        return;
+    }
     g_pool_read = true;
     // a market saved before the twins were left out: they go, unless they raced
     for (auto it = g_state.drivers.begin(); it != g_state.drivers.end();)

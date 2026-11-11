@@ -1,3 +1,9 @@
+# 1.1.2
+
+- **No more stall at Team HQ.** With many drivers from other addons (More Driver Models, for example), the first Team HQ visit after loading a career could freeze for 10 to 15 seconds while Silly Season read the career's driver lists from the game database. It now reads them in the background as soon as the career loads, finds each driver in one pass instead of searching the whole table every time, and keeps them while the game runs. Team HQ no longer waits.
+- **"You" in both seats of your team is fixed.** In some Driver Careers (2025 careers with your own driver), the hub could show you in both seats, because your car's row named the same driver as your team-mate's. Your team-mate now keeps his own name, and the hub never seats one driver twice.
+- **Retired drivers in My Team (diagnostics):** when a driver leaves the grid, the log now records how the game holds him, to find out why a driver the game retired could still turn up in Silly Season's rumours. Send your logs if you see it.
+
 # 1.1.1
 
 - **Installs on every launcher that can run it.** 1.1.0 asked for launcher 1.8.16 or later, but its manifest links the source code, which launchers before 1.8.19 refuse. Silly Season now asks for launcher **1.8.36** or later.

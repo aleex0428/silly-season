@@ -910,6 +910,32 @@ static void game_ratings_test(const Value &baseline)
     std::printf("game ratings: Norris 91 (pace 94, focus 73), potential %.0f\n", n->potential());
 }
 
+// 1.1.2 (a 1.1.1 report: "You" in both seats of a team): a read naming one driver twice seats him once, in the
+// human's car when one of the two is the player's
+static void duplicate_driver_test(const Value &baseline)
+{
+    State st;
+    CHECK(init(st, baseline, "f1_career_2025", 303, nullptr), "init failed");
+    std::vector<GridCar> cars;
+    std::string twice;
+    std::string team;
+    for (const Team &t : st.teams)
+        for (int k = 0; k < 2; ++k) {
+            std::string who = t.seats[static_cast<size_t>(k)];
+            if (twice.empty() && k == 1) {
+                twice = t.seats[0];
+                team = t.id;
+                who = twice; // the second seat's row names the first seat's driver, and that one is the human
+            }
+            cars.push_back({who, t.id, k == 1 && t.id == team});
+        }
+    sync_grid(st, cars);
+    const Team *t = st.team(team);
+    CHECK(t && (t->seats[0] == twice) != (t->seats[1] == twice), "%s sits in both seats of %s", twice.c_str(), team.c_str());
+    CHECK(st.player == twice, "the human's car wasn't kept");
+    std::printf("duplicate driver: %s seated once in %s\n", twice.c_str(), team.c_str());
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -931,6 +957,7 @@ int main(int argc, char **argv)
     run(baseline, seasons, Intensity::realistic, false, true, quiet, 2026);
     swap_test(baseline);
     outside_test(baseline);
+    duplicate_driver_test(baseline);
     season_refusal_test(baseline, false);
     season_refusal_test(baseline, true);
     observer_test(baseline);
