@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "suite": "alexs.silly-season",
+  "defaults": {
+    "timeout_s": 600,
+    "addons": ["swofty.core", "alexs.silly-season"]
+  },
+  "tests": [
+    {
+      "id": "loads_at_boot",
+      "tags": ["smoke"],
+      "env": { "kind": "boot" },
+      "timeout_s": 240,
+      "steps": [{ "wait": { "log": "\\[silly-season\\] ready: version .*, market " }, "timeout_s": 180 }],
+      "assert": [
+        { "log": "\\[silly-season\\] baseline: ok" },
+        { "log": "\\[silly-season\\] overlay: banner and F7 panel ok" },
+        { "no_crash": true }
+      ]
+    },
+    {
+      "id": "driver_career_team_hq",
+      "tags": ["career"],
+      "env": { "kind": "career", "fixture": "fixtures/driver-career-2025", "at": "team_hq" },
+      "steps": [
+        { "wait": { "log": "\\[silly-season\\] hub: game at round" }, "timeout_s": 300 },
+        { "wait": { "ms": 5000 } }
+      ],
+      "assert": [
+        { "log": "\\[silly-season\\] real grid: \\d+ seats" },
+        { "log": "\\[silly-season\\] game ratings: \\d+ entries read" },
+        { "log": "\\[silly-season\\] results: \\d+ round\\(s\\) run" },
+        { "log": "\\[silly-season\\] game drivers \\(team hq\\)" },
+        { "log": "\\[silly-season\\] saved .* \\(team hq\\): storage ok" },
+        { "perf": { "p99_ms": { "max": 250 } } },
+        { "no_crash": true }
+      ]
+    },
+    {
+      "id": "my_team_observer",
+      "tags": ["career"],
+      "env": { "kind": "career", "fixture": "fixtures/my-team-2026", "at": "team_hq" },
+      "steps": [
+        { "wait": { "log": "\\[silly-season\\] hub: game at round" }, "timeout_s": 300 },
+        { "wait": { "ms": 5000 } }
+      ],
+      "assert": [
+        { "log": "\\[silly-season\\] My Team: only the game changes race seats here" },
+        { "log": "\\[silly-season\\] real grid: \\d+ seats, player .* \\(own team\\)" },
+        { "no_crash": true }
+      ]
+    }
+  ]
+}

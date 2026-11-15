@@ -35,8 +35,10 @@
 #include <swofty/storage.hpp>
 #include <swofty/systems/career.hpp>
 #include <swofty/systems/drivers.hpp>
-#include <swofty/systems/sessions.hpp>
+#include <swofty/systems/content.hpp>
 #include <swofty/telemetry.hpp>
+#include <swofty/view.hpp>
+#include <swofty/systems/sessions.hpp>
 
 #include <swofty/services.hpp>
 
@@ -48,6 +50,9 @@ using namespace swofty;
 namespace json = swofty::json;
 
 static constexpr const char *kAddon = "alexs.silly-season";
+#ifndef SS_VERSION
+#define SS_VERSION "dev" // build.bat passes the manifest's version
+#endif
 
 // ---------------------------------------------------------------------------------------------------
 // Settings (swofty.json "options", all binds: native)
@@ -76,8 +81,28 @@ SWOFTY_SETTING(bool, grid_reveal, true);   // next season's grid revealed team b
 SWOFTY_SETTING(bool, hq_widget, true);     // a small market card in a corner of Team HQ
 SWOFTY_SETTING(bool, car_numbers, true);   // new talents pick their own racing number
 SWOFTY_SETTING(bool, living_market, true); // 1.1.0 phase 5: sister-team swaps, budgets and sponsors, team principals
+// 1.1.3: overtakes, incidents and breakdowns from the game's telemetry. 15 Nov: off by default and marked experimental
+// (flashbacks with the game's own clock and a feed that appears late are still to be seen in the game); the
+// manifest's default is the same
+SWOFTY_SETTING(bool, on_track, false);
 SWOFTY_SETTING(bool, academies, true);     // 1.1.0 phase 6: reserve drivers, academies, partner teams
 SWOFTY_SETTING(std::string_view, panel_size, "normal"); // the F7 panel's size: small, normal, large
+SWOFTY_SETTING(std::string_view, panel_key, "f7");       // 1.1.3: the key that opens the panel (another addon may use F7)
+
+// 1.1.3: the keys the panel can open with; the overlay reads the pick from the render thread
+struct PanelKey {
+    const char *id, *label;
+    int vk;
+};
+constexpr PanelKey kPanelKeys[] = {{"f7", "F7", VK_F7}, {"f6", "F6", VK_F6}, {"f8", "F8", VK_F8},
+                                   {"f9", "F9", VK_F9}, {"f10", "F10", VK_F10}, {"f11", "F11", VK_F11}};
+std::atomic<int> g_panel_key{0}; // index into kPanelKeys
+// 1.1.3: bumped when a career loads or unloads: what the overlays remember on the render thread (shown ids, the one on
+// screen, the alerts, the focus) belongs to one career, and the next starts it again. A race report of the next career
+// used to wait for an id above the last one shown, while its count started again at 1.
+std::atomic<int> g_ov_generation{0};
+const char *panel_key_label() { return kPanelKeys[g_panel_key.load(std::memory_order_relaxed)].label; }
+int panel_key_vk() { return kPanelKeys[g_panel_key.load(std::memory_order_relaxed)].vk; }
 // 1.1.0 overlays
 SWOFTY_SETTING(bool, press_popup, true);   // a press question on screen at Team HQ, answered with 1-3
 SWOFTY_SETTING(bool, race_report, true);   // a report after each race at Team HQ
@@ -108,6 +133,7 @@ static ss::Settings settings()
     s.deadline = deadline_day;
     s.living = living_market;
     s.academies = academies;
+    s.on_track = on_track;
     s.lang = "en"; // everything the player reads is in English
     if (g_real_career) {
         s.standins = false;
@@ -123,7 +149,65 @@ static ss::Settings settings()
 
 namespace {
 
-std::recursive_mutex g_lock;
+// The market's lock. 1.1.3: each time it is taken counts as a change to the market (on purpose, the safe side), so a
+// game save with nothing taken since the last write skips building the JSON (save_state). A handler that never changes
+// what is saved takes quiet() instead; once it changes the market, it must take g_lock itself.
+struct StateLock {
+    std::recursive_mutex m;
+    std::atomic<uint64_t> changes{0};
+    void lock()
+    {
+        m.lock();
+        changes.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool try_lock()
+    {
+        if (!m.try_lock())
+            return false;
+        changes.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    void unlock() { m.unlock(); }
+    std::recursive_mutex &quiet() { return m; }
+    void touch() { changes.fetch_add(1, std::memory_order_relaxed); } // a change made under quiet()
+};
+StateLock g_lock;
+
+// 1.1.3: how long the work on the game's thread takes, part by part. One line in the log only when the whole is slow
+// enough to be felt ("[silly-season] timing: team hq 74 ms (ratings 20, texts 31, ...)"; tools/swperf.py shows them)
+class Timing {
+public:
+    Timing(const char *what, double over_ms) : what_(what), over_(over_ms) {}
+    Timing(const Timing &) = delete;
+    Timing &operator=(const Timing &) = delete;
+    ~Timing()
+    {
+        double total = ms(start_, Clock::now());
+        if (total >= over_)
+            log("[silly-season] timing: %s %.0f ms (%s)", what_, total, parts_.empty() ? "-" : parts_.c_str());
+    }
+    // the part since the last mark (or the start), named when it took 1 ms or more
+    void mark(const char *part)
+    {
+        Clock::time_point now = Clock::now();
+        double t = ms(last_, now);
+        last_ = now;
+        if (t >= 1.0) {
+            char b[96];
+            std::snprintf(b, sizeof b, "%s%s %.0f", parts_.empty() ? "" : ", ", part, t);
+            parts_ += b;
+        }
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    static double ms(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); }
+    const char *what_;
+    double over_;
+    Clock::time_point start_ = Clock::now(), last_ = start_;
+    std::string parts_;
+};
+
 json::Value g_baseline;
 bool g_baseline_ok = false;
 bool g_loaded = false;         // a career this addon handles is loaded
@@ -137,6 +221,12 @@ ss::State g_state;
 
 // what the game told us between Team HQ visits
 int g_weekends_ended = 0;      // fallback round counter when current_round() is unavailable
+int g_weekend_raced = 0;       // the race weekend the sessions since the last hub belonged to (note_weekend)
+int g_weekend_season = -1;     // its season index (-1: not known)
+// The weekend only counts once its race is run: practice or qualifying alone doesn't. 1.1.3 (15 Nov): a weekend whose
+// sessions never said their type counts only once the calendar moves on.
+bool g_race_ended = false;     // a race session ended since the last hub
+bool g_session_typed = false;  // a session since the last hub said its type
 bool g_season_ended = false;
 bool g_moves_finalised = false;
 std::vector<std::pair<std::string, int>> g_results;  // driver, position
@@ -224,22 +314,37 @@ bool provisional_id(std::string_view id) { return id.find(":new") != std::string
 
 constexpr const char *kProvisionalList = "careers/provisional.json";
 
+// 1.1.3: the list is read once and kept here. A storage read costs some 8 ms on the game's thread, and a new career
+// saved under its provisional id read the list at every save (Team HQ, the game's saves, leaving the career). Only
+// this addon writes the file. g_lock held for all of these.
+json::Value g_provisional;
+bool g_provisional_read = false;
+
 json::Value read_provisional()
 {
-    std::string text;
-    if (storage::available() && storage::read(kProvisionalList, text) == storage::Result::ok) {
-        json::Error err;
-        json::Value v = json::parse(text, &err);
-        if (v.is_array())
-            return v;
+    if (!g_provisional_read && storage::available()) {
+        g_provisional_read = true;
+        g_provisional = json::Value::array();
+        std::string text;
+        storage::Result r = storage::read(kProvisionalList, text);
+        if (r == storage::Result::ok) {
+            json::Error err;
+            json::Value v = json::parse(text, &err);
+            if (v.is_array())
+                g_provisional = std::move(v);
+        }
+        log("[silly-season] provisional markets: %zu (%s)", g_provisional.size(), storage::name(r));
     }
-    return json::Value::array();
+    return g_provisional.is_array() ? g_provisional : json::Value::array();
 }
 
 void write_provisional(const json::Value &list)
 {
-    if (storage::available())
-        storage::write(kProvisionalList, json::dump(list, 0));
+    if (!storage::available())
+        return;
+    g_provisional = list;
+    g_provisional_read = true;
+    storage::write(kProvisionalList, json::dump(list));
 }
 
 void forget_provisional(const std::string &id)
@@ -256,6 +361,17 @@ void forget_provisional(const std::string &id)
         write_provisional(out);
 }
 
+// 1.1.3 (15 Nov): the human's driver and team as the core's career state says them (stat ids; false: not known)
+bool career_player(uint32_t &driver, uint32_t &team)
+{
+    career::State cs{};
+    if (career::state(&cs) != career::Result::ok || !cs.has_player)
+        return false;
+    driver = cs.player_driver >> 16;
+    team = cs.player_team >> 16;
+    return true;
+}
+
 // after a save under a provisional id: remember it, newest last, a few at most
 void note_provisional()
 {
@@ -267,6 +383,11 @@ void note_provisional()
     e["id"] = json::Value(g_state.career);
     e["group"] = json::Value(g_state.group);
     e["player"] = json::Value(g_state.player);
+    // 1.1.3 (15 Nov): the human's driver and team, so a later load adopts it only for the same career
+    if (uint32_t pd = 0, pt = 0; career_player(pd, pt)) {
+        e["player_stat"] = json::Value(static_cast<int64_t>(pd));
+        e["team_stat"] = json::Value(static_cast<int64_t>(pt));
+    }
     e["season_index"] = json::Value(static_cast<int64_t>(g_state.season_index));
     e["round"] = json::Value(static_cast<int64_t>(g_state.round));
     e["saved"] = json::Value(static_cast<int64_t>(std::time(nullptr)));
@@ -275,6 +396,11 @@ void note_provisional()
         out.if_array()->erase(out.if_array()->begin());
     write_provisional(out);
 }
+
+// 1.1.3 (15 Nov): a copy the market no longer needs (a provisional id's, or one it adopted): it is removed, with its
+// entry in the provisional list, only once the market's copy under its own id has been written and read back. A
+// failed write keeps it: the next save tries again, and a load before that still finds it.
+std::string g_retire_after_save;
 
 // g_lock held: the loaded career's id changed (a new career's first save): the market follows it
 void follow_career_id()
@@ -287,17 +413,38 @@ void follow_career_id()
     std::string old = g_state.career;
     g_state.career = now;
     log("[silly-season] career id %s -> %s: the market moves to the new id", old.c_str(), now.c_str());
-    if (provisional_id(old)) {
-        if (storage::available())
-            storage::remove(storage_path(old));
-        forget_provisional(old);
-    }
+    if (provisional_id(old))
+        g_retire_after_save = old; // removed once the new id's copy reads back (save_state)
 }
 
-void save_state(const char *why)
+// the copy under `career` reads back as this market's: its own id and this revision (storage first, else the career
+// data)
+bool reads_back(const std::string &career, uint64_t revision)
+{
+    std::string text;
+    json::Value v;
+    if (storage::available() && storage::read(storage_path(career), text) == storage::Result::ok) {
+        json::Error err;
+        v = json::parse(text, &err);
+    } else if (career::saves::available()) {
+        if (auto stored = career::saves::data(kAddon).get(career))
+            v = stored->value;
+    }
+    return v.is_object() && v["career"].as_string() == career && static_cast<uint64_t>(v["revision"].as_int(-1)) == revision;
+}
+
+// the last state written, for this career: an unchanged state isn't written again
+std::string g_saved_career, g_saved_text;
+uint64_t g_saved_changes = 0; // g_lock.changes when the state was last written (or found unchanged)
+int g_saves_written = 0, g_saves_same = 0, g_saves_skipped = 0; // this career's, logged when it unloads
+
+// only_if_changed: the game's own saves (1.1.3). With g_lock not taken since the last write, nothing changed and the
+// JSON isn't even built; Team HQ and leaving the career always compare the whole state.
+void save_state(const char *why, bool only_if_changed = false)
 {
     if (!g_loaded)
         return;
+    Timing tm("save", 10);
     follow_career_id();
     if (g_state.career.empty())
         g_state.career = career::saves::current(); // a new career gets its id with its first save
@@ -310,49 +457,117 @@ void save_state(const char *why)
         log("[silly-season] not saved (%s): the career has no id yet", why);
         return;
     }
+    tm.mark("career id");
+    if (only_if_changed && g_state.career == g_saved_career && g_lock.changes.load() == g_saved_changes) {
+        ++g_saves_skipped;
+        return;
+    }
     json::Value v = ss::to_json(g_state);
-    std::string text = json::dump(v, 0);
+    tm.mark("to_json");
+    std::string text = ss::dump_save(v); // 1.1.3: compact, floats in their shortest text (some 15% smaller in all)
+    tm.mark("dump");
     // the game saves the profile often (menus, sessions): an unchanged state is already in storage and in
     // the core's career data, which the core writes with every save by itself
-    static std::string last_career, last_text;
-    if (g_state.career == last_career && text == last_text)
+    if (g_state.career == g_saved_career && text == g_saved_text) {
+        ++g_saves_same;
+        g_saved_changes = g_lock.changes.load();
         return;
+    }
+    // 1.1.3 (15 Nov): a new revision for a copy that changed. Its field is near the top of the text: it is changed
+    // there rather than the whole tree dumped again.
+    {
+        std::string was = "\"revision\":" + std::to_string(g_state.revision);
+        g_state.revision += 1;
+        size_t at = text.find(was);
+        if (at != std::string::npos && at < 64) {
+            text.replace(at, was.size(), "\"revision\":" + std::to_string(g_state.revision));
+        } else {
+            v["revision"] = static_cast<int64_t>(g_state.revision);
+            text = ss::dump_save(v);
+        }
+    }
     storage::Result sr = storage::available() ? storage::write(storage_path(g_state.career), text)
                                               : storage::Result::unavailable;
+    tm.mark("storage");
+    // the career data takes the text just built: the SDK's Data::set would dump the whole tree a second time (and
+    // with the floats at 17 digits). The table call is what that wrapper makes.
     career::Result cr = career::Result::unavailable;
-    if (career::saves::available())
-        cr = career::saves::data(kAddon).set(g_state.career, v, 1);
+    if (const SwoftyCareerSaves *t = career::detail::live_saves(); t && t->data_set)
+        cr = career::detail::ops_result(t->data_set(g_state.career.c_str(), kAddon, 1, {text.data(), text.size()}));
+    tm.mark("career data");
     log("[silly-season] saved %s (%s): storage %s, career data %s, %zu bytes", g_state.career.c_str(), why,
         storage::name(sr), career::name(cr), text.size());
     if (sr == storage::Result::ok && provisional_id(g_state.career))
         note_provisional();
+    tm.mark("provisional list");
     if (sr == storage::Result::ok && (cr == career::Result::ok || !career::saves::available())) {
-        last_career = g_state.career;
-        last_text = std::move(text);
+        ++g_saves_written;
+        g_saved_career = g_state.career;
+        g_saved_text = std::move(text);
+        g_saved_changes = g_lock.changes.load();
     } else {
-        last_career.clear(); // try both again next time
+        g_saved_career.clear(); // try both again next time
+    }
+    // 1.1.3 (15 Nov): the copy this market came from goes only now that its own reads back
+    if (!g_retire_after_save.empty() && g_retire_after_save != g_state.career && (sr == storage::Result::ok || cr == career::Result::ok)) {
+        if (reads_back(g_state.career, g_state.revision)) {
+            if (storage::available())
+                storage::remove(storage_path(g_retire_after_save));
+            forget_provisional(g_retire_after_save);
+            log("[silly-season] career %s: its copy reads back; the one under %s is removed", g_state.career.c_str(),
+                g_retire_after_save.c_str());
+            g_retire_after_save.clear();
+        } else {
+            log("[silly-season] career %s: its copy doesn't read back yet; the one under %s is kept", g_state.career.c_str(),
+                g_retire_after_save.c_str());
+        }
     }
 }
 
+// 1.1.3 (15 Nov): both copies are read (the career data and the storage). One that names another career is never
+// taken; of the two that are this career's, the higher revision is the newer (a write that failed on one side left
+// the other ahead). A save from before 1.1.3 has no revision (0) and its career field is still checked; one without a
+// career at all is taken as it always was.
 bool load_saved(const std::string &career)
 {
+    struct Copy {
+        ss::State st;
+        bool ok = false;
+        const char *from = "";
+    } data, store;
+    auto take = [&](Copy &c, const json::Value &v, const char *from) {
+        ss::State st;
+        if (!ss::from_json(st, v))
+            return;
+        if (!st.career.empty() && st.career != career) {
+            log("[silly-season] career %s: the copy in the %s is career %s's; it is left alone", career.c_str(), from,
+                st.career.c_str());
+            return;
+        }
+        c.st = std::move(st);
+        c.ok = true;
+        c.from = from;
+    };
     if (career::saves::available())
         if (auto stored = career::saves::data(kAddon).get(career))
-            if (ss::from_json(g_state, stored->value)) {
-                log("[silly-season] career %s: state from the career data (season %d, round %d)", career.c_str(),
-                    g_state.year, g_state.round);
-                return true;
-            }
+            take(data, stored->value, "career data");
     std::string text;
     if (storage::available() && storage::read(storage_path(career), text) == storage::Result::ok) {
         json::Error err;
-        if (ss::from_json(g_state, json::parse(text, &err))) {
-            log("[silly-season] career %s: state from storage (season %d, round %d)", career.c_str(), g_state.year,
-                g_state.round);
-            return true;
-        }
+        take(store, json::parse(text, &err), "storage");
     }
-    return false;
+    if (!data.ok && !store.ok)
+        return false;
+    // the career data wins a tie, as before
+    Copy &pick = !store.ok ? data : !data.ok ? store : store.st.revision > data.st.revision ? store : data;
+    if (data.ok && store.ok && data.st.revision != store.st.revision)
+        log("[silly-season] career %s: the career data holds revision %llu and the storage %llu; the newer (%s) is taken",
+            career.c_str(), static_cast<unsigned long long>(data.st.revision), static_cast<unsigned long long>(store.st.revision),
+            pick.from);
+    g_state = std::move(pick.st);
+    log("[silly-season] career %s: state from the %s (season %d, round %d, revision %llu)", career.c_str(), pick.from,
+        g_state.year, g_state.round, static_cast<unsigned long long>(g_state.revision));
+    return true;
 }
 
 // A career loaded under its real id with no market saved there: the newest market saved under a
@@ -376,17 +591,45 @@ bool adopt_tracker_key(const std::string &id)
     return true;
 }
 
+// 1.1.3 (15 Nov): a provisional market is taken only when it can be this career's: the same data group, the same
+// human (driver and team, when the list knows them), and not ahead of the game's calendar. Two that could both be (two
+// new careers of the same kind left before their first save) are left alone: guessing could give a career another's.
 bool adopt_provisional(const std::string &id, const std::string &group)
 {
     json::Value list = read_provisional();
+    uint32_t pd = 0, pt = 0;
+    bool know_player = career_player(pd, pt);
+    auto pos = career::current_round();
+    std::vector<std::string> fits;
     std::string from;
     int64_t newest = -1;
-    for (const json::Value &e : *list.if_array())
-        if (e["group"].as_string() == group && e["saved"].as_int() > newest) {
-            newest = e["saved"].as_int();
-            from = std::string(e["id"].as_string());
+    for (const json::Value &e : *list.if_array()) {
+        std::string eid(e["id"].as_string());
+        if (e["group"].as_string() != group || eid == id)
+            continue;
+        if (know_player && e["player_stat"].is_number() &&
+            (static_cast<uint32_t>(e["player_stat"].as_int()) != pd || static_cast<uint32_t>(e["team_stat"].as_int()) != pt))
+            continue; // another human: another career
+        if (pos) {
+            int si = static_cast<int>(e["season_index"].as_int(-1)), rd = static_cast<int>(e["round"].as_int(0));
+            if (si > pos->season_index || (si == pos->season_index && rd > pos->round))
+                continue; // ahead of this career's calendar
         }
-    if (from.empty() || from == id)
+        fits.push_back(eid);
+        if (e["saved"].as_int() > newest) {
+            newest = e["saved"].as_int();
+            from = eid;
+        }
+    }
+    if (fits.size() > 1) {
+        std::string all;
+        for (const std::string &f : fits)
+            all += (all.empty() ? "" : ", ") + f;
+        log("[silly-season] career %s: %zu provisional markets could be this career's (%s); none is taken", id.c_str(),
+            fits.size(), all.c_str());
+        return false;
+    }
+    if (from.empty())
         return false;
     if (!load_saved(from)) {
         forget_provisional(from);
@@ -403,7 +646,11 @@ uint64_t seed_for(const std::string &career)
     uint64_t h = 1469598103934665603ull;
     for (char c : career)
         h = (h ^ static_cast<uint8_t>(c)) * 1099511628211ull;
+#if defined(SILLY_SEASON_FIXED_SEED)
+    return h; // plugin_test: the same career id gives the same market every run
+#else
     return h ^ static_cast<uint64_t>(GetTickCount64());
+#endif
 }
 
 std::string career_id(const events::Context *ctx)
@@ -425,17 +672,32 @@ const F2RevampCareer *f2_service()
     return c && c->size >= offsetof(F2RevampCareer, promoted) + sizeof c->promoted ? c : nullptr;
 }
 
-// the loaded F2 Revamp career is still in its F2 season (or F2 Revamp can't say: the market waits)
+int human_team_stat(); // the human's team stat id from the career's rows; -1 when they can't be read (below)
+
+// F2 Revamp's F2 teams: the player is in F2 while he races for one (the same test its own service makes)
+constexpr int kF2TeamFirst = 489, kF2TeamLast = 499;
+
+// the loaded F2 Revamp career is still in its F2 season. F2 Revamp's service says so when it publishes it (0.8.2 on);
+// 1.1.3: without it (0.8.1, the version in the catalogue for a while) the player's team says it. 1.1.2 waited for the
+// service forever, so after the F2 season no Silly Season market ever started (two players' reports, 11 Nov).
 bool f2_phase()
 {
-    const F2RevampCareer *c = f2_service();
-    return !c || !c->in_f2 || c->in_f2() != 0;
+    if (const F2RevampCareer *c = f2_service(); c && c->in_f2)
+        return c->in_f2() != 0;
+    int team = human_team_stat();
+    if (team < 0) {
+        career::State cs{};
+        if (career::state(&cs) == career::Result::ok && cs.loaded && cs.has_player)
+            team = static_cast<int>(cs.player_team >= 0x10000 ? cs.player_team >> 16 : cs.player_team);
+    }
+    return team < 0 || (team >= kF2TeamFirst && team <= kF2TeamLast); // unknown: wait for the next Team HQ
 }
 
 void begin_market(const std::string &group, const std::string &id, bool fresh);
 namespace game_pool {
 void start(const std::string &group); // game_pool.inl: read the career's driver lists in the background
 }
+void start_db_labels(); // the game database's driver labels, read in the background (below)
 
 // a career of a data group the baseline knows
 void begin_career(const events::Context &ctx, bool fresh)
@@ -459,8 +721,10 @@ void begin_career(const events::Context &ctx, bool fresh)
             save_state("another career");
         g_loaded = false;
         g_f2_waiting = true;
-        log("[silly-season] F2 Revamp career: %s; the market starts with the player's first F1 season",
-            f2_service() ? "the player is in F2" : "F2 Revamp's service isn't there");
+        int team = human_team_stat();
+        log("[silly-season] F2 Revamp career: the player is in F2 (%s%s); the market starts with the player's first F1 "
+            "season", f2_service() ? "F2 Revamp's service says so" : "his team says so: F2 Revamp publishes no service",
+            team < 0 ? ", his row not read yet" : "");
         return;
     }
     begin_market(group, career_id(&ctx), fresh);
@@ -506,8 +770,10 @@ void begin_market(const std::string &group, const std::string &id, bool fresh)
         real_people_in(g_state);
     g_real_now = g_state.real;
     g_loaded = true;
+    g_ov_generation.fetch_add(1); // 1.1.3: the overlays start this career afresh
     if (!g_real_career)
         game_pool::start(group); // ready by the first Team HQ, which then doesn't wait for it
+    start_db_labels();
     g_weekends_ended = 0;
     g_season_ended = g_moves_finalised = false;
     g_results.clear();
@@ -528,19 +794,11 @@ std::string driver_label(std::string_view raw)
 // the team stat each team's rows carried at the last read: seat writes go to the slot the game uses
 std::unordered_map<std::string, uint32_t> g_row_team_stat;
 
-// every seat of the new grid, so whatever the game did over the winter, the grid ends as planned
-std::vector<ss::SeatChange> full_grid(const ss::Settings &s)
-{
-    std::vector<ss::SeatChange> out;
-    for (const ss::Team &t : g_state.teams)
-        for (int k = 0; k < 2; ++k)
-            if (!t.seats[static_cast<size_t>(k)].empty() && !g_state.locked(t, k, s))
-                out.push_back({t.id, k, t.seats[static_cast<size_t>(k)], "season"});
-    return out;
-}
 
 // returns the new season's seats ("season") the game refused, for the caller to take back once the grid is read again
-std::vector<ss::SeatChange> apply_changes(const std::vector<ss::SeatChange> &changes, const char *why)
+// results: when given, each change's result in order (1.1.3: the new season's seats are "requested" on ok)
+std::vector<ss::SeatChange> apply_changes(const std::vector<ss::SeatChange> &changes, const char *why,
+                                          std::vector<career::Result> *results = nullptr)
 {
     std::vector<ss::SeatChange> refused;
     const SwoftyCareerOps *ops = career::ops();
@@ -584,6 +842,8 @@ std::vector<ss::SeatChange> apply_changes(const std::vector<ss::SeatChange> &cha
         }
         if (r != career::Result::ok && c.reason == "season")
             refused.push_back(c);
+        if (results)
+            results->push_back(r);
     }
     return refused;
 }
@@ -778,9 +1038,20 @@ void sync_player()
         team.clear(); // the player's own My Team team sits in the custom slot, as Konnersport does
     std::string driver = known_driver(driver_stat);
     g_player_stat = driver_stat;
-    if (driver.empty())
-        driver = g_state.player.empty() ? std::string("player") : g_state.player; // a created driver
     const ss::Team *t = g_state.team(team);
+    // 1.1.3: a stock driver is the player only when the market already has him in the player's team. A created
+    // driver's career state can carry another driver's stat id (Felipe Massa's, a legend's): 1.1.2 made the player
+    // that driver for good when the first visit couldn't read the career's rows (players' reports, 11 Nov)
+    if (!driver.empty() && !(t && (t->seats[0] == driver || t->seats[1] == driver))) {
+        if (g_player_log_budget-- > 0)
+            log("[silly-season] player: the career state names %s (stat %u), who doesn't race for %s; he is a created driver",
+                driver.c_str(), driver_stat, team.c_str());
+        driver.clear();
+    }
+    if (driver.empty()) {
+        const ss::Driver *was = g_state.driver(g_state.player);
+        driver = g_state.player.empty() || (was && was->kind != "player") ? std::string("player") : g_state.player; // created
+    }
     if (!t) {
         if (g_player_log_budget-- > 0)
             log("[silly-season] player: driver stat %u, team stat %u: no team of this career has that stat",
@@ -819,15 +1090,24 @@ void sync_player()
 // line-ups, a season already under way and the player himself all come from the game. Every read is
 // guarded; rows that don't look like a grid are left alone and the market keeps its own.
 
+constexpr uint32_t kNoLook = 0xffffffffu;
+
 struct RealSeat {
     uint32_t driver = 0, team = 0; // stat ids
     int seat = 0;
     bool human = false;
+    uint32_t look = kNoLook; // 1.1.3: the look the row dresses him in (its stat id; kNoLook when the row has none)
 };
 
-// history mode (history.inl): the drivers' looks of each real year, the rows last read
-std::unordered_map<uint32_t, std::string> g_real_stats; // a look's (or a driver's) stat id -> the driver
-std::vector<RealSeat> g_last_seats;                     // the rows last read, to tell the year from them
+// history mode (history.inl). 1.1.3: a row holds the driver at +0x50 and his look at +0x54, each its own stat id
+// (Progressive's dump: "seat sw16_rosberg(238) ... look sw16-nico_rosberg(1861)"). 1.1.0-1.1.2 matched the rows'
+// drivers against the looks of years.json, which never agree, so no real year was ever recognised.
+std::unordered_map<uint32_t, std::string> g_real_stats;    // a driver's stat id in Progressive's pool -> the driver
+std::unordered_map<uint32_t, std::string> g_real_look_ids; // a look's stat id (any year's, any change's) -> the driver
+std::unordered_map<uint32_t, uint32_t> g_row_look;         // each career row's driver stat id -> his look's, last read
+std::vector<RealSeat> g_last_seats;                        // the rows last read, to tell the year from them
+std::string g_last_seats_owner; // 1.1.3: the career (its id and entity) whose rows g_last_seats holds
+std::vector<ss::GridCar> g_last_cars;   // 1.1.3: the cars the market took from the last read of the rows
 // 1.1.0 phase 5: each driver's career row as the game holds it (stat id -> S race seat, F free agent, R reserve,
 // M more than one row), from the last read
 std::unordered_map<uint32_t, char> g_row_class;
@@ -835,7 +1115,7 @@ std::unordered_map<uint32_t, std::string> g_row_raw; // 1.1.2: each driver's row
 
 namespace rows {
 constexpr uintptr_t kEntrantsBegin = 0x2e0, kEntrantsEnd = 0x2e8, kBusy = 0x2f8; // CareerEntity
-constexpr size_t kSize = 0x88, kOrdinal = 0x48, kDriver = 0x50, kTeam = 0x58, kVehicle = 0x5c, kPosition = 0x80;
+constexpr size_t kSize = 0x88, kOrdinal = 0x48, kDriver = 0x50, kLook = 0x54, kTeam = 0x58, kVehicle = 0x5c, kPosition = 0x80;
 constexpr uint32_t kNoKey = 0x3fff0000u, kHumanBit = 0x10000000u;
 constexpr size_t kMaxRows = 512;
 
@@ -859,6 +1139,26 @@ template <typename T> T at(const std::vector<uint8_t> &buf, size_t off)
     return v;
 }
 } // namespace rows
+
+int human_team_stat()
+{
+    uintptr_t e = reinterpret_cast<uintptr_t>(career::entity());
+    uintptr_t begin = 0, end = 0;
+    uint8_t busy = 0;
+    if (!e || !rows::copy(&begin, e + rows::kEntrantsBegin, sizeof begin) || !rows::copy(&end, e + rows::kEntrantsEnd, sizeof end) ||
+        !rows::copy(&busy, e + rows::kBusy, sizeof busy) || busy || !begin || end <= begin || (end - begin) % rows::kSize ||
+        (end - begin) / rows::kSize > rows::kMaxRows)
+        return -1;
+    std::vector<uint8_t> buf(end - begin);
+    if (!rows::copy(buf.data(), begin, buf.size()))
+        return -1;
+    for (size_t off = 0; off < buf.size(); off += rows::kSize)
+        if (rows::at<uint32_t>(buf, off + rows::kOrdinal) & rows::kHumanBit) {
+            uint32_t team = rows::at<uint32_t>(buf, off + rows::kTeam);
+            return (team & 0xffff0000u) == rows::kNoKey ? -1 : static_cast<int>(team >> 16);
+        }
+    return -1;
+}
 
 // the race seats of the loaded career; false (with why) when the rows can't be read or don't look right
 bool read_real_grid(std::vector<RealSeat> &out, std::string &why)
@@ -893,12 +1193,18 @@ bool read_real_grid(std::vector<RealSeat> &out, std::string &why)
     size_t humans = 0;
     g_row_class.clear();
     g_row_raw.clear();
+    g_row_look.clear();
     for (size_t off = 0; off < buf.size(); off += rows::kSize) {
         uint32_t ordinal = rows::at<uint32_t>(buf, off + rows::kOrdinal), driver = rows::at<uint32_t>(buf, off + rows::kDriver),
-                 team = rows::at<uint32_t>(buf, off + rows::kTeam), vehicle = rows::at<uint32_t>(buf, off + rows::kVehicle);
+                 team = rows::at<uint32_t>(buf, off + rows::kTeam), vehicle = rows::at<uint32_t>(buf, off + rows::kVehicle),
+                 look_key = rows::at<uint32_t>(buf, off + rows::kLook);
         uint16_t position = rows::at<uint16_t>(buf, off + rows::kPosition);
         bool teamless = (team & 0xffff0000u) == rows::kNoKey, car = (vehicle & 0xffff0000u) != rows::kNoKey;
         int seat = (position >> 8) ? (position & 0xff) : -1;
+        // the look is a key like the driver's (stat << 16); none, or not a key, is no look
+        uint32_t look = (look_key & 0xffffu) == 0 && (look_key & 0xffff0000u) != rows::kNoKey ? look_key >> 16 : kNoLook;
+        if ((driver & 0xffu) == 0 && look != kNoLook)
+            g_row_look[driver >> 16] = look;
         // what the game makes of each driver for a seat change (the core's set_seat): a race driver ('S') and a free
         // agent ('F') take a seat; a reserve ('R': a team, no race seat) and a driver with two rows ('M') don't
         if ((driver & 0xffu) == 0) {
@@ -914,7 +1220,7 @@ bool read_real_grid(std::vector<RealSeat> &out, std::string &why)
         }
         if (teamless || !car || seat < 0 || seat > 1)
             continue; // a reserve, a free agent or a driver without a car
-        RealSeat s{driver >> 16, team >> 16, seat, (ordinal & rows::kHumanBit) != 0};
+        RealSeat s{driver >> 16, team >> 16, seat, (ordinal & rows::kHumanBit) != 0, look};
         if (!seats.insert({s.team, s.seat}).second) {
             why = "two drivers on one seat";
             return false;
@@ -930,29 +1236,68 @@ bool read_real_grid(std::vector<RealSeat> &out, std::string &why)
     return true;
 }
 
-// a driver label from the game database, for a driver the baseline doesn't know (another addon's)
-std::string db_label(uint32_t stat)
+// The driver labels of the game database (entrants.drivers), for drivers the baseline doesn't know (another addon's).
+// 1.1.3: read once in the background, started with the career's market. 1.1.2 read the whole table on the game's
+// thread at the first lookup, in Team HQ, and with many addons the table is long (a 2.1 s freeze in a player's
+// report). Until it is ready a lookup answers "" (a driver added meanwhile is named once it is: driver_for_stat).
+namespace db_labels {
+std::mutex lock;
+std::unordered_map<uint32_t, std::string> labels;
+std::atomic<int> state{0}; // 0 not started, 1 being read, 2 ready
+
+void read()
 {
-    static std::unordered_map<uint32_t, std::string> labels;
-    static bool built = false;
-    if (!built && db::available()) {
-        built = true;
+    std::unordered_map<uint32_t, std::string> found;
+    if (db::available()) {
         db::Cursor c{};
         for (db::Result r = db::open("entrants.drivers", &c); r == db::Result::ok; r = db::step(&c)) {
             db::Value v{};
             const char *label = db::row_name(&c);
             if (label && db::cell(&c, "stat_id", &v) == db::Result::ok)
-                labels.emplace(static_cast<uint32_t>(v.i), label);
+                found.emplace(static_cast<uint32_t>(v.i), label);
         }
-        log("[silly-season] game database: %zu driver label(s) in entrants.drivers", labels.size());
     }
-    auto it = labels.find(stat);
-    return it == labels.end() ? std::string() : it->second;
+    {
+        std::lock_guard l(lock);
+        labels = std::move(found);
+    }
+    state = 2;
+    log("[silly-season] game database: %zu driver label(s) in entrants.drivers (read in the background)", labels.size());
+}
+
+void start()
+{
+    int none = 0;
+    if (db::available() && state.compare_exchange_strong(none, 1))
+        std::thread(read).detach();
+}
+} // namespace db_labels
+
+void start_db_labels() { db_labels::start(); }
+
+std::string db_label(uint32_t stat)
+{
+    if (db_labels::state.load() != 2) {
+        db_labels::start();
+        return {};
+    }
+    std::lock_guard l(db_labels::lock);
+    auto it = db_labels::labels.find(stat);
+    return it == db_labels::labels.end() ? std::string() : it->second;
 }
 
 // "2025-williams_carlos_sainz-jr" or "carlos_sainz-jr" -> "Carlos Sainz Jr"
 std::string name_from_label(std::string label)
 {
+    // 1.1.3: a name's accented variant another addon adds ("noel_leon-accent" for Noel León) is the same driver: the
+    // suffix isn't part of his name (F2 Revamp's test showed "Noel Leon Accent" in the news)
+    for (const char *tail : {"-accent", "_accent", "-accented", "_accented"}) {
+        size_t n = std::strlen(tail);
+        if (label.size() > n && label.compare(label.size() - n, n, tail) == 0) {
+            label.resize(label.size() - n);
+            break;
+        }
+    }
     if (size_t dash = label.find('-'); dash != std::string::npos && dash > 0 && std::isdigit(static_cast<unsigned char>(label[0])))
         label.erase(0, dash + 1);
     if (size_t us = label.find('_'); us != std::string::npos && label.find('_', us + 1) != std::string::npos)
@@ -978,10 +1323,16 @@ std::string name_from_label(std::string label)
 // what a driver with no stat id holds), then a driver added earlier from the game; "" when unknown
 std::string known_driver(uint32_t stat)
 {
-    // a Progressive career: each real year dresses its drivers in looks of their own, with their own stat ids
-    if (g_real_career && !g_real_stats.empty())
+    // a Progressive career: each real year dresses its drivers in looks of their own, with their own stat ids. 1.1.3:
+    // the row's look names the driver (the season addons' own drivers, sw16_rosberg, get a stat id from the launcher
+    // that years.json can't know), then Progressive's pool by the driver's own stat id
+    if (g_real_career) {
+        if (auto row = g_row_look.find(stat); row != g_row_look.end())
+            if (auto it = g_real_look_ids.find(row->second); it != g_real_look_ids.end() && g_state.driver(it->second))
+                return it->second;
         if (auto it = g_real_stats.find(stat); it != g_real_stats.end() && g_state.driver(it->second))
             return it->second;
+    }
     static std::unordered_map<uint32_t, std::string> by_stat;
     static bool built = false;
     if (!built && g_baseline_ok) {
@@ -1052,6 +1403,19 @@ std::string driver_for_stat(uint32_t stat)
 
 std::string g_own_team_name;      // the player's own My Team team, shown in the hub ("" when he drives for a known team)
 std::string g_real_grid_said;     // the last outcome logged
+bool g_grid_read_now = false;     // 1.1.3: this Team HQ visit read the game's rows (they can tell the real year)
+// 1.1.3 (15 Nov): and the grid they make passed every check (the teams this career's, the market synced to it): only
+// then may seats be written. A read rejected for its unknown teams left the writes allowed before.
+bool g_grid_valid_now = false;
+
+// 1.1.3: whose rows a read belongs to: the loaded career's id and its entity. Rows read for another career (the one
+// before, with the game still filling the new one's) never tell this one's real year.
+std::string rows_owner()
+{
+    char b[40];
+    std::snprintf(b, sizeof b, "|%p", career::entity());
+    return g_state.career + b;
+}
 int g_dup_logged = 0;              // 1.1.2: times the player's row named another car's driver (logged 3 times)
 std::string g_rows_said;          // the last row count logged
 
@@ -1084,9 +1448,14 @@ void take_row_classes()
             continue;
         take(id, static_cast<uint32_t>(d.stat));
     }
-    for (const auto &[stat, id] : g_real_stats) // Progressive: each real year's looks have stat ids of their own
-        if (g_state.driver(id))
-            take(id, stat);
+    // Progressive: a driver the market knows by his row's look (a season addon's own, with a stat id from the launcher)
+    if (g_real_career)
+        for (const auto &[stat, look] : g_row_look) {
+            auto it = g_real_look_ids.find(look);
+            const ss::Driver *d = it == g_real_look_ids.end() ? nullptr : g_state.driver(it->second);
+            if (d && static_cast<uint32_t>(d->stat) != stat)
+                take(it->second, stat);
+        }
     g_state.game_rows_known = true;
     char said[200];
     std::snprintf(said, sizeof said, "%zu race drivers and %zu free agents can take a seat; %zu are reserves in the game, %zu have no single row",
@@ -1117,7 +1486,10 @@ bool sync_real_grid()
         }
         return false;
     }
+    g_grid_read_now = true;
+    g_grid_valid_now = false; // set at the end, once the grid passed every check
     g_last_seats = seats;
+    g_last_seats_owner = rows_owner();
     // the player's team, and his team-mate when the team is his own (My Team): no team of the baseline
     uint32_t human_team = 0;
     bool have_human = false;
@@ -1156,10 +1528,18 @@ bool sync_real_grid()
                         driver.empty() ? "nobody" : driver.c_str(), s.driver);
                 driver.clear();
             }
-            if (driver.empty())
-                driver = g_state.player.empty() || g_state.driver(g_state.player) == nullptr || shared_player(g_state.player, seats)
-                             ? std::string("player")
-                             : g_state.player; // a created driver
+            if (driver.empty()) {
+                // a created driver keeps the market's own id for him; 1.1.3: never a stock driver's id the market
+                // borrowed for him earlier (a save of 1.1.2 or before where he became Felipe Massa): he is "player"
+                // again, and the borrowed driver is himself once more
+                const ss::Driver *was = g_state.driver(g_state.player);
+                bool borrowed = was && was->kind != "player" && static_cast<uint32_t>(was->stat) != s.driver;
+                if (borrowed && g_dup_logged++ < 3)
+                    log("[silly-season] real grid: the player went by %s, another driver's identity; he is his own driver again",
+                        g_state.player.c_str());
+                driver = g_state.player.empty() || !was || borrowed || shared_player(g_state.player, seats) ? std::string("player")
+                                                                                                          : g_state.player;
+            }
             player = driver;
             player_team = team;
         } else {
@@ -1179,7 +1559,7 @@ bool sync_real_grid()
             if (d && d->team != team)
                 moved.push_back((d->name.empty() ? driver : d->name) + " -> " + team);
         }
-        cars.push_back({driver, team, s.human});
+        cars.push_back({driver, team, s.human, s.seat}); // with the game's seat index: seats are written by it
     }
     take_row_classes();
     // more than a team's worth of cars on unknown teams: the team ids don't match this career (another
@@ -1213,6 +1593,7 @@ bool sync_real_grid()
         if (!d.team.empty())
             before[id] = d.team;
     ss::sync_grid(g_state, cars);
+    g_last_cars = cars; // 1.1.3: the game's grid as read, for the market to go back to when a write can't be checked
     // 1.1.2: a driver who left the grid since the last read, as the game holds him now (a retired driver may keep
     // his row: what tells him apart is what this line is for). A handful per read, and only when the grid is whole.
     if (cars.size() >= 16) {
@@ -1259,6 +1640,7 @@ bool sync_real_grid()
         log("[silly-season] observer: %d move(s) the game made told as official%s", told,
             told == 0 ? " (none: a partial read, or too many at once to be this career's)" : winter ? " (the winter's)" : "");
     }
+    g_grid_valid_now = true;
     return true;
 }
 
@@ -1316,23 +1698,468 @@ void take_game_ratings()
             player_line = b;
         }
     }
-    char said[320];
-    std::snprintf(said, sizeof said, "%zu entries read, %zu drivers of the market take them%s%s", list.size(), taken,
-                  kinds ? ", some entries of another kind" : "", player_line.c_str());
+    // 1.1.3: the drivers the game doesn't rate join its scale
+    float shift = ss::calibrate_ratings(g_state);
+    char said[360];
+    std::snprintf(said, sizeof said, "%zu entries read, %zu drivers of the market take them, the rest shifted by %+.1f%s%s",
+                  list.size(), taken, shift, kinds ? ", some entries of another kind" : "", player_line.c_str());
     if (said != g_ratings_said) {
         g_ratings_said = said;
         log("[silly-season] game ratings: %s", said);
     }
 }
 
-int g_results_rounds = -1;       // rounds the game's standings say were run this season (-1: unread)
-std::string g_results_said;      // the last outcome logged
+// 1.1.3: what the game's telemetry saw in this weekend's races (overtakes, collisions, retirements), kept until the
+// next idle Team HQ hands them to the market. g_lock held for all of it.
+struct PendingTrack {
+    ss::TrackEvent e;
+    float time = 0;  // the session clock when it happened
+    int session = 0; // the session it happened in (g_track_session)
+    // 1.1.3 (15 Nov): the GP it belongs to (the career's season index and round at lights out; -1/0: not known), so
+    // two GPs before one Team HQ each go to their own round
+    int season = -1, round = 0;
+};
+int g_track_season_now = -1, g_track_round_now = 0; // the running race's GP, set at lights out
+std::set<int> g_track_done; // 1.1.3 (15 Nov): sessions whose race ended normally (not a restart)
+std::set<int> g_track_restarted; // 1.1.3 (15 Nov): sessions that ended in a restart: nothing of them counts
+// 1.1.3: every event that passed the identity checks, as it came (only an exact repeat of a pair's last event is left
+// out at once). What the market keeps is worked out from it when it is read (kept_track): so an event a flashback
+// undoes takes back what it caused, an overtake given back included.
+std::vector<PendingTrack> g_track;
+float g_track_clock = -1;      // 1.1.3: the latest session clock seen in this race (a lower one: a flashback)
+// a race is running: set when the race starts (lights out, the core's race.start), cleared when the session ends, a
+// session starts or one unloads. The feed's session type can't tell (the UDP 2026 format has no session packet: it
+// stays 0), and the view's session type comes as practice in careers.
+std::atomic<bool> g_track_race{false};
+bool g_track_told_off = false; // the reason no event counts was logged
+int g_track_session = 0;       // counts this game run's sessions: a race's events belong to its session
+int g_track_started = -1;      // the session whose race last started (lights out twice in one session: a restart)
 
-// g_lock held, at an idle Team HQ: the game's race results go into the market, round by round, and the
-// player's secret meetings into the news
-void take_season_data()
+// The core (1.9) tells an overtake at every change of the classification between two cars on track, so a start, two
+// cars swapping places back and forth and cars that are no part of the grid (another addon's entry list can add some)
+// made hundreds in a five-lap race. What the market keeps of a race, and why the rest is left out, logged at its end.
+struct TrackTally {
+    int raw = 0;       // every event the game told while the option is on
+    int outside = 0;   // not between lights out and the race's end
+    int paused = 0;    // while the game was paused (the pause menu, a flashback being picked)
+    int unread = 0;    // the feed couldn't be read
+    int unknown = 0;   // a car the market can't tell (no driver id: the game's UDP output is off)
+    int strangers = 0; // a car whose driver holds no race seat in the market's grid
+    int repeated = 0;  // the same pair again within kTrackPairWindow (or a driver retiring twice)
+    int undone = 0;    // an overtake given back within kTrackPairWindow: both are dropped
+    int rewound = 0;   // dropped after a flashback or a restart: they never happened
+};
+TrackTally g_tally;
+constexpr float kTrackPairWindow = 30.0f; // seconds of the session clock
+
+// Swofty's shared-memory telemetry feed, read straight. The core's telemetry::session/car/participant reads answered
+// unavailable all session long in the game (launcher 1.8.38), while this mapping held every field.
+const SwoftyTelemetryFeed *g_feed = nullptr;
+// 1.1.3 (15 Nov): a feed that can't be opened yet (the core not ready, a feed that appears late) is tried again, at
+// most every 10 s; before, the first failure was the last try of the game run
+std::chrono::steady_clock::time_point g_feed_next_try{};
+int g_feed_failures = 0;
+int g_feed_retry_seconds = 10; // plugin_test sets 0
+
+void open_feed()
+{
+    if (g_feed)
+        return;
+    auto now = std::chrono::steady_clock::now();
+    if (now < g_feed_next_try)
+        return; // tried and failed less than g_feed_retry_seconds ago
+    const char *name = nullptr;
+    telemetry::Result r = telemetry::shared_memory(&name);
+    if (r != telemetry::Result::ok || !name) {
+        g_feed_next_try = now + std::chrono::seconds(g_feed_retry_seconds);
+        if (++g_feed_failures <= 3)
+            log("[silly-season] on track: the telemetry feed can't be opened (%s)%s", telemetry::name(r),
+                g_feed_failures == 1 ? "; tried again every 10 s" : "");
+        return;
+    }
+    int n = MultiByteToWideChar(CP_UTF8, 0, name, -1, nullptr, 0);
+    std::wstring w(static_cast<size_t>(n > 0 ? n : 1), L' ');
+    MultiByteToWideChar(CP_UTF8, 0, name, -1, w.data(), n);
+    HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, w.c_str());
+    void *view = h ? MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(SwoftyTelemetryFeed)) : nullptr;
+    g_feed = static_cast<const SwoftyTelemetryFeed *>(view);
+    if (!g_feed)
+        g_feed_next_try = now + std::chrono::seconds(g_feed_retry_seconds);
+    log("[silly-season] on track: telemetry feed %s %s", name, g_feed ? "mapped" : "could not be opened");
+}
+
+// one consistent copy of the feed (its sequence counter is odd while the core writes it)
+bool feed_snapshot(SwoftyTelemetryFeed &out)
+{
+    if (!g_feed)
+        open_feed(); // 1.1.3 (15 Nov): one that appears late is picked up (at most a try every 10 s)
+    if (!g_feed)
+        return false;
+    for (int i = 0; i < 64; ++i) {
+        uint64_t before = reinterpret_cast<const volatile uint64_t &>(g_feed->seq);
+        if (before & 1)
+            continue;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        std::memcpy(&out, g_feed, sizeof out);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (reinterpret_cast<const volatile uint64_t &>(g_feed->seq) == before)
+            return out.size == sizeof out;
+    }
+    return false;
+}
+
+// the market's driver for a telemetry participant; "" when it can't be told
+std::string track_driver(const SwoftyTelemetryFeed &f, uint32_t index)
+{
+    if (index >= 24)
+        return {};
+    // The driver ids come with the game's UDP output. Without it every slot holds zeros, which would read as "a
+    // human's car" and "driver 0" (Carlos Sainz's id) at once: then no car can be told.
+    int with_id = 0, ai_without = 0;
+    for (const SwoftyParticipant &q : f.participants) {
+        with_id += q.driver_id != 0;
+        ai_without += q.driver_id == 0 && q.ai_controlled;
+    }
+    if (with_id < 10)
+        return {};
+    const SwoftyParticipant &p = f.participants[index];
+    if (!p.ai_controlled) // the human's car; an empty slot (no id, not the player's index) is nobody's
+        return p.driver_id || index == f.session.player_index ? g_state.player : std::string();
+    if (p.driver_id)
+        return known_driver(p.driver_id);
+    // id 0 is Carlos Sainz: his car, when it is the session's only AI car without an id
+    return ai_without == 1 ? known_driver(0) : std::string();
+}
+
+// g_lock held: the driver races in this career now: a race seat in the market's grid, the player, his own team's
+// other driver (My Team) or a driver of a team the market doesn't plan. A free agent or a reserve the game puts on
+// track anyway (a car another addon's entry list adds) doesn't: what he does is no part of the season.
+bool races_now(const std::string &id)
+{
+    if (id.empty())
+        return false;
+    if (id == g_state.player || id == g_state.own_mate || g_state.protected_ids.count(id))
+        return true;
+    for (const ss::State::Standin &sb : g_state.standins)
+        if (sb.in == id)
+            return true; // a stand-in: the seat stays the regular driver's in the market, but he is the one racing
+    const ss::Driver *d = g_state.driver(id);
+    return d && !d->team.empty();
+}
+
+// g_lock held: this session's events from `from` on are dropped (a flashback, a restart)
+int drop_track_events(float from)
+{
+
+    size_t before = g_track.size();
+    g_track.erase(std::remove_if(g_track.begin(), g_track.end(),
+                                 [&](const PendingTrack &t) { return t.session == g_track_session && t.time > from; }),
+                  g_track.end());
+    return static_cast<int>(before - g_track.size());
+}
+
+// g_lock held: what the market keeps of the events (one session, or all with session < 0). In a session, the same two
+// cars within kTrackPairWindow are one fight (a collision told from either car, an overtake repeated), an overtake
+// given back within it cancels both, and a driver retires once.
+std::vector<PendingTrack> kept_track(int session, int *repeated = nullptr, int *undone = nullptr)
+{
+    std::vector<PendingTrack> kept;
+    int rep = 0, und = 0;
+    for (const PendingTrack &t : g_track) {
+        if (session >= 0 && t.session != session)
+            continue;
+        bool skip = false;
+        for (size_t i = kept.size(); i-- > 0;) {
+            const PendingTrack &p = kept[i];
+            if (p.session != t.session || t.time - p.time > kTrackPairWindow)
+                break; // older events are further back still
+            if (p.e.kind != t.e.kind)
+                continue;
+            bool same = p.e.a == t.e.a && p.e.b == t.e.b, mirrored = p.e.a == t.e.b && p.e.b == t.e.a;
+            if (t.e.kind == "overtake" && mirrored) {
+                kept.erase(kept.begin() + static_cast<std::ptrdiff_t>(i)); // given back: neither overtake stands
+                und += 2;
+                skip = true;
+                break;
+            }
+            if (same || (t.e.kind == "collision" && mirrored)) {
+                ++rep;
+                skip = true;
+                break;
+            }
+        }
+        if (!skip && t.e.kind == "retirement")
+            for (const PendingTrack &p : kept)
+                if (p.session == t.session && p.e.kind == "retirement" && p.e.a == t.e.a) {
+                    ++rep;
+                    skip = true;
+                    break;
+                }
+        if (!skip)
+            kept.push_back(t);
+    }
+    if (repeated)
+        *repeated = rep;
+    if (undone)
+        *undone = und;
+    return kept;
+}
+
+// the race is over (its session ended or unloaded): what the telemetry told and what the market keeps, once a race
+// 1.1.3 (15 Nov): the feed tells who most of the cars are (the game's UDP output is on): a race read this way has data
+// even when nothing happened in it
+bool feed_tells_drivers()
+{
+    SwoftyTelemetryFeed f;
+    if (!feed_snapshot(f) || !f.session.participant_count)
+        return false;
+    uint32_t n = std::min<uint32_t>(f.session.participant_count, 24), known = 0;
+    for (uint32_t i = 0; i < n; ++i)
+        known += track_driver(f, i).empty() ? 0 : 1;
+    return known * 2 >= n;
+}
+
+void track_race_over(const char *where)
+{
+    if (!g_track_race.exchange(false))
+        return;
+    std::lock_guard lock(g_lock.quiet());
+    TrackTally t = g_tally;
+    g_tally = TrackTally{};
+    if (!g_loaded || !settings().on_track)
+        return;
+    // 1.1.3 (15 Nov): a race the telemetry could read counts as one with data, events or not (a clean race: 0
+    // incidents, not "no data yet"). A restart's session is dropped whole later, this mark with it.
+    if (!g_track_restarted.count(g_track_session) && feed_tells_drivers()) {
+        PendingTrack cov;
+        cov.e.kind = "coverage";
+        cov.session = g_track_session;
+        cov.season = g_track_season_now;
+        cov.round = g_track_round_now;
+        cov.time = 0; // at the start: a flashback (events after a moment) never drops it, a restart (all) does
+        g_track.push_back(cov);
+    }
+    if (!t.raw)
+        return;
+    int passes = 0, hits = 0, out = 0, repeated = 0, undone = 0;
+    for (const PendingTrack &p : kept_track(g_track_session, &repeated, &undone)) {
+        passes += p.e.kind == "overtake";
+        hits += p.e.kind == "collision";
+        out += p.e.kind == "retirement";
+    }
+    t.repeated += repeated;
+    t.undone += undone;
+    log("[silly-season] on track: race over (%s): %d event(s) from the game, %d kept (%d overtake(s), %d collision(s), "
+        "%d retirement(s)); left out: %d repeated, %d given back, %d of cars with no race seat in the market, %d of cars "
+        "it can't tell, %d while paused, %d before a flashback or restart, %d feed unread",
+        where, t.raw - t.outside, passes + hits + out, passes, hits, out, t.repeated, t.undone, t.strangers, t.unknown,
+        t.paused, t.rewound, t.unread);
+}
+
+void on_track_event(const char *kind, const SwoftyEvent *ev)
+{
+    std::lock_guard lock(g_lock.quiet()); // kept for the next Team HQ: nothing saved changes here
+    if (!g_loaded || !settings().on_track)
+        return;
+    ++g_tally.raw;
+    if (!g_track_race.load()) {
+        ++g_tally.outside;
+        if (!g_track_told_off) {
+            g_track_told_off = true;
+            log("[silly-season] on track: a %s outside a race is left out (practice, qualifying, before lights out or "
+                "after the race)", kind);
+        }
+        return;
+    }
+    // nothing happens on track while the game is paused: an event then is the game's replay or flashback at work
+    if (view::paused()) {
+        ++g_tally.paused;
+        return;
+    }
+    SwoftyTelemetryFeed f;
+    if (!feed_snapshot(f)) {
+        ++g_tally.unread;
+        return;
+    }
+    float now = f.session.session_time;
+    // the session clock went back (a flashback, a restart): what came after that moment never happened
+    if (g_track_clock >= 0 && now + 1.0f < g_track_clock)
+        g_track_clock = now;
+    g_tally.rewound += drop_track_events(now + 1.0f);
+    PendingTrack t;
+    t.e.kind = kind;
+    t.time = now;
+    t.session = g_track_session;
+    t.season = g_track_season_now;
+    t.round = g_track_round_now;
+    bool pair = t.e.kind != "retirement";
+    t.e.a = track_driver(f, static_cast<uint32_t>(ev->a));
+    if (pair)
+        t.e.b = track_driver(f, static_cast<uint32_t>(ev->b));
+    else
+        t.e.reason = static_cast<int>(ev->b);
+    if (t.e.a.empty() || (pair && (t.e.b.empty() || t.e.b == t.e.a))) {
+        ++g_tally.unknown;
+        return;
+    }
+    if (!races_now(t.e.a) || (pair && !races_now(t.e.b))) {
+        ++g_tally.strangers;
+        return;
+    }
+    // 1.1.3: an exact repeat of the pair's latest event within the window (the same overtake told again, a collision
+    // told from either car, a second retirement) is left out at once; everything else is kept as it came and judged
+    // when it is read (kept_track), so a flashback can undo a give-back as well as an overtake
+    for (size_t i = g_track.size(); i-- > 0;) {
+        const PendingTrack &p = g_track[i];
+        if (p.session != g_track_session || now - p.time > kTrackPairWindow)
+            break;
+        if (p.e.kind != t.e.kind)
+            continue;
+        bool same = p.e.a == t.e.a && p.e.b == t.e.b, mirrored = p.e.a == t.e.b && p.e.b == t.e.a;
+        if (!pair ? p.e.a == t.e.a : (same || mirrored)) {
+            if (same || (t.e.kind == "collision" && mirrored) || !pair) {
+                ++g_tally.repeated;
+                return;
+            }
+            break; // the pair's latest is the other way round: a give-back, judged when read
+        }
+    }
+    if (!pair) // a driver retires once a race (also beyond the window)
+        for (const PendingTrack &p : g_track)
+            if (p.session == g_track_session && p.e.kind == "retirement" && p.e.a == t.e.a) {
+                ++g_tally.repeated;
+                return;
+            }
+    g_track_clock = std::max(g_track_clock, now);
+    if (g_track.size() < 4000)
+        g_track.push_back(std::move(t));
+}
+
+// 1.1.3: a flashback with nothing after it. The SDK has no flashback event, and events only came to say the clock had
+// gone back: a collision undone by a flashback with no other event in the rest of the race stayed (the test bench:
+// Verstappen's incident). Twice a second during a race, out of the pause, the feed's clock is checked.
+void watch_track_clock()
+{
+    if (!g_track_race.load() || view::paused())
+        return;
+    static std::chrono::steady_clock::time_point last;
+    auto now_t = std::chrono::steady_clock::now();
+    if (now_t - last < std::chrono::milliseconds(500))
+        return;
+    last = now_t;
+    SwoftyTelemetryFeed f;
+    if (!feed_snapshot(f))
+        return;
+    float now = f.session.session_time;
+    std::lock_guard lock(g_lock.quiet()); // kept for the next Team HQ: nothing saved changes here
+    if (g_track_clock >= 0 && now + 1.0f < g_track_clock) {
+        float was = g_track_clock;
+        int dropped = drop_track_events(now + 1.0f);
+        g_tally.rewound += dropped;
+        log("[silly-season] on track: the session clock went back from %.0f s to %.0f s (a flashback): %d event(s) after it "
+            "are dropped", was, now, dropped);
+        g_track_clock = now;
+        return;
+    }
+    g_track_clock = std::max(g_track_clock, now);
+}
+
+int g_results_rounds = -1;       // rounds of this career's season the game's standings hold (-1: unread)
+// 1.1.3 (15 Nov): of those, the ones this visit may take: the calendar has passed them, or their race ended since the
+// last visit. A round of the table can hold only its qualifying for now (the reader takes the session with the most
+// cars, and qualifying has as many as the race).
+int g_results_confirmed = 0;
+bool g_results_another = false;  // 1.1.3 (15 Nov): every round the market took (two or more) reads differently: another career's
+std::string g_results_said;      // the last outcome logged
+std::vector<game_data::Round> g_rounds; // 1.1.3: this visit's standings, this career's rows only
+bool g_results_differ = false;   // 1.1.3: a round the market took reads differently now: another career's standings
+bool g_results_short = false;    // 1.1.3: the standings hold fewer rounds than the market took (maybe only for now)
+std::string g_results_differ_said, g_results_short_said;
+
+// g_lock held, at an idle Team HQ, after the standings are read and before their results are taken: the races'
+// events go to the market
+// 1.1.3 (15 Nov): only the races of `season` (and those whose season wasn't known), each GP to its own round: two GPs
+// before one Team HQ used to go to one round. The closing season's races go before it closes, the new one's after.
+void take_track_events(const ss::Settings &s, int season)
+{
+    if (g_track.empty())
+        return;
+    std::vector<PendingTrack> mine, others;
+    for (const PendingTrack &t : g_track) {
+        if (g_track_restarted.count(t.session))
+            continue; // a restarted session: it never happened
+        (t.season < 0 || t.season == season ? mine : others).push_back(t);
+    }
+    std::swap(g_track, mine);
+    std::vector<PendingTrack> kept = kept_track(-1);
+    g_track = std::move(others);
+    if (g_state.season_index < 0 || g_state.real)
+        return;
+    // a GP whose round wasn't known: the standings' newest row the market hasn't taken yet, else the next round
+    int fallback = g_results_confirmed > g_state.results_read ? g_results_confirmed : std::max(g_state.results_read, g_state.round) + 1;
+    std::map<int, std::vector<ss::TrackEvent>> by_round;
+    for (const PendingTrack &t : kept)
+        by_round[t.round > 0 ? t.round : fallback].push_back(t.e);
+    for (const auto &[round, list] : by_round) {
+        int passes = 0, hits = 0, failures = 0;
+        bool covered = false;
+        for (const ss::TrackEvent &e : list) {
+            passes += e.kind == "overtake";
+            hits += e.kind == "collision";
+            failures += e.kind == "retirement" && e.reason == 8;
+            covered = covered || e.kind == "coverage";
+        }
+        ss::apply_track_events(g_state, s, list, round);
+        log("[silly-season] on track, round %d: %d overtake(s), %d collision(s), %d mechanical retirement(s)%s", round, passes,
+            hits, failures, covered ? "" : " (the feed didn't tell the cars: no data for the drivers who raced)");
+    }
+}
+
+// A round's fingerprint, never 0 (0: none kept). Scheme 1 (1.1.3 before 15 Nov): its winner, runner-up and how many
+// cars it classified. Scheme 2: the whole classification, so two races with the same top two still differ.
+uint32_t round_key(const game_data::Round &r, int scheme = 2)
+{
+    if (scheme == 1) {
+        uint32_t first = 0x3fff, second = 0x3fff;
+        for (const game_data::Finish &f : r) {
+            if (f.position == 1)
+                first = f.stat & 0x3fff;
+            else if (f.position == 2)
+                second = f.stat & 0x3fff;
+        }
+        uint32_t k = (first << 18) | (second << 4) | (static_cast<uint32_t>(r.size()) & 0xf);
+        k ^= static_cast<uint32_t>(r.size()) << 28;
+        return k ? k : 1;
+    }
+    std::vector<std::pair<int, uint32_t>> order;
+    for (const game_data::Finish &f : r)
+        order.push_back({f.position, f.stat});
+    std::sort(order.begin(), order.end());
+    uint32_t h = 2166136261u;
+    auto mixin = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            h ^= (v >> (i * 8)) & 0xff;
+            h *= 16777619u;
+        }
+    };
+    mixin(static_cast<uint32_t>(order.size()));
+    for (const auto &[pos, stat] : order) {
+        mixin(static_cast<uint32_t>(pos));
+        mixin(stat);
+    }
+    return h ? h : 1;
+}
+
+// g_lock held, at an idle Team HQ: the game's standings for this season, read once a visit (g_rounds,
+// g_results_rounds, g_results_confirmed). 1.1.3: rows of another championship found before this career raced
+// (State::foreign_keys) stay out while the game still shows them first; rounds the market already took are checked
+// against their fingerprints. 15 Nov: a round that reads differently is a correction unless every round taken does.
+void read_season_results()
 {
     g_results_rounds = -1;
+    g_results_confirmed = 0;
+    g_rounds.clear();
+    g_results_differ = g_results_short = g_results_another = false;
     std::vector<game_data::Round> rounds;
     std::string why;
     if (!game_data::read_results(rounds, why)) {
@@ -1341,13 +2168,146 @@ void take_season_data()
             g_results_said = said;
             log("[silly-season] results: not read (%s); races are simulated", why.c_str());
         }
+        return;
+    }
+    const int scheme = g_state.key_scheme;
+    // the other championship's rows: still first in the table (the game added this career's races after them), or
+    // gone (the game replaced the table with this career's own)
+    size_t skip = 0;
+    if (!g_state.foreign_keys.empty() && !rounds.empty()) {
+        size_t same = 0, can = std::min(rounds.size(), g_state.foreign_keys.size());
+        while (same < can && round_key(rounds[same], scheme) == g_state.foreign_keys[same])
+            ++same;
+        if (same == can) {
+            skip = same;
+        } else {
+            log("[silly-season] results: the standings no longer start with the %zu round(s) of another championship "
+                "left out before; every row is this career's", g_state.foreign_keys.size());
+            g_state.foreign_keys.clear();
+        }
+    }
+    // a save of the first scheme: its keys checked out (or are gone), so they are made again in the second
+    if (scheme == 1) {
+        for (size_t i = 0; i < skip; ++i)
+            g_state.foreign_keys[i] = round_key(rounds[i], 2);
+    }
+    std::vector<game_data::Round> foreign(rounds.begin(), rounds.begin() + static_cast<std::ptrdiff_t>(skip));
+    rounds.erase(rounds.begin(), rounds.begin() + static_cast<std::ptrdiff_t>(skip));
+    // 1.1.3: a market's first visit, with the calendar at its first round: no race of this season has been run, so
+    // standings that hold rounds belong to another championship (seen in an F2 Revamp career, whose F1 table showed a
+    // race before the player's first F1 weekend). They are kept aside, never taken, and never count as rounds run.
+    if (g_state.season_index < 0 && !rounds.empty())
+        if (auto pos = career::current_round(); pos && pos->round <= 1 && g_weekend_raced == 0) {
+            for (const game_data::Round &r : rounds)
+                g_state.foreign_keys.push_back(round_key(r, 2));
+            log("[silly-season] results: the standings hold %zu round(s) but the calendar hasn't run a race yet; left out "
+                "(this career's races count from round 1 whether the game adds them after these or replaces the table)",
+                rounds.size());
+            rounds.clear();
+        }
+    // the rounds the market took, against what the standings say now
+    size_t check = std::min({rounds.size(), g_state.result_keys.size(), static_cast<size_t>(std::max(0, g_state.results_read))});
+    int checked = 0, differ = 0;
+    for (size_t i = 0; i < check; ++i) {
+        if (!g_state.result_keys[i])
+            continue;
+        ++checked;
+        if (round_key(rounds[i], scheme) != g_state.result_keys[i]) {
+            ++differ;
+            if (differ == 1) {
+                std::string said = "round " + std::to_string(i + 1);
+                if (said != g_results_differ_said) {
+                    g_results_differ_said = said;
+                    log("[silly-season] results: round %zu in the standings isn't the round %zu the market took", i + 1, i + 1);
+                }
+            }
+        }
+    }
+    g_results_differ = differ > 0;
+    g_results_another = checked >= 2 && differ == checked;
+    if (scheme == 1 && !g_results_another) {
+        for (size_t i = 0; i < check; ++i)
+            if (g_state.result_keys[i])
+                g_state.result_keys[i] = round_key(rounds[i], 2);
+        g_state.key_scheme = 2;
+        log("[silly-season] results: the market's fingerprints move to the whole classification (%zu round(s))", check);
+    }
+    auto pos = career::current_round();
+    g_results_short = static_cast<int>(rounds.size()) < g_state.results_read && (!pos || pos->season_index == g_state.season_index);
+    if (g_results_short) {
+        std::string said = std::to_string(rounds.size()) + "<" + std::to_string(g_state.results_read);
+        if (said != g_results_short_said) {
+            g_results_short_said = said;
+            log("[silly-season] results: the standings show %zu round(s), fewer than the %d the market took", rounds.size(),
+                g_state.results_read);
+        }
+    }
+    // 1.1.3 (15 Nov): a round of the table counts once its GP is over: the calendar has moved past it, or its race
+    // ended since the last visit (a race session said so). Practice and qualifying alone never make it a round run.
+    int n = static_cast<int>(rounds.size()), confirmed = 0;
+    if (pos) {
+        bool this_season = g_weekend_season < 0 || g_weekend_season == pos->season_index;
+        int raced = g_race_ended && this_season && g_weekend_raced > 0 ? g_weekend_raced : 0;
+        confirmed = std::min(n, std::max(pos->round - 1, raced));
+        if (confirmed < n)
+            log("[silly-season] results: the standings hold %d round(s), round %d not over yet (the calendar is at round "
+                "%d%s): it waits for its race", n, confirmed + 1, pos->round, raced ? "" : " and no race ended since the last visit");
     } else {
-        g_results_rounds = static_cast<int>(rounds.size());
-        int fed = 0;
+        // no calendar to read: the rounds the market has already gone past, or a race that ended
+        int raced = g_race_ended && g_weekend_raced > 0 ? g_weekend_raced : 0;
+        confirmed = std::min(n, std::max(g_state.round, raced));
+    }
+    g_results_rounds = n;
+    g_results_confirmed = confirmed;
+    g_rounds = std::move(rounds);
+}
+
+void take_season_results();
+
+// g_lock held: the standings read and taken in one go (the engine's tests)
+void take_season_data()
+{
+    read_season_results();
+    take_season_results();
+}
+
+// g_lock held, at an idle Team HQ, after read_season_results and with the market at this season: the game's race
+// results go into the market, each round once (State::counted). A round already behind the market is recorded now;
+// a round still ahead waits in State::incoming for complete_round, which records it before that round's decisions.
+// The player's secret meetings go into the news.
+void take_season_results()
+{
+    if (g_results_rounds >= 0 && g_state.season_index >= 0) {
+        int fed = 0, queued = 0, late = 0, corrected = 0;
         size_t unknown = 0;
         std::string unknown_list; // "80 (label)": what the log says of a driver the market can't tell
-        for (int r = std::max(0, g_state.results_read); r < g_results_rounds; ++r) {
-            for (const game_data::Finish &f : rounds[static_cast<size_t>(r)]) {
+        for (int r = 0; r < g_results_confirmed; ++r) {
+            const game_data::Round &round = g_rounds[static_cast<size_t>(r)];
+            int at = r + 1;
+            uint32_t key = round_key(round, 2);
+            if (g_state.result_keys.size() <= static_cast<size_t>(r))
+                g_state.result_keys.resize(static_cast<size_t>(r) + 1, 0);
+            char how = g_state.counted_as(at);
+            if (how == 't' || how == 'k') {
+                // counted from the table already: a classification that changed since (a penalty after the flag) is
+                // noted, and what was counted stays
+                if (g_state.result_keys[static_cast<size_t>(r)] && g_state.result_keys[static_cast<size_t>(r)] != key) {
+                    ++corrected;
+                    log("[silly-season] results: round %d's classification changed since the market took it (a correction); "
+                        "the market keeps what it counted", at);
+                }
+                g_state.result_keys[static_cast<size_t>(r)] = key;
+                continue;
+            }
+            if (how == 's') {
+                // the market simulated it before the game's results came: its count stays, nothing is added
+                g_state.count_round(at, 'k');
+                g_state.result_keys[static_cast<size_t>(r)] = key;
+                ++late;
+                continue;
+            }
+            std::vector<std::pair<std::string, int>> list;
+            for (const game_data::Finish &f : round) {
                 std::string id = f.stat == g_player_stat && g_player_stat && !g_state.player.empty() ? g_state.player : known_driver(f.stat);
                 if (id.empty()) {
                     if (++unknown <= 4) {
@@ -1357,24 +2317,54 @@ void take_season_data()
                     }
                     continue;
                 }
-                ss::record_result(g_state, id, f.position, r + 1); // the season's round, also when several are taken at once
+                list.push_back({id, f.position});
             }
-            ++fed;
+            if (at <= g_state.round) {
+                for (const auto &[id, pos] : list)
+                    ss::record_result(g_state, id, pos, at); // the season's round, also when several are taken at once
+                ++fed;
+            } else {
+                g_state.incoming[at] = std::move(list);
+                ++queued;
+            }
+            // 1.1.3: the records' status word, per value: what a retirement looks like there is still to be seen in the
+            // game (a breakdown, a crash and a manual retirement), so it decides nothing yet
+            {
+                std::map<uint32_t, std::string> by;
+                for (const game_data::Finish &f : round) {
+                    std::string &who = by[f.status];
+                    if (std::count(who.begin(), who.end(), ',') < 3)
+                        who += (who.empty() ? "" : ", ") + std::string("P") + std::to_string(f.position);
+                }
+                if (by.size() > 1) {
+                    std::string line;
+                    for (const auto &[st, who] : by)
+                        line += (line.empty() ? "" : "; ") + std::to_string(st) + ": " + who;
+                    log("[silly-season] results: round %d: status words %s", at, line.c_str());
+                }
+            }
+            g_state.result_keys[static_cast<size_t>(r)] = key;
         }
-        if (g_results_rounds > g_state.results_read)
-            g_state.results_read = g_results_rounds;
+        if (g_results_confirmed > g_state.results_read)
+            g_state.results_read = g_results_confirmed;
+        (void)fed;
+        if (late)
+            log("[silly-season] results: %d round(s) the market had simulated came in the standings later; the simulated "
+                "count stays (nothing is counted twice)", late);
         char said[160];
-        std::snprintf(said, sizeof said, "%d round(s) run", g_results_rounds);
-        if (fed || said != g_results_said) {
+        std::snprintf(said, sizeof said, "%d round(s) run, %d over", g_results_rounds, g_results_confirmed);
+        if (fed || queued || said != g_results_said) {
             g_results_said = said;
             std::string winner;
-            if (!rounds.empty())
-                for (const game_data::Finish &f : rounds.back())
+            if (g_results_confirmed > 0)
+                for (const game_data::Finish &f : g_rounds[static_cast<size_t>(g_results_confirmed - 1)])
                     if (f.position == 1)
                         winner = f.stat == g_player_stat && g_player_stat ? g_state.player : known_driver(f.stat);
-            log("[silly-season] results: %s, %d new round(s) taken%s%s%s%s", said, fed, winner.empty() ? "" : "; last winner ",
-                winner.c_str(), unknown ? "; drivers the market can't tell: " : "", unknown_list.c_str());
+            log("[silly-season] results: %s, %d round(s) taken now and %d with their round's decisions%s%s%s%s", said, fed, queued,
+                winner.empty() ? "" : "; last winner ", winner.c_str(), unknown ? "; drivers the market can't tell: " : "",
+                unknown_list.c_str());
         }
+        (void)corrected;
     }
     // the player's secret meeting with another team
     if (g_player_stat) {
@@ -1452,6 +2442,7 @@ struct UiDriver {
     int age = 0, contract = 0;
     float value = 0, potential = 0, trend = 0;
     bool clause = false, feud = false, pressure = false;
+    bool player = false; // 1.1.3: the player himself, listed with the others (marked YOU)
     std::string trait; // the trait that shows most: ambition, loyalty, money (or none)
     // 1.1.0 phase 6: a free agent's role: "reserve" or "academy", with the team's code and colour
     std::string role, role_code;
@@ -1498,6 +2489,9 @@ struct UiDriverCard {
     // their peak
     float rating[5] = {0, 0, 0, 0, 0}, peak[5] = {0, 0, 0, 0, 0};
     int game_rating = 0; // the game's own overall for him (its ratings screen); 0: not read
+    int t_overtakes = 0, t_incidents = 0, t_failures = 0; // 1.1.3: this season on track (game telemetry)
+    int t_rounds = 0;       // 1.1.3: his races this season that came with telemetry (0: no data, not "no incidents")
+    bool t_on = false;      // 1.1.3: the "On-track reputation" option is on
 };
 
 // a team's card (F7)
@@ -1595,7 +2589,10 @@ struct UiReport {
     int id = 0;             // new when a round was completed in this session
     int round = 0, rounds = 0, position = 0, rumours = 0, signings = 0, keen = 0;
     float value = 0, delta = 0;
-    std::vector<std::string> headlines;
+    std::vector<std::string> headlines; // the round's other stories
+    // 1.1.3: the round's main story, told big, with the panel's key to read it in full
+    int lead_id = 0;
+    std::string lead_kind, lead_title, lead_text;
 };
 
 // a team became keen on the player
@@ -1607,10 +2604,12 @@ struct UiAlert {
 
 struct OverlayData {
     bool career = false, enabled = true, es = false, effects = true;
+    bool waiting_year = false; // 1.1.3: a Progressive career whose real year isn't known yet: the panel says so
     bool real = false; // history mode: the real season is told
     int version = 0;
     int year = 0, round = 0, rounds = 24;
     bool finalised = false;
+    int open_seats = 0; // 1.1.3 (15 Nov): the new season's seats the game hasn't shown yet (State::seat_checks)
     int unread = 0, seats_in_play = 0, open_talks = 0, done_deals = 0;
     std::vector<UiNews> news;
     // the press
@@ -1713,6 +2712,8 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
     o.round = st.round;
     o.rounds = st.rounds;
     o.finalised = st.finalised;
+    o.open_seats = static_cast<int>(std::count_if(st.seat_checks.begin(), st.seat_checks.end(),
+                                                  [&](const ss::State::SeatCheck &k) { return k.year == st.year && k.state < 2; }));
     o.real = st.real;
     o.unread = ss::unread(st);
 
@@ -1867,7 +2868,7 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
         u.value = ss::driver_value(d);
         u.potential = d.potential();
         u.trend = d.trend;
-        u.salary = ss::text::salary_short(ss::text::lang_of(s.lang), d.salary);
+        u.salary = d.salary > 0.05f ? ss::text::salary_short(ss::text::lang_of(s.lang), d.salary) : std::string("-"); // the player's isn't known
         u.kind = d.kind;
         u.clause = d.clause_rank > 0;
         u.feud = !d.feuds.empty();
@@ -1892,22 +2893,34 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
         }
         return u;
     };
+    // 1.1.3: the player is listed too, marked YOU, under his own name when he is a driver of the game (a player asked
+    // why only the other 19 showed on the Drivers and Stock pages)
+    auto as_player = [&](UiDriver &u, const ss::Driver &d) {
+        u.player = true;
+        if (d.kind != "player" && !d.name.empty())
+            u.name = d.name;
+    };
     for (const ss::Team &t : st.teams)
         for (const std::string &who : t.seats)
-            if (const ss::Driver *d = st.driver(who))
-                if (d->id != st.player) {
-                    o.drivers.push_back(ui_driver(*d));
-                    if (d->contract <= st.year && !d->retiring)
-                        ++o.seats_in_play;
-                }
+            if (const ss::Driver *d = st.driver(who)) {
+                UiDriver u = ui_driver(*d);
+                if (d->id == st.player)
+                    as_player(u, *d);
+                else if (d->contract <= st.year && !d->retiring)
+                    ++o.seats_in_play;
+                o.drivers.push_back(std::move(u));
+            }
     if (own_team)
-        if (const ss::Driver *mate = st.driver(st.own_mate)) {
-            UiDriver u = ui_driver(*mate);
-            u.team = g_own_team_name;
-            u.code = "MYT";
-            u.col = 0x5E5CE6;
-            o.drivers.push_back(std::move(u));
-        }
+        for (const std::string &who : {st.player, st.own_mate})
+            if (const ss::Driver *d = st.driver(who)) {
+                UiDriver u = ui_driver(*d);
+                u.team = g_own_team_name;
+                u.code = "MYT";
+                u.col = 0x5E5CE6;
+                if (who == st.player)
+                    as_player(u, *d);
+                o.drivers.push_back(std::move(u));
+            }
     std::sort(o.drivers.begin(), o.drivers.end(), [](const UiDriver &a, const UiDriver &b) { return a.value > b.value; });
 
     for (const auto &[id, d] : st.drivers)
@@ -1963,6 +2976,10 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
     {
         std::string_view size = panel_size;
         o.scale = size == "small" ? 0.9f : size == "large" ? 1.12f : 1.0f;
+        std::string_view key = panel_key;
+        for (int i = 0; i < static_cast<int>(std::size(kPanelKeys)); ++i)
+            if (key == kPanelKeys[i].id)
+                g_panel_key = i;
     }
     for (auto it = st.awards.rbegin(); it != st.awards.rend() && o.awards.size() < 30; ++it)
         o.awards.push_back({it->year, it->key, it->name, it->line});
@@ -2089,6 +3106,11 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
             c.c_points = ct.points;
             c.c_titles = ct.titles;
             c.c_teams = ct.teams;
+            c.t_overtakes = static_cast<int>(d.s_overtakes);
+            c.t_incidents = static_cast<int>(d.s_incidents);
+            c.t_failures = static_cast<int>(d.s_failures);
+            c.t_rounds = d.s_track_rounds;
+            c.t_on = s.on_track;
             ss::HeadToHead h = ss::head_to_head(st, d);
             if (!h.mate.empty()) {
                 c.h2h_mate = dname(h.mate);
@@ -2398,8 +3420,30 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
                 r.rumours += n.kind == "rumour" || n.kind == "talks";
                 r.signings += n.kind == "official";
             }
+        // 1.1.3: the main story of the round: a signing first (a bombshell above all), then what breaks a seat (a deal
+        // off, a sacking, a retirement), then talks and rumours; the newest of equals
+        auto weight = [&](const UiNews &n) {
+            int w = n.kind == "official" ? 60 : n.kind == "collapse" || n.kind == "sacking" ? 50 : n.kind == "retirement" ? 45
+                    : n.kind == "player" ? 40 : n.kind == "talks" ? 30 : n.kind == "rumour" ? 20 : 10;
+            for (const ss::NewsItem &x : st.news)
+                if (x.id == n.id && x.big)
+                    w += 15;
+            return w;
+        };
+        const UiNews *lead = nullptr;
         for (const UiNews &n : o.news)
-            if (n.year == st.year && n.round == st.round && r.headlines.size() < 3)
+            if (n.year == st.year && n.round == st.round && (!lead || weight(n) > weight(*lead)))
+                lead = &n;
+        if (lead) {
+            r.lead_id = lead->id;
+            r.lead_kind = lead->kind;
+            r.lead_title = lead->title;
+            std::string line = lead->body.substr(0, lead->body.find('\n'));
+            size_t end = line.find(". ");
+            r.lead_text = end == std::string::npos ? line : line.substr(0, end + 1);
+        }
+        for (const UiNews &n : o.news)
+            if (n.year == st.year && n.round == st.round && (!lead || n.id != lead->id) && r.headlines.size() < 2)
                 r.headlines.push_back(n.title);
         for (const UiSuitor &x : o.future.suitors)
             r.keen += x.status == "keen";
@@ -2436,6 +3480,9 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
     while (o.alerts.size() > 3)
         o.alerts.pop_front();
     o.career = g_loaded;
+    // 1.1.3: until the first Team HQ tells the real year, a Progressive career's market is still the baseline's 2026
+    // (a player saw the 2026 teams and a team keen on him in a 2015 career): the panel waits, no other overlay shows
+    o.waiting_year = g_real_career && st.season_index < 0;
     o.enabled = headlines;
     o.effects = effects;
     o.version = g_ov.version + 1;
@@ -2562,13 +3609,7 @@ double g_round_poll = 0;
 // The weekend the sessions since the last Team HQ visit belonged to. The core's current_round() alone
 // can't tell "at weekend N, not raced yet" from "weekend N raced" and it can skip a weekend, so the
 // sessions themselves say which race weekend was run: its round, or -1 when no source knew it.
-// g_weekend_raced stays 0 while no career session ran since the last hub.
-int g_weekend_raced = 0;
-int g_weekend_season = -1;
-// The weekend only counts once its race is run: practice or qualifying alone doesn't. When no session
-// says its type (an older core), the weekend counts as before, at its first session.
-bool g_race_ended = false;   // a race session ended since the last hub
-bool g_session_typed = false; // a session since the last hub said its type
+// g_weekend_raced, g_weekend_season, g_race_ended and g_session_typed are declared with the other counters above.
 int g_session_type = -1;      // the running session's type, -1 unknown
 
 const char *session_type_name(int t)
@@ -2665,7 +3706,15 @@ bool realign_year(int season_index)
 void reset_market(const char *why, int season_index)
 {
     std::string id = g_state.career, group = g_state.group;
+    // 1.1.3 (15 Nov): never without a copy of what was there: careers/backup/<id>.<revision>.json, the last three
+    if (storage::available() && g_state.season_index >= 0) {
+        std::string path = "careers/backup/" + safe_name(id) + "." + std::to_string(g_state.revision % 3) + ".json";
+        storage::Result r = storage::write(path, ss::dump_save(ss::to_json(g_state)));
+        log("[silly-season] career %s: the market before the reset is kept in %s (%s)", id.c_str(), path.c_str(),
+            storage::name(r));
+    }
     log("[silly-season] career %s: %s; a new market starts", id.c_str(), why);
+    uint64_t revision = g_state.revision; // the new market's copies stay newer than the old one's
     g_state = ss::State{};
     g_pool_read = false;
     g_adopted_from.clear();
@@ -2675,6 +3724,7 @@ void reset_market(const char *why, int season_index)
         g_loaded = false;
         return;
     }
+    g_state.revision = revision;
     (void)season_index; // the first visit sets the year from the game's season (realign_year)
     g_state.career = id;
     g_state.group = group;
@@ -2754,51 +3804,220 @@ const SillySeasonMarket kMarketService{sizeof(SillySeasonMarket), &svc_sign};
 // g_lock held: the new season's grid into the game. A seat the game refuses is taken back: the market reads the
 // game's grid again and the signing it told falls through (1.0.1 kept announcing it). An observer career (My Team)
 // writes nothing: the grid is the game's.
-void apply_new_season(const ss::Settings &s)
+// 1.1.3: a new season's seat change, from the news to the game's rows. Each starts "announced" (the market's plan); it
+// is "requested" when the game takes the write and "confirmed" when a later read of the rows shows the driver in that
+// team. Until then the market follows the grid the game was read with, never its own plan.
+// 1.1.3 (15 Nov): each driver's deal just before the season turned (start_new_season moves the market's plan in at
+// once), so a move the game never takes gives his old deal back
+struct PrevDeal {
+    std::string team;
+    int contract = 0;
+    float salary = 0;
+};
+std::map<std::string, PrevDeal> g_turn_prev;
+
+void note_check(const ss::SeatChange &c)
 {
+    ss::State::SeatCheck k{c.team, c.driver, c.seat, g_state.year, 0};
+    if (auto it = g_turn_prev.find(c.driver); it != g_turn_prev.end()) {
+        k.have_prev = true;
+        k.prev_team = it->second.team;
+        k.prev_contract = it->second.contract;
+        k.prev_salary = it->second.salary;
+    }
+    for (ss::State::SeatCheck &x : g_state.seat_checks)
+        if (x.year == g_state.year && x.team == c.team && x.seat == c.seat) {
+            x = k;
+            return;
+        }
+    g_state.seat_checks.push_back(k);
+}
+
+// a move the game never took: the driver's deal as it was before the season turned (his team follows the game's rows)
+void give_back_deal(const ss::State::SeatCheck &k)
+{
+    ss::Driver *d = g_state.driver(k.driver);
+    if (!d || !k.have_prev)
+        return;
+    d->contract = k.prev_contract;
+    d->salary = k.prev_salary;
+    log("[silly-season] %s: the move to %s never happened; his deal goes back to %s until %d", k.driver.c_str(),
+        k.team.c_str(), k.prev_team.empty() ? "none" : k.prev_team.c_str(), k.prev_contract);
+}
+
+// 1.1.3 (15 Nov): a seat write the last valid read of this career's rows allows: the team is in the rows, and the seat
+// isn't the human's or a protected driver's (the player's own team-mate, a team the market doesn't plan). nullptr: ok
+const char *write_blocked(const ss::SeatChange &c)
+{
+    if (!g_grid_valid_now || g_last_seats_owner != rows_owner())
+        return "no valid read of this career's rows in this visit";
+    if (!g_row_team_stat.count(c.team) && !g_state.team(c.team))
+        return "a team not in the rows";
+    for (const RealSeat &s : g_last_seats) {
+        if (team_by_stat(s.team) != c.team || s.seat != c.seat)
+            continue;
+        if (s.human)
+            return "the human's seat";
+        std::string who = driver_for_stat(s.driver);
+        if (!who.empty() && g_state.protected_ids.count(who))
+            return "a protected driver's seat";
+    }
+    return nullptr;
+}
+
+// what the last read of the rows says of a check: 2 the driver in that team and seat, 1 in that team's other seat,
+// 0 not in that team
+int seat_shows(const ss::State::SeatCheck &k)
+{
+    int best = 0;
+    for (const RealSeat &s : g_last_seats) {
+        if (s.human || team_by_stat(s.team) != k.team || driver_for_stat(s.driver) != k.driver)
+            continue;
+        best = std::max(best, s.seat == k.seat ? 2 : 1);
+    }
+    return best;
+}
+
+// g_lock held, with the rows read in this visit: this season's open checks are written (those the rows don't show yet),
+// the rows are read again, and each is confirmed or taken back. When the rows can't be read again, the checks wait for
+// the next Team HQ and the market goes back to the grid read before the writes.
+void write_and_confirm(const char *why)
+{
+    g_state.seat_checks.erase(std::remove_if(g_state.seat_checks.begin(), g_state.seat_checks.end(),
+                                             [](const ss::State::SeatCheck &k) { return k.year < g_state.year; }),
+                              g_state.seat_checks.end());
+    if (g_state.seat_checks.empty())
+        return;
+    // 1.1.3 (15 Nov): only on a valid read of this career's rows in this visit
+    if (!g_grid_valid_now || g_last_seats_owner != rows_owner()) {
+        log("[silly-season] %s: no valid read of this career's rows in this visit; %zu seat(s) wait for the next Team HQ", why,
+            g_state.seat_checks.size());
+        return;
+    }
+    std::vector<ss::SeatChange> writes;
+    std::vector<size_t> which;
+    int blocked = 0;
+    for (size_t i = 0; i < g_state.seat_checks.size(); ++i) {
+        ss::State::SeatCheck &k = g_state.seat_checks[i];
+        if (seat_shows(k) == 2)
+            continue; // the rows show it already: checked again with the rest after the writes
+        ss::SeatChange c{k.team, k.seat, k.driver, "season"};
+        if (const char *no = write_blocked(c)) {
+            log("[silly-season] %s: %s to %s seat %d is not written (%s)", why, k.driver.c_str(), k.team.c_str(), k.seat, no);
+            k.state = std::min(k.state, 0);
+            ++blocked;
+            continue;
+        }
+        writes.push_back(c);
+        which.push_back(i);
+    }
+    std::vector<career::Result> results;
+    if (!writes.empty())
+        apply_changes(writes, why, &results);
+    std::vector<bool> refused(g_state.seat_checks.size(), false);
+    for (size_t j = 0; j < which.size(); ++j) {
+        if (j < results.size() && results[j] == career::Result::ok)
+            g_state.seat_checks[which[j]].state = std::max(g_state.seat_checks[which[j]].state, 1);
+        else
+            refused[which[j]] = true; // the game said no
+    }
+    std::vector<ss::GridCar> before = g_last_cars;
+    // every check is read again after the batch, those the rows showed before it too: another write in it can have
+    // moved a driver already in place
+    bool read = !writes.empty() ? sync_real_grid() : true;
+    int confirmed = 0, other_seat = 0, taken_back = 0, waiting = 0, unseen_requests = 0, slow = 0;
+    if (!read) {
+        // the game's grid as read before the writes: the market never takes its plan for the game's
+        if (!before.empty())
+            ss::sync_grid(g_state, before);
+        for (const ss::State::SeatCheck &k : g_state.seat_checks)
+            waiting += k.state < 2;
+    } else {
+        size_t i = 0;
+        for (auto it = g_state.seat_checks.begin(); it != g_state.seat_checks.end(); ++i) {
+            int shows = seat_shows(*it);
+            if (shows) {
+                ++confirmed;
+                other_seat += shows == 1;
+                if (shows == 1)
+                    log("[silly-season] %s: %s is in %s's other seat (not seat %d): taken as confirmed", why, it->driver.c_str(),
+                        it->team.c_str(), it->seat);
+                it = g_state.seat_checks.erase(it);
+                continue;
+            }
+            bool was_refused = i < refused.size() && refused[i];
+            // the game said ok, but the rows don't show it: the game can be slow to show a seat, so it waits for
+            // one more Team HQ before it is taken back
+            if (!was_refused && it->state == 1 && ++it->misses < 2) {
+                ++slow;
+                ++it;
+                continue;
+            }
+            if (!was_refused && it->state == 0 && blocked) {
+                ++waiting; // not written in this visit (no valid target): it waits
+                ++it;
+                continue;
+            }
+            unseen_requests += it->state == 1;
+            if (ss::season_change_refused(g_state, it->team, it->driver, false))
+                ++taken_back;
+            give_back_deal(*it);
+            it = g_state.seat_checks.erase(it);
+        }
+    }
+    log("[silly-season] %s: %zu seat(s) written; %d confirmed by the rows%s, %d taken back (%d the game took but never "
+        "showed), %d waiting for the game to show them, %d waiting for the next read", why, writes.size(), confirmed,
+        other_seat ? " (some in the other seat)" : "", taken_back, unseen_requests, slow, waiting);
+}
+
+void apply_new_season(const ss::Settings &s, const std::vector<ss::SeatChange> &changes)
+{
+    (void)s;
     if (g_state.observer) {
         log("[silly-season] new season: the game's grid stands (My Team: no seat is written)");
         return;
     }
-    std::vector<ss::SeatChange> refused = apply_changes(full_grid(s), "new season");
-    if (refused.empty())
+    for (const ss::SeatChange &c : changes)
+        note_check(c);
+    // 1.1.3: only with the game's grid read in this visit, and only the seats that change against it. Before, every
+    // seat was written whatever was read, so a grid the market couldn't read (other addons' teams, a game update) was
+    // overwritten with the market's own, undoing what other addons had set (editors, driver managers). The changes
+    // stay announced and are written at the next Team HQ that reads the rows; meanwhile the market follows the game.
+    // 15 Nov: read and valid (a read rejected for unknown teams left the writes allowed before).
+    if (!g_grid_valid_now) {
+        if (!g_last_cars.empty())
+            ss::sync_grid(g_state, g_last_cars);
+        log("[silly-season] new season: no valid read of the game's grid in this visit, so no seat is written yet (%zu "
+            "planned change(s) wait for the next Team HQ that reads it)", changes.size());
         return;
-    bool read = sync_real_grid();
-    int taken_back = 0;
-    for (const ss::SeatChange &c : refused)
-        if (ss::season_change_refused(g_state, c.team, c.driver))
-            ++taken_back;
-    log("[silly-season] new season: the game refused %zu seat(s); %s, %d signing(s) taken back", refused.size(),
-        read ? "the market follows the game's grid" : "the game's grid couldn't be read again", taken_back);
+    }
+    write_and_confirm("new season");
+}
+
+// g_lock held, at Team HQ with the rows read: the new season's changes still open (written but not seen, or not
+// written yet) are checked against the rows, written if need be, and confirmed or taken back
+void confirm_open_seats()
+{
+    if (g_state.observer || g_state.real || !g_grid_valid_now)
+        return;
+    bool open = std::any_of(g_state.seat_checks.begin(), g_state.seat_checks.end(),
+                            [](const ss::State::SeatCheck &k) { return k.year == g_state.year && k.state < 2; });
+    if (open)
+        write_and_confirm("new season (checked again)");
+    else if (!g_state.seat_checks.empty())
+        g_state.seat_checks.clear();
 }
 
 void on_hub()
 {
+    Timing tm("team hq", 30);
     std::lock_guard lock(g_lock);
     if (!g_loaded)
         return;
+    tm.mark("lock");
     ss::Settings s = settings();
     ss::localize(g_state, s.lang != "en");
 
-    if (g_grid_dirty) {
-        g_grid_dirty = false;
-        size_t known = 0;
-        for (ss::GridCar &c : g_grid) {
-            if (!c.human)
-                c.driver = driver_label(c.driver);
-            if (g_state.team(c.team) && (c.human || g_state.driver(c.driver)))
-                ++known;
-        }
-        if (known * 2 >= g_grid.size()) {
-            ss::sync_grid(g_state, g_grid);
-            log("[silly-season] grid synced: %zu of %zu cars known, player %s (%s)", known, g_grid.size(),
-                g_state.player.c_str(), g_state.player_team.c_str());
-        } else {
-            log("[silly-season] grid NOT synced: only %zu of %zu cars match known drivers and teams (first: %s / %s)",
-                known, g_grid.size(), g_grid.empty() ? "" : g_grid[0].driver.c_str(),
-                g_grid.empty() ? "" : g_grid[0].team.c_str());
-        }
-    }
     follow_career_id();
     // My Team: the core can't write race seats there (no DriverCareerContractsManagerComponent), so the market only
     // observes the game's moves. 1.0.1 announced signings that never happened (a player report).
@@ -2810,10 +4029,40 @@ void on_hub()
         }
     }
     std::string player_before = g_state.player;
-    if (!sync_real_grid())
+    g_grid_read_now = g_grid_valid_now = false;
+    // The career's rows say the grid. 1.1.3: the last session's cars are only the fallback when the rows can't be read.
+    // They used to be taken first, so a move the game made before a session (My Team's own market, an editor) was
+    // already in the market when the rows were read: the observer never told it, and the log never named it.
+    bool rows_read = sync_real_grid();
+    if (rows_read)
+        confirm_open_seats(); // 1.1.3: last winter's seats the rows hadn't shown yet
+    tm.mark("game grid");
+    if (!rows_read && g_grid_dirty) {
+        size_t known = 0;
+        for (ss::GridCar &c : g_grid) {
+            if (!c.human)
+                c.driver = driver_label(c.driver);
+            if (g_state.team(c.team) && (c.human || g_state.driver(c.driver)))
+                ++known;
+        }
+        if (known * 2 >= g_grid.size()) {
+            ss::sync_grid(g_state, g_grid);
+            log("[silly-season] grid synced from the session's cars: %zu of %zu known, player %s (%s)", known, g_grid.size(),
+                g_state.player.c_str(), g_state.player_team.c_str());
+        } else {
+            log("[silly-season] grid NOT synced: only %zu of %zu cars match known drivers and teams (first: %s / %s)",
+                known, g_grid.size(), g_grid.empty() ? "" : g_grid[0].driver.c_str(),
+                g_grid.empty() ? "" : g_grid[0].team.c_str());
+        }
+    }
+    g_grid_dirty = false;
+    if (!rows_read)
         sync_player();
+    tm.mark("session grid");
     adopt_game_pool("team hq"); // the drivers other addons put in the career's lists
+    tm.mark("driver lists");
     take_f2_promotions();       // F2 Revamp's promotions from F2, as signings
+    tm.mark("f2");
     if (!g_adopted_from.empty() && !player_before.empty() && player_before != "player" && player_before != g_state.player) {
         reset_market("the market taken from a provisional id was another driver's", career::current_round() ? career::current_round()->season_index : 0);
         if (!g_loaded)
@@ -2822,35 +4071,63 @@ void on_hub()
     // 1.1.0's probe (probe::run) did its job during development: the readers it led to live in game_data.inl and
     // game_ratings.inl, and it no longer writes to the log of a released build
     take_game_ratings(); // before the market moves: it decides on what the game shows
-    take_season_data();
-    if (g_results_rounds < 0) // the telemetry's results, when no standings could be read
-        for (auto &[driver, pos] : g_results)
-            ss::record_result(g_state, driver_label(driver), pos);
-    g_results.clear();
+    tm.mark("ratings");
+    // 1.1.3 (15 Nov): where the game is, first. The first visit of a new season closes the year before with its own
+    // races and only then reads the standings, which are the new year's: before, a new year's rounds also went into
+    // the year that was closing and were read again after it, and a career's totals counted them twice.
+    auto pos = career::current_round();
+    bool turning = pos && g_state.season_index >= 0 && pos->season_index > g_state.season_index;
+    if (!turning)
+        read_season_results(); // this season's standings: the rounds run, and whether they are the ones the market took
+    tm.mark("standings");
+    // 1.1.3: whether the player owns the F1 2026 season content (logged once it is known, for reports)
+    {
+        static int told = -1;
+        auto o = swofty::content::owned("f1_2026");
+        int now = o == swofty::content::Ownership::owned ? 1 : o == swofty::content::Ownership::not_owned ? 0 : -1;
+        if (now >= 0 && now != told) {
+            told = now;
+            log("[silly-season] F1 2026 season content: %s", now ? "owned" : "not owned");
+        }
+    }
 
     // the report after the race: rounds this visit completes in a market already running
     bool market_running = g_state.season_index >= 0;
     int round_before = g_state.round, year_before = g_state.year;
 
-    auto pos = career::current_round();
     // a saved market ahead of the game belongs to another career under the same id (two careers with the
-    // same driver can share one on this core)
+    // same driver can share one on this core).
+    // 1.1.3 (15 Nov): the standings only say "another career" with real evidence: every round the market took (two or
+    // more) reads differently, or the market came from another id this visit and its rounds don't match. One round
+    // read differently is a correction of that race (a penalty after the flag) and a shorter table is the game
+    // emptying it for a moment: the market is kept, and what it counted stays. Before any reset, a copy is kept.
+    bool same_season = !turning && pos && g_state.season_index == pos->season_index && g_results_rounds >= 0;
+    bool another = same_season && (g_results_another || ((g_results_differ || g_results_short) && !g_adopted_from.empty()));
+    if (same_season && g_results_short && !another)
+        log("[silly-season] results: the standings are shorter than the market's %d round(s) for now; the market is kept",
+            g_state.results_read);
+    if (same_season && g_results_differ && !another)
+        log("[silly-season] results: a round the market took reads differently now (a correction, not another career): the "
+            "market is kept");
     if (pos && g_state.season_index >= 0 &&
-        (g_state.season_index > pos->season_index ||
+        (g_state.season_index > pos->season_index || another ||
          (g_state.season_index == pos->season_index && g_state.round > pos->round + 1))) {
-        char why[160];
-        std::snprintf(why, sizeof why, "the saved market (season index %d, round %d) is ahead of the game (season index %d, round %d)",
-                      g_state.season_index, g_state.round, pos->season_index, pos->round);
+        char why[220];
+        std::snprintf(why, sizeof why, "the saved market (season index %d, round %d, %d result round(s)) is %s the game "
+                      "(season index %d, round %d, %d in its standings)", g_state.season_index, g_state.round,
+                      g_state.results_read, another ? "another career's, by its results, than" : "ahead of",
+                      pos->season_index, pos->round, g_results_rounds);
         reset_market(why, pos->season_index);
         if (!g_loaded)
             return;
+        read_season_results(); // the new market reads the table as its own
     }
     if (!g_adopted_from.empty()) {
-        // the adopted market checked out: it lives under the real id from now on
+        // the adopted market checked out: it lives under the real id from now on. 1.1.3 (15 Nov): its old copy goes
+        // once the new one reads back (save_state), not before
         log("[silly-season] career %s: the market from %s is this career's", g_state.career.c_str(), g_adopted_from.c_str());
-        if (storage::available())
-            storage::remove(storage_path(g_adopted_from));
-        forget_provisional(g_adopted_from);
+        if (provisional_id(g_adopted_from))
+            g_retire_after_save = g_adopted_from;
         g_adopted_from.clear();
     }
     if (pos)
@@ -2861,24 +4138,58 @@ void on_hub()
     g_round_seen = pos ? pos->season_index * 100 + pos->round : -1;
     if (pos) {
         g_weekends_ended = 0;
+        if (turning) {
+            // the closing year's races (their overtakes and incidents) go to it before it closes
+            take_track_events(s, g_state.season_index);
+            // each driver's deal before the market's plan moves in: given back for a move the game never takes
+            g_turn_prev.clear();
+            for (const auto &[id, d] : g_state.drivers)
+                g_turn_prev[id] = {d.team, d.contract, d.salary};
+            std::vector<ss::RatingChange> ratings;
+            bool real_season = g_state.real; // the season that ends was a real one: Progressive sets the new grid
+            auto changes = ss::start_new_season(g_state, s, &ratings);
+            g_state.season_index = pos->season_index;
+            log("[silly-season] season %d: %zu seat(s) change", g_state.year, changes.size());
+            if (g_real_career && g_real_ok && g_state.year <= g_real_last)
+                start_real_season(g_state.year, pos->rounds);
+            if (real_season) {
+                log("[silly-season] history: Progressive puts %d's real line-up on the grid", g_state.year);
+                ratings.clear();
+            } else {
+                apply_new_season(s, changes);
+            }
+            for (const ss::RatingChange &rc : ratings) {
+                career::DriverRatings dr;
+                dr.experience = rc.experience;
+                dr.racecraft = rc.racecraft;
+                dr.awareness = rc.awareness;
+                dr.pace = rc.pace;
+                career::set_driver_ratings(Ref<drivers::Identity>("game/" + rc.driver), dr);
+            }
+            g_season_ended = g_moves_finalised = false;
+            read_season_results(); // the new year's standings, read once, for the new year only
+        }
+        take_track_events(s, pos->season_index);
+        tm.mark("track");
         int completed = std::min(pos->round - 1, pos->rounds);
-        // a weekend whose race was run since the last visit counts, whatever the game's round says. Practice
-        // or qualifying alone doesn't; with no session type known, the weekend counts as it always did.
-        if (g_weekend_raced != 0 && g_state.season_index >= 0 &&
-            (g_weekend_season < 0 || g_weekend_season == pos->season_index)) {
+        // a weekend whose race ended since the last visit counts, whatever the game's round says. 1.1.3 (15 Nov): only
+        // a race that ended: a weekend whose sessions never said their type no longer counts on its own (practice and
+        // qualifying looked the same); the calendar counts it once it moves on.
+        bool this_season = g_weekend_season < 0 || g_weekend_season == pos->season_index;
+        if (g_weekend_raced != 0 && g_state.season_index >= 0 && this_season) {
             int raced = g_weekend_raced > 0 ? g_weekend_raced : g_state.round + 1;
-            if (!g_race_ended && g_session_typed) {
-                log("[silly-season] hub: sessions of round %d ran, but not its race yet", raced);
+            if (!g_race_ended) {
+                log("[silly-season] hub: sessions of round %d ran, but no race of it ended%s", raced,
+                    g_session_typed ? "" : " (no session said its type): the calendar counts it once it moves on");
             } else if (raced > completed) {
-                log("[silly-season] hub: counting round %d as raced (the game says round %d%s)", raced, pos->round,
-                    g_race_ended ? "" : ", no session said its type");
+                log("[silly-season] hub: counting round %d as raced (the game says round %d)", raced, pos->round);
                 completed = std::min(raced, pos->rounds);
             }
         }
-        // the standings: as many rounds as have results were run, whatever the calendar or the sessions say
-        if (g_results_rounds > completed && (g_weekend_season < 0 || g_weekend_season == pos->season_index)) {
-            log("[silly-season] hub: the standings hold %d round(s) (the game says round %d)", g_results_rounds, pos->round);
-            completed = std::min(g_results_rounds, pos->rounds);
+        // the standings: the rounds of the table that are over (read_season_results)
+        if (g_results_confirmed > completed && this_season) {
+            log("[silly-season] hub: the standings hold %d round(s) over (the game says round %d)", g_results_confirmed, pos->round);
+            completed = std::min(g_results_confirmed, pos->rounds);
         }
         g_weekend_raced = 0;
         g_weekend_season = -1;
@@ -2888,7 +4199,14 @@ void on_hub()
         if (g_state.season_index < 0) {
             // first visit: take the career where it is, without replaying the rounds already raced
             if (g_real_career) {
-                if (int year = detect_real_year())
+                // 1.1.3: only rows of this career read in this visit tell the year. A first read that fails (the game
+                // still filling the rows) left the career before's in g_last_seats, and their year was taken.
+                int year = 0;
+                if (!g_grid_read_now || g_last_seats_owner != rows_owner())
+                    log("[silly-season] history: this career's rows weren't read in this visit; the real year waits for them");
+                else
+                    year = detect_real_year();
+                if (year)
                     start_real_season(year, pos->rounds);
                 else {
                     log("[silly-season] history: the real year can't be told from the grid yet; the market waits for the next Team HQ");
@@ -2906,35 +4224,25 @@ void on_hub()
                 pos->rounds, g_state.year);
             ss::season_preview(g_state, s);
         }
-        if (pos->season_index > g_state.season_index) {
-            std::vector<ss::RatingChange> ratings;
-            bool real_season = g_state.real; // the season that ends was a real one: Progressive sets the new grid
-            auto changes = ss::start_new_season(g_state, s, &ratings);
-            g_state.season_index = pos->season_index;
-            log("[silly-season] season %d: %zu seat(s) change", g_state.year, changes.size());
-            if (g_real_career && g_real_ok && g_state.year <= g_real_last)
-                start_real_season(g_state.year, pos->rounds);
-            take_season_data(); // the new season's rounds, if any were run before this visit
-            if (real_season) {
-                log("[silly-season] history: Progressive puts %d's real line-up on the grid", g_state.year);
-                ratings.clear();
-            } else {
-                apply_new_season(s);
-            }
-            for (const ss::RatingChange &rc : ratings) {
-                career::DriverRatings dr;
-                dr.experience = rc.experience;
-                dr.racecraft = rc.racecraft;
-                dr.awareness = rc.awareness;
-                dr.pace = rc.pace;
-                career::set_driver_ratings(Ref<drivers::Identity>("game/" + rc.driver), dr);
-            }
-            g_season_ended = g_moves_finalised = false;
+        // the game's results, each round once: those behind the market now, those ahead with their round
+        take_season_results();
+        if (g_results_rounds < 0 && !g_results.empty() && g_state.counted_as(g_state.round + 1) == '-') {
+            // the telemetry's results, when no standings could be read: the next round's
+            auto &list = g_state.incoming[g_state.round + 1];
+            for (auto &[driver, p] : g_results)
+                list.push_back({driver_label(driver), p});
         }
+        g_results.clear();
+        tm.mark("season data");
         if (completed > g_state.round)
             ss::complete_round(g_state, s, completed, pos->rounds);
+        g_state.incoming.clear(); // a round not completed now is read again from the standings next time
     } else {
         // older core: count weekends and season ends ourselves
+        if (g_results_rounds < 0 && g_state.counted_as(g_state.round + 1) == '-') // the telemetry's results
+            for (auto &[driver, p] : g_results)
+                ss::record_result(g_state, driver_label(driver), p);
+        g_results.clear();
         if (g_weekends_ended > 0) {
             ss::complete_round(g_state, s, g_state.round + g_weekends_ended, g_state.rounds);
             g_weekends_ended = 0;
@@ -2942,22 +4250,51 @@ void on_hub()
         if (g_season_ended && !g_state.finalised)
             ss::finalise_season(g_state, s);
         if (g_moves_finalised) {
-            ss::start_new_season(g_state, s);
-            apply_new_season(s);
+            auto changes = ss::start_new_season(g_state, s);
+            apply_new_season(s, changes);
             g_season_ended = g_moves_finalised = false;
         }
     }
-    apply_changes(ss::take_pending(g_state), "mid-season");
+    tm.mark("market");
+    // 1.1.3 (15 Nov): stand-ins, returns and mid-season moves only on a valid read of this career's rows, and never into
+    // the human's or a protected seat. One that can't be written now: a return waits for the next Team HQ; a stand-in
+    // is called off (its race is next) and a sacking or a swap is taken back before anyone reads it.
+    {
+        std::vector<ss::SeatChange> now;
+        for (const ss::SeatChange &c : ss::take_pending(g_state)) {
+            const char *no = write_blocked(c);
+            if (!no) {
+                now.push_back(c);
+                continue;
+            }
+            log("[silly-season] mid-season: %s to %s seat %d (%s) isn't written: %s", c.driver.c_str(), c.team.c_str(), c.seat,
+                c.reason.c_str(), no);
+            if (c.reason == "return")
+                g_state.pending.push_back(c);
+            else if (c.reason == "standin")
+                ss::cancel_standin(g_state, c.team, c.seat, c.driver);
+            else if (c.reason == "midseason" || c.reason == "swap")
+                ss::cancel_change(g_state, c.team, c.seat, c.driver);
+        }
+        apply_changes(now, "mid-season");
+    }
+    tm.mark("seats");
     g_state.player_name = s.lang == "en" ? "You" : "Tú";
     if (market_running && g_state.round > 0 && (g_state.round > round_before || g_state.year != year_before))
         ++g_report_seq; // a race since the last visit: the report after it
     ss::refresh_mails(g_state, s);
+    tm.mark("mails");
     apply_texts(s);
+    tm.mark("texts");
     push_talent_ratings();
+    tm.mark("talent ratings");
     push_talent_numbers();
+    tm.mark("talent numbers");
     update_overlay(s);
+    tm.mark("overlay");
     g_popup_wait = 1.5; // let Team HQ settle before a popup
     save_state("team hq");
+    tm.mark("save");
 }
 
 void on_hub_event(const SwoftyEvent *ev, void *)
@@ -2989,9 +4326,12 @@ bool g_reset_press_row = false;
 
 void frame_tick(double dt, void *)
 {
+    Timing tm("frame", 16); // 1.1.3: which part of a slow frame was ours
+    watch_track_clock();
     if (g_reset_press_row) {
         g_reset_press_row = false;
         hub::set_option(kAddon, "press_answer", "-"); // ready for the next question
+        tm.mark("press row");
     }
     if (int choice = g_press_answer.exchange(-1); choice >= 0) {
         std::lock_guard lock(g_lock);
@@ -3010,6 +4350,7 @@ void frame_tick(double dt, void *)
                 save_state("press answer");
             }
         }
+        tm.mark("press answer");
     }
     // the awards ceremony and the season's cover were watched: once a season each
     for (auto [flag, field] : {std::pair{&g_awards_done, &ss::State::awards_shown}, std::pair{&g_cover_done, &ss::State::cover_shown}})
@@ -3020,6 +4361,7 @@ void frame_tick(double dt, void *)
                 update_overlay(settings());
                 save_state("overlay seen");
             }
+            tm.mark("awards or cover seen");
         }
     if (int year = g_reveal_done.exchange(0); year > 0) {
         // the player watched next season's grid revealed: once a season
@@ -3029,6 +4371,7 @@ void frame_tick(double dt, void *)
             update_overlay(settings());
             save_state("grid reveal");
         }
+        tm.mark("grid reveal seen");
     }
     if (g_seen_request.exchange(false)) {
         // the F7 panel was opened: everything in it counts as read
@@ -3040,6 +4383,7 @@ void frame_tick(double dt, void *)
             apply_texts(s, false); // the tab title follows when the panel closes
             update_overlay(s);
         }
+        tm.mark("panel read");
     }
     {
         // the panel just closed: the game's texts (the tab title's unread count) refresh now; the refresh is a
@@ -3047,25 +4391,30 @@ void frame_tick(double dt, void *)
         static bool was_open = false;
         bool open_now = g_board_open.load();
         if (was_open && !open_now) {
-            std::lock_guard lock(g_lock);
+            std::lock_guard lock(g_lock.quiet()); // the game's texts only
             if (g_loaded && g_lang_refresh_due && lang::available()) {
                 g_lang_refresh_due = false;
                 lang::refresh();
             }
+            tm.mark("texts refresh");
         }
         was_open = open_now;
     }
     if (!g_hub_idle)
         return;
-    std::lock_guard lock(g_lock);
+    // quiet: taken every frame at Team HQ; on_hub() takes g_lock itself, and the news popup counts as a change below
+    std::lock_guard lock(g_lock.quiet());
     if ((g_round_poll -= dt) <= 0) {
         g_round_poll = 2.0;
         if (g_loaded)
             if (auto pos = career::current_round(); pos && pos->season_index * 100 + pos->round != g_round_seen) {
                 log("[silly-season] hub: the game's round changed to %d (season index %d) after Team HQ opened",
                     pos->round, pos->season_index);
+                tm.mark("round check");
                 on_hub();
+                tm.mark("team hq again");
             }
+        tm.mark("round check");
     }
     if (!g_report.empty()) {
         std::string body = g_report;
@@ -3076,13 +4425,17 @@ void frame_tick(double dt, void *)
             body.erase(0, nl + 1);
         popup::show(title, body);
         g_popup_wait = 2.0; // news after the report, not on top of it
+        tm.mark("report popup");
         return;
     }
     if (g_popup_wait < 0 || !g_loaded)
         return;
     g_popup_wait -= dt;
-    if (g_popup_wait < 0)
+    if (g_popup_wait < 0) {
+        g_lock.touch(); // the news shown are marked as shown
         show_news();
+        tm.mark("news popup");
+    }
 }
 
 bool in_career(const events::Context &ctx)
@@ -3098,6 +4451,8 @@ bool in_career(const events::Context &ctx)
            (cs.mode == SWOFTY_CAREER_DRIVER || cs.mode == SWOFTY_CAREER_MY_TEAM);
 }
 
+std::string g_grid_extra_said; // the cars without a market seat last logged (take_grid)
+
 // the real grid from a list of entrants; false when the list is empty. g_lock held
 bool take_grid(std::span<const events::Entrant> entrants, const char *where)
 {
@@ -3109,6 +4464,27 @@ bool take_grid(std::span<const events::Entrant> entrants, const char *where)
     g_grid = std::move(cars);
     g_grid_dirty = true;
     log("[silly-season] grid seen at %s: %zu cars", where, g_grid.size());
+    // 1.1.3: cars whose driver holds no race seat in the market's grid, which follows the career's rows since the
+    // last Team HQ. A session with more cars than the career has seats (a 2025 career raced with 26: three 2024 cars
+    // from another addon's entry list) explains odd races, and those cars' overtakes and crashes aren't counted.
+    if (g_state.season_index >= 0) {
+        std::string list;
+        int extra = 0;
+        for (const ss::GridCar &c : g_grid) {
+            std::string id = driver_label(c.driver);
+            if (c.human || races_now(id))
+                continue;
+            if (extra++ < 6)
+                list += (list.empty() ? "" : ", ") + (id.empty() ? std::string("?") : id) + " (" + c.team + ")";
+        }
+        std::string said = std::to_string(extra) + ":" + list;
+        if (extra && said != g_grid_extra_said) {
+            g_grid_extra_said = said;
+            log("[silly-season] grid seen at %s: %d car(s) hold no race seat in the market's grid: %s%s. What they do on "
+                "track isn't counted; more cars than the career has seats usually come from another addon's entry list",
+                where, extra, list.c_str(), extra > 6 ? ", ..." : "");
+        }
+    }
     return true;
 }
 std::atomic<bool> g_grid_wanted{false}; // this session's grid is not known yet: the first lap reads it
@@ -3141,8 +4517,10 @@ SWOFTY_ON_CHANGE(menu, std::string_view v)
             std::string out = ss::text::t_press(ss::text::lang_of(s.lang)) + "\n" + q->question + "\n\n";
             for (size_t i = 0; i < q->answers.size(); ++i)
                 out += std::to_string(i + 1) + ". " + q->answers[i] + "\n";
-            out += es ? "\nResponde en la fila \"Rueda de prensa\" de esta pestaña (1, 2 o 3) o con F7."
-                      : "\nAnswer on this tab's \"Press conference\" row (1, 2 or 3) or with F7.";
+            // 1.1.3 (15 Nov): the panel's key as set (it said F7 whatever the setting)
+            out += std::string(es ? "\nResponde en la fila \"Rueda de prensa\" de esta pestaña (1, 2 o 3) o con "
+                                  : "\nAnswer on this tab's \"Press conference\" row (1, 2 or 3) or with ") +
+                   panel_key_label() + ".";
             g_report = out;
         } else {
             g_report = ss::text::t_press(ss::text::lang_of(s.lang)) + "\n" +
@@ -3250,29 +4628,34 @@ SWOFTY_ON_LOAD
     }
 
     events::on<career::events::Created>().after([](const career::events::Created &, const events::Context &ctx) {
+        Timing tm("career created", 20);
         begin_career(ctx, true);
+        tm.mark("market");
         career_ready();
+        tm.mark("texts and panel");
     });
     events::on<career::events::Loaded>().after([](const career::events::Loaded &, const events::Context &ctx) {
-        auto t0 = std::chrono::steady_clock::now();
+        Timing tm("career loaded", 20);
         begin_career(ctx, false);
-        auto t1 = std::chrono::steady_clock::now();
+        tm.mark("market");
         career_ready();
-        auto t2 = std::chrono::steady_clock::now();
-        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-        if (ms(t0, t2) > 50)
-            log("[silly-season] career loaded in %.0f ms (state %.0f ms, texts and panel %.0f ms)", ms(t0, t2), ms(t0, t1),
-                ms(t1, t2));
+        tm.mark("texts and panel");
     });
     events::on<career::events::Saving>().before([](career::events::Saving &, const events::Context &) {
-        std::lock_guard lock(g_lock);
+        std::lock_guard lock(g_lock.quiet()); // the game saving changes nothing in the market
         if (g_loaded && g_state.career.empty())
             g_state.career = career::saves::current(); // set for this event
-        save_state("profile save");
+        save_state("profile save", true);
     });
     events::on<career::events::Unloaded>().after([](const career::events::Unloaded &, const events::Context &) {
+        Timing tm("career unloaded", 20);
         std::lock_guard lock(g_lock);
         save_state("career unloaded");
+        tm.mark("save");
+        if (g_loaded)
+            log("[silly-season] the game's saves for this career: %d written, %d unchanged, %d skipped without building "
+                "the JSON", g_saves_written, g_saves_same, g_saves_skipped);
+        g_saves_written = g_saves_same = g_saves_skipped = 0;
         g_loaded = false;
         g_f2_waiting = false;
         g_report_seq = 0;
@@ -3280,49 +4663,146 @@ SWOFTY_ON_LOAD
         g_keen_prev.clear();
         g_hub_idle = false;
         clear_texts();
+        tm.mark("texts");
         g_talent_ratings_year = 0;
         g_own_team_name.clear();
         g_real_grid_said.clear();
         g_real_career = g_real_now = false;
+        g_row_look.clear();
+        g_last_seats.clear(); // 1.1.3: the next career never tells its year from these rows
+        g_last_seats_owner.clear();
+        g_last_cars.clear();
         g_results_said.clear();
+        g_results_differ_said.clear();
+        g_results_short_said.clear();
         g_player_stat = 0;
+        g_track.clear();
+        g_track_done.clear();
+        g_track_restarted.clear();
+        g_track_season_now = -1;
+        g_track_round_now = 0;
+        g_retire_after_save.clear(); // 1.1.3 (15 Nov): kept on disk; the next load decides with the copies it finds
+        g_turn_prev.clear();
+        g_tally = TrackTally{};
+        g_track_race = false;
+        g_track_started = -1;
+        g_grid_extra_said.clear();
         std::lock_guard ov_lock(g_ov_lock);
         g_ov.career = false;
         g_ov.banners.clear();
+        // 1.1.3: nothing of this career waits to be shown in the next one
+        g_ov.signings.clear();
+        g_ov.farewells.clear();
+        g_ov.strips.clear();
+        g_ov.alerts.clear();
+        g_ov.report = UiReport{};
+        g_ov_generation.fetch_add(1);
     });
     // no banner or panel while a session runs
-    events::on("session.unload").after([](std::span<const std::byte>, const events::Context &) { g_in_session = false; });
+    events::on("session.unload").after([](std::span<const std::byte>, const events::Context &) {
+        g_in_session = false;
+        track_race_over("session unloaded");
+    });
+    // 1.1.3: lights out: from here the session's overtakes, collisions and retirements count (races only)
+    // (1.1.3: the handlers from here to the race's results only note what happened for the next Team HQ and change
+    // nothing saved: they take g_lock.quiet(), and a game save in between skips the market's JSON)
+    events::subscribe(SWOFTY_EVENT_RACE_START, [](const SwoftyEvent *, void *) {
+        g_track_race = true;
+        std::lock_guard lock(g_lock.quiet());
+        if (g_loaded && settings().on_track) {
+            open_feed();
+            g_track_told_off = false;
+            g_track_clock = -1;
+            // 1.1.3 (15 Nov): the GP this race is: its events go to that round, whatever Team HQ they reach
+            g_track_season_now = g_weekend_season;
+            g_track_round_now = g_weekend_raced > 0 ? g_weekend_raced : 0;
+            if (g_track_season_now < 0)
+                if (auto pos = career::current_round())
+                    g_track_season_now = pos->season_index;
+            // 1.1.3 (15 Nov): an earlier attempt at this same GP that never ended (a restart that opened a new session)
+            // never happened either
+            size_t before = g_track.size();
+            g_track.erase(std::remove_if(g_track.begin(), g_track.end(),
+                                         [](const PendingTrack &t) {
+                                             return t.session != g_track_session && !g_track_done.count(t.session) &&
+                                                    t.round > 0 && t.round == g_track_round_now && t.season == g_track_season_now;
+                                         }),
+                          g_track.end());
+            int abandoned = static_cast<int>(before - g_track.size());
+            g_tally.rewound += abandoned;
+            if (abandoned)
+                log("[silly-season] on track: %d event(s) of an earlier attempt at this GP that never ended are dropped",
+                    abandoned);
+            // lights out again in the same session: the race was restarted, and its first start never happened
+            int dropped = g_track_started == g_track_session ? drop_track_events(-1.0f) : 0;
+            g_tally.rewound += dropped;
+            g_track_started = g_track_session;
+            if (dropped)
+                log("[silly-season] on track: lights out again in this session (a restart): %d event(s) of the first "
+                    "start are dropped", dropped);
+            else
+                log("[silly-season] on track: lights out, the race's overtakes and incidents count");
+        }
+    });
+    // 1.1.3 (15 Nov): how a session ended (e->a: 0 over, 1 a restart, 2 unloaded with it open). A restart's race never
+    // happened: its events go, whatever session the restart opens next.
+    events::subscribe(SWOFTY_EVENT_SESSION_END, [](const SwoftyEvent *e, void *) {
+        std::lock_guard lock(g_lock.quiet());
+        if (e->a == 1) {
+            g_track_restarted.insert(g_track_session);
+            size_t before = g_track.size();
+            g_track.erase(std::remove_if(g_track.begin(), g_track.end(),
+                                         [](const PendingTrack &t) { return t.session == g_track_session; }),
+                          g_track.end());
+            int n = static_cast<int>(before - g_track.size());
+            g_tally.rewound += n;
+            log("[silly-season] on track: the session was restarted; its %d event(s) never happened", n);
+        } else if (g_track_started == g_track_session) {
+            g_track_done.insert(g_track_session);
+        }
+    });
     events::on<career::events::SeasonEnd>().after([](const career::events::SeasonEnd &, const events::Context &) {
-        std::lock_guard lock(g_lock);
+        std::lock_guard lock(g_lock.quiet());
         g_season_ended = true;
     });
     events::on("career.moves.finalised").after([](std::span<const std::byte>, const events::Context &) {
-        std::lock_guard lock(g_lock);
+        std::lock_guard lock(g_lock.quiet());
         g_moves_finalised = true;
     });
     events::on("career.weekend.end").after([](std::span<const std::byte>, const events::Context &) {
-        std::lock_guard lock(g_lock);
+        std::lock_guard lock(g_lock.quiet());
         ++g_weekends_ended;
     });
 
     // the real grid at every session start
     events::on("session.start").after([](std::span<const std::byte>, const events::Context &ctx) {
         g_in_session = true;
+        track_race_over("another session started");
+        ++g_track_session;
+        {
+            std::lock_guard lock(g_lock.quiet());
+            g_track_clock = -1;
+        }
+        Timing tm("session start", 8);
         if (!in_career(ctx))
             return;
-        std::lock_guard lock(g_lock);
+        tm.mark("career check");
+        std::lock_guard lock(g_lock.quiet());
         if (!g_loaded)
             return;
+        tm.mark("lock");
         note_weekend(ctx, "session start");
+        tm.mark("weekend");
         if (!take_grid(ctx.participants(), "session start"))
             g_grid_wanted = true;
+        tm.mark("grid");
     });
     // the lap event's context always has the participants: the first crossing reads the grid when the
     // session start could not
     events::on<sessions::events::Lap>().after([](const sessions::events::Lap &, const events::Context &ctx) {
         if (!g_grid_wanted.load(std::memory_order_relaxed))
             return;
-        std::unique_lock lock(g_lock, std::try_to_lock);
+        std::unique_lock lock(g_lock.quiet(), std::try_to_lock);
         if (!lock.owns_lock())
             return;
         if (take_grid(ctx.participants(), "first lap") || !g_loaded)
@@ -3333,10 +4813,11 @@ SWOFTY_ON_LOAD
     // 1.0.1's time leaves them at zero, so the race is simulated)
     events::on("session.end").after([](std::span<const std::byte>, const events::Context &ctx) {
         g_grid_wanted = false;
+        track_race_over("session ended"); // 1.1.3: nothing after the race counts (its replays, the results screens)
         if (!in_career(ctx))
             return;
         {
-            std::lock_guard lock(g_lock);
+            std::lock_guard lock(g_lock.quiet());
             if (g_loaded)
                 note_session_end(ctx);
         }
@@ -3351,7 +4832,7 @@ SWOFTY_ON_LOAD
             if (telemetry::participant(e.car, &p) == telemetry::Result::ok && p.position >= 1 && p.position <= 32)
                 results.push_back({strip_game(e.driver.id()), p.position});
         }
-        std::lock_guard lock(g_lock);
+        std::lock_guard lock(g_lock.quiet());
         if (g_loaded) {
             g_results.insert(g_results.end(), results.begin(), results.end());
             log("[silly-season] race result: %zu classified car(s)", results.size());
@@ -3361,14 +4842,29 @@ SWOFTY_ON_LOAD
     // the ratings the game uses in this career
     events::on<drivers::events::RatingsRead>().after([](const drivers::events::RatingsRead &r, const events::Context &) {
         int stat = static_cast<int>(r.stat);
-        if (stat > 3)
+        if (stat < 0 || stat > 3)
             return;
-        std::unique_lock lock(g_lock, std::try_to_lock);
-        if (lock.owns_lock() && g_loaded)
-            ss::observe_rating(g_state, strip_game(r.driver().id()), stat, r.value);
+        // the game reads ratings often: a change to the market only when the rating is new to it
+        std::unique_lock lock(g_lock.quiet(), std::try_to_lock);
+        if (!lock.owns_lock() || !g_loaded)
+            return;
+        std::string id = strip_game(r.driver().id());
+        ss::Driver *d = g_state.driver(id);
+        if (!d)
+            return;
+        const float *field[] = {&d->experience, &d->racecraft, &d->awareness, &d->pace};
+        float before = *field[stat];
+        bool seen = d->ratings_seen;
+        ss::observe_rating(g_state, id, stat, r.value);
+        if (*field[stat] != before || d->ratings_seen != seen)
+            g_lock.touch();
     });
 
     events::subscribe(SWOFTY_EVENT_CAREER_HUB, on_hub_event);
+    // 1.1.3: overtakes, collisions and retirements, from the game's telemetry (its UDP output must be on)
+    events::subscribe(telemetry::event::overtake, [](const SwoftyEvent *e, void *) { on_track_event("overtake", e); });
+    events::subscribe(telemetry::event::collision, [](const SwoftyEvent *e, void *) { on_track_event("collision", e); });
+    events::subscribe(telemetry::event::retirement, [](const SwoftyEvent *e, void *) { on_track_event("retirement", e); });
     events::on_frame(frame_tick);
     if (ov::available()) {
         ov::Result r = ov::on_paint(paint);
@@ -3379,7 +4875,9 @@ SWOFTY_ON_LOAD
     } else {
         log("[silly-season] overlay: not available (the experimental overlay is off); mails and the Team HQ tab only");
     }
-    log("[silly-season] ready: market %s, intensity %.*s", std::string_view(game_market) == "game" ? "shared with the game" : "run by Silly Season",
+    // 1.1.3: which build this is, for a player's log (the manifest's version, set by build.bat, and when it was built)
+    log("[silly-season] ready: version %s (built %s %s), market %s, intensity %.*s", SS_VERSION, __DATE__, __TIME__,
+        std::string_view(game_market) == "game" ? "shared with the game" : "run by Silly Season",
         int(std::string_view(intensity).size()), std::string_view(intensity).data());
 }
 

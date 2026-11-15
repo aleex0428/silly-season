@@ -36,6 +36,10 @@ const std::map<std::string, ss::RealPerson> &real_people()
         // 2015 (the Swofty Seasons 2015)
         {"sw15_maldonado", {"Pastor Maldonado", "venezuela", 1985}},  {"sw15_merhi", {"Roberto Merhi", "spain", 1991}},
         {"sw15_stevens", {"Will Stevens", "britain", 1991}},
+        // 2014 (Progressive 0.5.0 and the Swofty Seasons 2014, 15 Nov)
+        {"sw14_bianchi", {"Jules Bianchi", "france", 1989}},           {"sw14_chilton", {"Max Chilton", "britain", 1991}},
+        {"sw14_kobayashi", {"Kamui Kobayashi", "japan", 1986}},        {"sw14_sutil", {"Adrian Sutil", "germany", 1983}},
+        {"sw14_vergne", {"Jean-Éric Vergne", "france", 1990}},
     };
     return people;
 }
@@ -68,18 +72,21 @@ bool load_real_data()
     }
     for (const json::Value &s : *g_real["slots"].if_array())
         g_real_slots[static_cast<int>(s["slot"].as_int())] = std::string(s["team"].as_string());
-    auto stat = [](const json::Value &v, const std::string &id) {
-        if (v.is_int())
-            g_real_stats.emplace(static_cast<uint32_t>(v.as_int()), id);
+    // 1.1.3: the drivers' own stat ids and their looks' are two tables. A career row holds both (+0x50 and +0x54);
+    // 1.1.0-1.1.2 kept them in one and matched the rows' drivers against the looks, so no year was ever recognised
+    auto look = [](const json::Value &v, const std::string &id) {
+        if (v.is_int() && !id.empty())
+            g_real_look_ids[static_cast<uint32_t>(v.as_int())] = id;
     };
     if (const json::Array *pool = g_real["pool"].if_array())
         for (const json::Value &p : *pool) {
             std::string id(p["driver"].as_string());
-            stat(p["stat_id"], id);
-            stat(p["default_look"]["stat_id"], id);
+            if (p["stat_id"].is_int() && !id.empty())
+                g_real_stats.emplace(static_cast<uint32_t>(p["stat_id"].as_int()), id);
+            look(p["default_look"]["stat_id"], id);
             if (const json::Object *looks = p["looks"].if_object())
-                for (const auto &[year, look] : *looks)
-                    stat(look["stat_id"], id);
+                for (const auto &[year, l] : *looks)
+                    look(l["stat_id"], id);
         }
     for (const auto &[ytext, season] : *g_real["seasons"].if_object()) {
         int year = std::atoi(ytext.c_str());
@@ -91,11 +98,15 @@ bool load_real_data()
                     for (const json::Value &d : *drivers)
                         if (d["look"]["stat_id"].is_int()) {
                             uint32_t s = static_cast<uint32_t>(d["look"]["stat_id"].as_int());
-                            g_real_stats[s] = std::string(d["driver"].as_string());
+                            look(d["look"]["stat_id"], std::string(d["driver"].as_string()));
                             g_real_looks[year].insert(s);
                         }
+        if (const json::Array *changes = season["changes"].if_array()) // a stand-in's look for his rounds
+            for (const json::Value &c : *changes)
+                look(c["look"]["stat_id"], std::string(c["in"].as_string()));
     }
-    log("[silly-season] history: %d to %d, %zu driver look(s) known", g_real_first, g_real_last, g_real_stats.size());
+    log("[silly-season] history: %d to %d, %zu driver look(s) and %zu driver stat id(s) known", g_real_first, g_real_last,
+        g_real_look_ids.size(), g_real_stats.size());
     return true;
 }
 
@@ -223,22 +234,34 @@ void real_people_in(ss::State &st)
         }
 }
 
-// the real year the career is in, from the looks of the drivers on its grid (0: can't tell)
+// the real year the career is in, from the looks of the drivers on its grid (0: can't tell). 1.1.3: the look is the
+// row's own field (RealSeat::look). A row without a look counts by its driver field, in case it holds the look there
+// (a layout not seen yet); a row with one never does, since drivers' stat ids and looks' overlap in number
 int detect_real_year()
 {
     int best = 0;
-    size_t best_n = 0;
+    size_t best_n = 0, second_n = 0, looks_read = 0;
+    for (const RealSeat &s : g_last_seats)
+        looks_read += s.look != kNoLook ? 1 : 0;
     for (const auto &[year, looks] : g_real_looks) {
         size_t n = 0;
         for (const RealSeat &s : g_last_seats)
-            n += looks.count(s.driver);
+            n += looks.count(s.look != kNoLook ? s.look : s.driver);
         if (n > best_n) {
+            second_n = best_n;
             best_n = n;
             best = year;
+        } else if (n > second_n) {
+            second_n = n;
         }
     }
-    log("[silly-season] history: the grid's looks match %d best (%zu of %zu cars)", best, best_n, g_last_seats.size());
-    return best_n >= 6 ? best : 0;
+    // 1.1.3 (15 Nov): a clear year only: at least 6 cars, at least 60% of the cars read, and 4 more than the next
+    // year. Six for 2015, six for 2016 and eight unknown cars gave 2015 before; now the market waits for a clearer read.
+    size_t cars = g_last_seats.size();
+    bool clear = best_n >= 6 && best_n * 10 >= cars * 6 && best_n >= second_n + 4;
+    log("[silly-season] history: the grid's looks match %d best (%zu of %zu cars; %zu look(s) read; the next year %zu)%s",
+        best, best_n, cars, looks_read, second_n, clear || !best_n ? "" : ": not clear enough, the year waits");
+    return clear ? best : 0;
 }
 
 // g_lock held: the market takes the real season `year` (its rounds from the game's calendar)

@@ -228,5 +228,12 @@ std::string h_deal_off(Lang l, const std::string &driver, const std::string &tea
 std::string deal_off(Lang l, const std::string &driver, const std::string &team, const std::string &now_team);
 std::string h_observer(Lang l);
 std::string observer(Lang l);
+// 1.1.3: on track
+std::string h_incidents(Lang l, const std::string &driver, int n);
+std::string incidents(Lang l, const std::string &driver, const std::string &team, int n);
+std::string h_reliability(Lang l, const std::string &team);
+std::string reliability(Lang l, const std::string &team, int n);
+std::string h_overtake_king(Lang l, const std::string &driver);
+std::string overtake_king(Lang l, const std::string &driver, const std::string &team, int n);
 
 } // namespace ss::text

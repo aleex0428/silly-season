@@ -2,9 +2,13 @@
 //
 //   sim_test.exe <data/baseline.json> [seasons] [intensity] [--quiet]
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <functional>
+#include <iterator>
 #include <set>
 #include <sstream>
 
@@ -747,7 +751,7 @@ static void season_refusal_test(const Value &baseline, bool seen)
     sync_grid(st, cars_of(old, st)); // the game kept last season's grid
     int told = 0;
     for (const SeatChange &c : changes)
-        told += season_change_refused(st, c.team, c.driver) ? 1 : 0;
+        told += season_change_refused(st, c.team, c.driver, st.driver(c.driver) && st.driver(c.driver)->team == c.team) ? 1 : 0;
     size_t deal_off = std::count_if(st.news.begin(), st.news.end(), [](const NewsItem &n) { return n.title_en.rfind("DEAL OFF", 0) == 0; });
     for (const SeatChange &c : changes) {
         const Driver *d = st.driver(c.driver);
@@ -907,7 +911,23 @@ static void game_ratings_test(const Value &baseline)
     State back;
     CHECK(from_json(back, to_json(st)) && back.driver("lando_norris")->game_overall == 91 && back.driver("lando_norris")->focus == 73,
           "the game's ratings aren't saved");
-    std::printf("game ratings: Norris 91 (pace 94, focus 73), potential %.0f\n", n->potential());
+    // 1.1.3: the drivers the game doesn't rate move onto its scale (the average gap of the ones it does)
+    int rated = 0;
+    for (auto &[id, d] : st.drivers)
+        if (!d.regen && !d.team.empty() && rated < 12 && id != "lando_norris") {
+            observe_game_ratings(st, id, d.overall() + 3.0f, d.experience, d.racecraft, 70, d.awareness, d.pace);
+            ++rated;
+        }
+    const Driver *f2 = nullptr;
+    for (const auto &[id, d] : st.drivers)
+        if (d.game_overall <= 0 && !d.regen && d.team.empty())
+            f2 = &d;
+    float before = f2 ? f2->overall() : 0;
+    float shift = calibrate_ratings(st);
+    CHECK(shift > 2.0f && shift < 4.0f, "the scale gap is %.2f, expected about 3", shift);
+    CHECK(f2 && std::abs(f2->overall() - (before + shift)) < 0.01f, "a driver the game doesn't rate wasn't moved onto its scale");
+    CHECK(n->rating_shift == 0 && n->overall() == 91, "a rated driver was shifted");
+    std::printf("game ratings: Norris 91 (pace 94, focus 73), potential %.0f, scale gap %+.1f\n", n->potential(), shift);
 }
 
 // 1.1.2 (a 1.1.1 report: "You" in both seats of a team): a read naming one driver twice seats him once, in the
@@ -936,6 +956,176 @@ static void duplicate_driver_test(const Value &baseline)
     std::printf("duplicate driver: %s seated once in %s\n", twice.c_str(), team.c_str());
 }
 
+// 1.1.3: overtakes, collisions and breakdowns from the game's telemetry move the market and make news
+static void track_events_test(const Value &baseline)
+{
+    Settings s;
+    State st;
+    CHECK(init(st, baseline, "f1_career_2026", 919, nullptr), "init failed");
+    st.round = 12; // past half distance of 24
+    st.rounds = 24;
+    const Team &t = st.teams[4];
+    std::string a = t.seats[0], b = t.seats[1], c = st.teams[1].seats[0];
+    Driver *da = st.driver(a), *db = st.driver(b), *dc = st.driver(c);
+    if (!da || !db || !dc)
+        return;
+    float form_before = db->form;
+    std::vector<TrackEvent> race;
+    for (int i = 0; i < 9; ++i)
+        race.push_back({"overtake", c, a, 0});
+    race.push_back({"collision", a, b, 0});
+    race.push_back({"retirement", b, "", 8});
+    size_t news = st.news.size();
+    apply_track_events(st, s, race, 13);
+    CHECK(dc->s_overtakes == 9 && da->s_overtaken == 9 && da->s_incidents == 1 && db->s_incidents == 1 && db->s_failures == 1,
+          "the race's events weren't counted");
+    CHECK(std::any_of(st.news.begin() + static_cast<long>(news), st.news.end(), [](const NewsItem &n) { return n.kind == "overtakes"; }),
+          "no overtake king past half distance");
+    // the breakdown: his retirement leaves his form alone (the collision's small nudge only)
+    float after_events = db->form;
+    record_result(st, b, 0, 13);
+    CHECK(db->form == after_events && after_events >= form_before - 0.08f, "a mechanical DNF still cost him form");
+    // two more races with incidents: the third makes a story, once
+    apply_track_events(st, s, {{"collision", a, c, 0}}, 14);
+    apply_track_events(st, s, {{"collision", a, c, 0}}, 15);
+    size_t stories = std::count_if(st.news.begin(), st.news.end(), [&](const NewsItem &n) { return n.kind == "incidents" && n.driver == a; });
+    CHECK(stories == 1 && da->s_incidents == 3, "%zu incident stories for 3 incidents", stories);
+    // a team's third breakdown
+    db->s_failures = 2;
+    apply_track_events(st, s, {{"retirement", a, "", 8}}, 16);
+    CHECK(std::any_of(st.news.begin(), st.news.end(), [](const NewsItem &n) { return n.kind == "reliability"; }), "no reliability story");
+    // the option off: nothing moves
+    Settings off = s;
+    off.on_track = false;
+    float o = dc->s_overtakes;
+    apply_track_events(st, off, {{"overtake", c, a, 0}}, 17);
+    CHECK(dc->s_overtakes == o, "the events counted with the option off");
+    State back;
+    CHECK(from_json(back, to_json(st)) && back.driver(c)->s_overtakes == 9 && back.overtakes_told == st.year && back.track_told.size() == st.track_told.size(),
+          "the on-track numbers aren't saved");
+    start_new_season(st, s);
+    CHECK(st.driver(c)->s_overtakes == 0 && st.driver(a)->s_incidents == 0 && st.track_told.empty(), "the on-track numbers outlived the season");
+    std::printf("on track: overtakes, incidents and breakdowns counted, %zu stories\n", stories);
+}
+
+// 1.1.3: the save's numbers in their shortest text read back to the very same floats, and the saves written before
+// (line breaks, floats with 17 digits) still load the same
+static void save_format_test(const Value &baseline)
+{
+    // any float: its shortest text, read as a double, narrows back to it
+    Lcg rng{2026};
+    int bad = 0, tried = 0;
+    for (int i = 0; i < 1000000; ++i) {
+        uint32_t bits = static_cast<uint32_t>(rng.next() * 4294967296.0);
+        float f;
+        std::memcpy(&f, &bits, sizeof f);
+        if (!std::isfinite(f))
+            continue;
+        ++tried;
+        Value v = Value::array({f});
+        swofty::json::Error e;
+        Value back = swofty::json::parse(dump_save(v), &e);
+        float g = static_cast<float>(back[0].as_double());
+        bad += std::memcmp(&f, &g, sizeof f) != 0;
+    }
+    CHECK(bad == 0, "%d of %d floats don't read back the same from their shortest text", bad, tried);
+
+    // a career two seasons in: every float of the market comes back bit for bit
+    Settings s;
+    State st;
+    CHECK(init(st, baseline, "f1_career_2026", 4242, nullptr), "init failed");
+    std::vector<GridCar> cars;
+    for (const Team &t : st.teams)
+        for (const std::string &who : t.seats)
+            cars.push_back({who, t.id, false});
+    sync_grid(st, cars);
+    season_preview(st, s);
+    Lcg race{7};
+    for (int season = 0; season < 2; ++season) {
+        for (int r = 1; r <= 24; ++r) {
+            std::vector<std::pair<double, std::string>> order;
+            for (const Team &t : st.teams)
+                for (const std::string &who : t.seats)
+                    if (const Driver *d = st.driver(who))
+                        order.push_back({t.performance * 0.7 + d->overall() * 0.5 + race.next() * 18.0, who});
+            std::sort(order.begin(), order.end(), [](auto &a, auto &b) { return a.first > b.first; });
+            for (size_t i = 0; i < order.size(); ++i)
+                record_result(st, order[i].second, static_cast<int>(i + 1));
+            complete_round(st, s, r, 24);
+        }
+        start_new_season(st, s);
+    }
+    Value saved = to_json(st);
+    std::string compact = dump_save(saved);
+    swofty::json::Error err;
+    State back;
+    CHECK(from_json(back, swofty::json::parse(compact, &err)), "the compact save doesn't load");
+    auto same = [](float a, float b) { return std::memcmp(&a, &b, sizeof a) == 0; };
+    int differ = 0, floats = 0;
+    for (const auto &[id, d] : st.drivers) {
+        const Driver *e = back.driver(id);
+        if (!e) {
+            ++differ;
+            continue;
+        }
+        const float a[] = {d.pace, d.racecraft, d.awareness, d.experience, d.pace_peak, d.racecraft_peak, d.awareness_peak,
+                           d.experience_peak, d.salary, d.backing, d.game_overall, d.focus, d.rating_shift, d.s_overtakes,
+                           d.s_overtaken, d.s_incidents, d.s_failures, d.form, d.last_value, d.trend, d.ambition, d.loyalty,
+                           d.money, d.value_start};
+        const float b[] = {e->pace, e->racecraft, e->awareness, e->experience, e->pace_peak, e->racecraft_peak, e->awareness_peak,
+                           e->experience_peak, e->salary, e->backing, e->game_overall, e->focus, e->rating_shift, e->s_overtakes,
+                           e->s_overtaken, e->s_incidents, e->s_failures, e->form, e->last_value, e->trend, e->ambition, e->loyalty,
+                           e->money, e->value_start};
+        for (size_t k = 0; k < std::size(a); ++k, ++floats)
+            differ += !same(a[k], b[k]);
+        differ += d.values.size() != e->values.size() || d.values_last.size() != e->values_last.size();
+        for (size_t k = 0; k < d.values.size() && k < e->values.size(); ++k, ++floats)
+            differ += !same(d.values[k], e->values[k]);
+        for (size_t k = 0; k < d.values_last.size() && k < e->values_last.size(); ++k, ++floats)
+            differ += !same(d.values_last[k], e->values_last[k]);
+    }
+    for (size_t i = 0; i < st.teams.size() && i < back.teams.size(); ++i) {
+        const Team &t = st.teams[i], &u = back.teams[i];
+        const float a[] = {t.prestige, t.performance, t.patience, t.budget, t.td_rating, t.budget_start};
+        const float b[] = {u.prestige, u.performance, u.patience, u.budget, u.td_rating, u.budget_start};
+        for (size_t k = 0; k < std::size(a); ++k, ++floats)
+            differ += !same(a[k], b[k]);
+    }
+    CHECK(differ == 0, "%d of %d floats changed through a save and a load", differ, floats);
+    CHECK(dump_save(to_json(back)) == compact, "a reloaded market saves differently");
+    // the save's own writer and the SDK's tell the same tree: the SDK's text (17-digit floats), read back and written
+    // by dump_save, is the save itself (same keys, same order, same strings, same floats)
+    CHECK(dump_save(swofty::json::parse(swofty::json::dump(saved), &err)) == compact && compact.size() > 1000,
+          "the save's text isn't the tree the SDK would write");
+    // a double that is no float (none is saved today) keeps every digit
+    CHECK(dump_save(Value::array({0.1, 1e300, 3.0, static_cast<int64_t>(7), true, Value(), std::string("a\"b\n")})) ==
+              "[0.1,1e+300,3.0,7,true,null,\"a\\\"b\\n\"]",
+          "dump_save writes other values differently: %s",
+          dump_save(Value::array({0.1, 1e300, 3.0, static_cast<int64_t>(7), true, Value(), std::string("a\"b\n")})).c_str());
+    CHECK(compact.find('\n') == std::string::npos, "the save isn't compact");
+
+    // a save as 1.1.2 wrote it (a line per value, floats widened to 17 digits) loads into the same market
+    std::function<void(Value &)> widen = [&](Value &v) {
+        if (v.is_double())
+            v = static_cast<double>(static_cast<float>(v.as_double()));
+        else if (swofty::json::Array *a = v.if_array())
+            for (Value &x : *a)
+                widen(x);
+        else if (swofty::json::Object *o = v.if_object())
+            for (auto &[k, x] : *o)
+                widen(x);
+    };
+    Value old = saved;
+    widen(old);
+    std::string old_text = swofty::json::dump(old, 0);
+    State legacy;
+    CHECK(from_json(legacy, swofty::json::parse(old_text, &err)), "a 1.1.2 save doesn't load");
+    CHECK(dump_save(to_json(legacy)) == compact, "a 1.1.2 save loads into another market");
+    std::printf("save format: %d floats back bit for bit; with 1.1.2's line breaks and 17-digit floats %.1f KB, as saved %.1f KB "
+                "(%.0f%% smaller; 1.1.2 also wrote every empty field: tools/bench_ab.py has the whole difference)\n", floats,
+                old_text.size() / 1024.0, compact.size() / 1024.0, 100.0 - 100.0 * compact.size() / old_text.size());
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -962,6 +1152,8 @@ int main(int argc, char **argv)
     season_refusal_test(baseline, true);
     observer_test(baseline);
     game_ratings_test(baseline);
+    track_events_test(baseline);
+    save_format_test(baseline);
     // the phase 3 blocks turned off
     for (uint64_t seed = 1; seed <= 4; ++seed)
         run(baseline, seasons, seed % 2 ? Intensity::chaos : Intensity::lively, false, true, true, seed * 71, "f1_career_2026", false, true);

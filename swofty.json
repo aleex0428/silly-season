@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "alexs.silly-season",
   "name": "Silly Season",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "author": "Alex Sánchez",
   "description": "A living driver market for Career mode: rumours, talks, signings, retirements, sackings, press conferences, F2 and new talents, with inbox mails, breaking news and a market panel (F7).",
   "license": "MIT",
@@ -22,7 +22,8 @@
     ]
   },
   "experimental_features": [
-    "overlay"
+    "overlay",
+    "telemetry"
   ],
   "options": [
     {
@@ -378,7 +379,7 @@
     {
       "id": "panel_size",
       "type": "choice",
-      "label": "Panel size (F7)",
+      "label": "Panel size",
       "description": "How big the market panel draws on screen. Small fits more on a laptop; large reads better from the sofa.",
       "values": [
         {
@@ -398,11 +399,53 @@
       "binds": "native"
     },
     {
+      "id": "panel_key",
+      "type": "choice",
+      "label": "Panel key",
+      "description": "The key that opens the market panel. Pick another one if a different addon already uses F7. Back + Y on a controller always works.",
+      "values": [
+        {
+          "value": "f7",
+          "label": "F7"
+        },
+        {
+          "value": "f6",
+          "label": "F6"
+        },
+        {
+          "value": "f8",
+          "label": "F8"
+        },
+        {
+          "value": "f9",
+          "label": "F9"
+        },
+        {
+          "value": "f10",
+          "label": "F10"
+        },
+        {
+          "value": "f11",
+          "label": "F11"
+        }
+      ],
+      "default": "f7",
+      "binds": "native"
+    },
+    {
       "id": "academies",
       "type": "toggle",
       "label": "Academies and reserves",
       "description": "Teams sign young drivers to their academies and a reserve driver each winter, bring rookies in through their second or partner team (Racing Bulls, Haas) and call the best of them up for stand-ins.",
       "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "on_track",
+      "type": "toggle",
+      "label": "On-track reputation (experimental)",
+      "description": "Experimental, off by default. Overtakes, incidents and mechanical failures from your races move driver values and make news. Needs UDP Telemetry on in the game's settings.",
+      "default": false,
       "binds": "native"
     }
   ],

@@ -274,3 +274,38 @@ std::string observer(Lang l)
                 : "In My Team the teams close their own deals. Silly Season follows the rumours and the talks, and "
                   "reports each move as official once the driver turns up in his new car.";
 }
+
+// --- 1.1.3: what the game's telemetry saw on track --------------------------------------------------------------
+
+std::string h_incidents(Lang l, const std::string &driver, int n)
+{
+    return fmt(l.es ? "%1: %2 INCIDENTES ESTE AÑO" : "%1: %2 INCIDENTS THIS YEAR", who(driver), num(n));
+}
+std::string incidents(Lang l, const std::string &driver, const std::string &team, int n)
+{
+    return fmt(n >= 5 ? (l.es ? "%1 ya suma %3 incidentes esta temporada. En %2 se acaba la paciencia, y los equipos de cabeza toman nota."
+                              : "%1 has been involved in %3 incidents this season. Patience is running out at %2, and the top teams are taking note.")
+                      : (l.es ? "Tercer incidente de la temporada para %1. En %2 piden más calma."
+                              : "A third incident of the season for %1. %2 want him to calm down."),
+               driver, team, num(n));
+}
+std::string h_reliability(Lang l, const std::string &team)
+{
+    return fmt(l.es ? "PROBLEMAS DE FIABILIDAD EN %1" : "RELIABILITY WOES AT %1", where(team));
+}
+std::string reliability(Lang l, const std::string &team, int n)
+{
+    return fmt(l.es ? "%2 abandonos por avería esta temporada en %1. Sus pilotos empiezan a dudar del proyecto."
+                    : "%2 mechanical retirements this season for %1. Its drivers are starting to question the project.",
+               team, num(n));
+}
+std::string h_overtake_king(Lang l, const std::string &driver)
+{
+    return fmt(l.es ? "EL REY DEL ADELANTAMIENTO: %1" : "OVERTAKE KING: %1", who(driver));
+}
+std::string overtake_king(Lang l, const std::string &driver, const std::string &team, int n)
+{
+    return fmt(l.es ? "%1 (%2) lleva %3 adelantamientos esta temporada, más que nadie. El paddock se fija en él."
+                    : "%1 (%2) has made %3 overtakes this season, more than anyone. The paddock has noticed.",
+               driver, team, num(n));
+}

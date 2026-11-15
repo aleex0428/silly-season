@@ -66,6 +66,11 @@ bool curve(const std::string &c, float &now, float &peak)
     return now > 0 && now <= 100;
 }
 
+// 1.1.3: the database reads of this file (the indexes below are built by the first) run one at a time: the
+// background read holds this, and a lookup from the game's thread only tries it (driver()), so Team HQ never waits
+// for the background and the two never build an index at once
+std::recursive_mutex g_db_read;
+
 // the career statistics holders: driver label -> holder index (read once)
 const std::unordered_map<std::string, int> &holders()
 {
@@ -180,6 +185,9 @@ const std::unordered_map<std::string, db::Cursor> &driver_rows()
 // one driver of the game by his label, from entrants.drivers and his statistics; false when he has no row
 bool driver(const std::string &label, const std::string &kind, ss::GameDriver &g)
 {
+    std::unique_lock busy(g_db_read, std::try_to_lock);
+    if (!busy.owns_lock())
+        return false; // the background read is at it: the driver is named at a later visit
     auto row = driver_rows().find(label);
     if (row == driver_rows().end())
         return false;
@@ -294,7 +302,6 @@ std::vector<ss::GameDriver> read(const std::string &group, std::string &why)
 // the game runs: the game database doesn't change after boot. Team HQ only takes the result, so it never waits.
 struct Work {
     std::mutex lock;   // the results, and which groups are being read
-    std::mutex read;   // one read at a time (the indexes above are built by the first)
     std::map<std::string, std::pair<std::vector<ss::GameDriver>, std::string>> done;
     std::set<std::string> running;
 };
@@ -318,7 +325,7 @@ void start(const std::string &group)
         std::vector<ss::GameDriver> list;
         std::string why;
         {
-            std::lock_guard r(work().read);
+            std::lock_guard r(g_db_read);
             list = read(group, why);
         }
         std::lock_guard l(work().lock);

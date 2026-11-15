@@ -1,6 +1,7 @@
 #include "market.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -127,6 +128,11 @@ void add_news(State &st, int round, std::string kind, const Words &title, const 
     n.body_en = body(kEn);
     n.title_es = title(kEs);
     n.body_es = body(kEs);
+    // 1.1.3: a list written line by line (the grid, the reserves, the awards) ended in a line break, an empty line
+    // under the text wherever it is shown (tools/texts.py found it)
+    for (std::string *t : {&n.title_en, &n.body_en, &n.title_es, &n.body_es})
+        while (!t->empty() && (t->back() == '\n' || t->back() == ' '))
+            t->pop_back();
     n.title = st.view_es ? n.title_es : n.title_en;
     n.body = st.view_es ? n.body_es : n.body_en;
     n.official = official;
@@ -416,7 +422,7 @@ float model_overall(const Driver &d)
 } // namespace
 
 // the game's own rating once it was read (it is what the player sees in the game); the market's model before
-float Driver::overall() const { return game_overall > 0 ? game_overall : model_overall(*this); }
+float Driver::overall() const { return game_overall > 0 ? game_overall : model_overall(*this) + rating_shift; }
 
 // the room to grow in the market's model, on top of what the game rates him now
 float Driver::potential() const
@@ -424,7 +430,7 @@ float Driver::potential() const
     float model = 0.40f * std::max(pace, pace_peak) + 0.25f * std::max(racecraft, racecraft_peak) +
                   0.20f * std::max(awareness, awareness_peak) + 0.15f * std::max(experience, experience_peak);
     if (game_overall <= 0)
-        return model;
+        return model + rating_shift;
     return std::max(game_overall, game_overall + model - model_overall(*this));
 }
 
@@ -466,6 +472,26 @@ bool State::shielded(const std::string &id) const
         return !t || !t->active;
     }
     return false;
+}
+
+char State::counted_as(int round) const
+{
+    auto it = counted.find(season_index);
+    if (round < 1 || it == counted.end() || static_cast<size_t>(round) > it->second.size())
+        return '-';
+    return it->second[static_cast<size_t>(round - 1)];
+}
+
+void State::count_round(int round, char how)
+{
+    if (round < 1 || round > 40 || season_index < 0)
+        return;
+    std::string &marks = counted[season_index];
+    if (marks.size() < static_cast<size_t>(round))
+        marks.resize(static_cast<size_t>(round), '-');
+    marks[static_cast<size_t>(round - 1)] = how;
+    while (counted.size() > 3) // this season and the two before are enough to tell what was counted
+        counted.erase(counted.begin());
 }
 
 bool State::locked(const Team &t, int seat, const Settings &s) const
@@ -746,7 +772,7 @@ void sync_grid(State &st, const std::vector<GridCar> &shown)
         for (const State::Standin &sb : st.standins)
             if (c.team == sb.team && c.driver == sb.in)
                 c.driver = sb.out;
-    std::map<std::string, std::vector<std::string>> by_team;
+    std::map<std::string, std::vector<std::pair<std::string, int>>> by_team; // the team's drivers and their game seat
     // 1.1.2: one seat per driver. A read that names a driver twice (the player's row naming his team-mate) keeps the
     // human's car, else the first; the other seat stays empty instead of showing the same driver twice
     std::set<std::string> placed;
@@ -772,9 +798,12 @@ void sync_grid(State &st, const std::vector<GridCar> &shown)
             draw_traits(st.seed, st.year, d);
             st.drivers.emplace(c.driver, d);
         }
-        by_team[c.team].push_back(c.driver);
+        by_team[c.team].push_back({c.driver, c.seat});
     }
-    // everyone off, then seat the grid as shown, keeping each driver's seat index where possible
+    // everyone off, then seat the grid as shown: on the game's own seat index when the source gave it, else keeping
+    // each driver's seat index where possible. 1.1.3: the market kept its own index before, which could be the other
+    // seat of the team (a new season's seat the game refused, a line-up the game orders the other way round); a
+    // sacking written to "seat 0" then took the team-mate out of the game's car instead.
     std::map<std::string, std::array<std::string, 2>> old;
     for (Team &t : st.teams)
         old[t.id] = t.seats;
@@ -789,8 +818,14 @@ void sync_grid(State &st, const std::vector<GridCar> &shown)
             t.active = it != by_team.end(); // the game shows the team (Konnersport) or doesn't
         if (it == by_team.end())
             continue;
-        std::vector<std::string> rest;
-        for (const std::string &who : it->second) {
+        std::vector<std::string> unplaced, rest;
+        for (const auto &[who, seat] : it->second) {
+            if ((seat == 0 || seat == 1) && t.seats[static_cast<size_t>(seat)].empty())
+                t.seats[static_cast<size_t>(seat)] = who;
+            else
+                unplaced.push_back(who);
+        }
+        for (const std::string &who : unplaced) {
             int k = old[t.id][0] == who ? 0 : old[t.id][1] == who ? 1 : -1;
             if (k >= 0 && t.seats[static_cast<size_t>(k)].empty())
                 t.seats[static_cast<size_t>(k)] = who;
@@ -841,6 +876,8 @@ void record_result(State &st, std::string_view driver, int position, int round)
     // the race, for the team-mate duel: where he finished and for whom
     if (round <= 0)
         round = st.round + 1;
+    if (st.counted_as(round) == '-')
+        st.count_round(round, 't'); // 1.1.3 (15 Nov): the round is counted (simulate_race marks its own)
     if (round >= 1 && round <= 40) {
         size_t i = static_cast<size_t>(round - 1);
         if (d->race_pos.size() <= i) {
@@ -870,6 +907,10 @@ void record_result(State &st, std::string_view driver, int position, int round)
                 if (o->overall() + 0.5f * (t.performance - 70.0f) > mine + 0.5f * (st.team(d->team)->performance - 70.0f))
                     ++better;
             }
+    // 1.1.3: his car broke down in this round (the game's telemetry said so): the start counts, his form stays. The
+    // game's standings classify a retirement at the back with a position like any other, so the position can't tell.
+    if (d->failed_round == round)
+        return;
     if (position <= 0)
         position = total ? total : 20; // a retirement counts as last
     float expected = static_cast<float>(better + 1);
@@ -928,6 +969,13 @@ float seat_score(const State &st, const Settings &s, const Team &t, const Driver
         score += stay; // continuity
         if (s.personality && d.loyalty >= 0)
             score += (d.loyalty - 0.5f) * 6.0f; // a loyal driver is easy to keep
+    }
+    // 1.1.3, on track: a driver in a lot of incidents worries a team fighting at the front; a racer who passes a lot
+    // impresses everyone a little
+    if (s.on_track) {
+        float extra = std::max(0.0f, d.s_incidents - 2.0f);
+        score -= extra * (top ? 1.2f : plan == "contend" ? 0.8f : 0.4f);
+        score += std::min(d.s_overtakes, 30.0f) * 0.06f;
     }
     if (s.academies && in_academy(t, d)) {
         // the team's own junior counts for more; a family with a second team or a partner (Racing Bulls, Haas) breaks
@@ -2028,6 +2076,7 @@ void simulate_race(State &st, Rng &r)
     std::sort(order.begin(), order.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
     for (size_t i = 0; i < order.size(); ++i) // the round being completed (complete_round set st.round to it)
         record_result(st, order[i].second, order[i].first < 0 ? 0 : static_cast<int>(i + 1), st.round);
+    st.count_round(st.round, 's'); // 1.1.3 (15 Nov): simulated: the game's results for it, if they come, add nothing
 }
 
 bool feuding(const Driver &a, const Driver &b)
@@ -2836,14 +2885,15 @@ void complete_round(State &st, const Settings &s, int round, int rounds)
     for (int at = st.round + 1; at <= round && at <= st.rounds; ++at) {
         st.round = at;
         double progress = static_cast<double>(at) / std::max(1, st.rounds);
-        // the game's results for this round arrived: the drivers have a start for every round the market saw
-        bool real_results = false;
-        for (const auto &[id, d] : st.drivers)
-            if (d.starts >= at - st.round_base) {
-                real_results = true;
-                break;
-            }
-        if (!real_results)
+        // 1.1.3 (15 Nov): the game's results for this round, when they came, go in now, before the round's market
+        // decisions (several rounds taken at once each get their own); a round counted once is never counted again
+        if (auto it = st.incoming.find(at); it != st.incoming.end()) {
+            if (st.counted_as(at) == '-')
+                for (const auto &[id, pos] : it->second)
+                    record_result(st, id, pos, at);
+            st.incoming.erase(it);
+        }
+        if (st.counted_as(at) == '-')
             simulate_race(st, r);
         end_standins(st, s, at);
         update_stock(st);
@@ -3122,6 +3172,9 @@ std::vector<SeatChange> start_new_season(State &st, const Settings &s, std::vect
         d.last_value = 0;
         d.wants_out = false;
         d.f2_pos = 0;
+        d.s_overtakes = d.s_overtaken = d.s_incidents = d.s_failures = 0;
+        d.failed_round = 0;
+        d.s_track_rounds = 0;
         if (was_on && d.kind != "player")
             d.seasons += 1;
     }
@@ -3242,6 +3295,9 @@ std::vector<SeatChange> start_new_season(State &st, const Settings &s, std::vect
     st.round = 0;
     st.round_base = 0;
     st.results_read = 0;
+    st.result_keys.clear();
+    st.foreign_keys.clear();
+    st.track_rounds = 0;
     st.deals.clear();
     st.retirements_drawn = false;
     st.midseason_moves = 0;
@@ -3262,6 +3318,7 @@ std::vector<SeatChange> start_new_season(State &st, const Settings &s, std::vect
     st.push_signing = false;
     st.sponsor_news = 0;
     st.principals_out = 0;
+    st.track_told.clear();
     st.team_comfort += st.team_comfort > 0 ? -1 : st.team_comfort < 0 ? 1 : 0; // a new season softens it
     academy_new_season(st);
     for (Team &t : st.teams)
@@ -3365,10 +3422,109 @@ void localize(State &st, bool es)
 // ---------------------------------------------------------------------------------------------------
 // Persistence
 
+// 1.1.3: a float widened to double prints 17 digits (70.12300109863281 for 70.123f). Every number with a fraction in
+// the save is a float, so each is written as its float's shortest text, which reads back to the very same float: the
+// save is some 7% smaller and nothing is lost (sim_test checks both). A double that is no float keeps its own text.
+namespace {
+void dump_save_value(std::string &out, const Value &v)
+{
+    switch (v.type()) {
+    case json::Type::floating: {
+        double d = v.as_double();
+        float f = static_cast<float>(d);
+        if (std::isfinite(f) && static_cast<double>(f) == d) {
+            char buf[48];
+            auto r = std::to_chars(buf, buf + sizeof buf, f);
+            std::string_view t(buf, static_cast<size_t>(r.ptr - buf));
+            out += t;
+            if (t.find_first_of(".eE") == std::string_view::npos)
+                out += ".0"; // still a number with a fraction when read back
+        } else {
+            json::detail::dump_double(out, d);
+        }
+        break;
+    }
+    case json::Type::array: {
+        out += '[';
+        bool first = true;
+        for (const Value &x : *v.if_array()) {
+            if (!first)
+                out += ',';
+            first = false;
+            dump_save_value(out, x);
+        }
+        out += ']';
+        break;
+    }
+    case json::Type::object: {
+        out += '{';
+        bool first = true;
+        for (const auto &[key, x] : *v.if_object()) {
+            if (!first)
+                out += ',';
+            first = false;
+            json::detail::dump_string(out, key);
+            out += ':';
+            dump_save_value(out, x);
+        }
+        out += '}';
+        break;
+    }
+    case json::Type::string:
+        json::detail::dump_string(out, *v.if_string());
+        break;
+    default: // null, a boolean, an integer: as the SDK writes them
+        out += json::dump(v);
+        break;
+    }
+}
+} // namespace
+
+std::string dump_save(const Value &v)
+{
+    std::string out;
+    out.reserve(256 * 1024);
+    dump_save_value(out, v);
+    return out;
+}
+
+// 1.1.3: a driver's field that loads as zero or empty when the save doesn't have it isn't written while it is zero or
+// empty. Most of a career's 180-odd drivers never raced, were never rated by the game and hold no deal, so nine in
+// ten of their fields said nothing: the save is about half the size, and built, written and read that much faster.
+// The fields whose missing value is something else (seat -1, the characters' -1, the ratings' 70) are always written.
+namespace {
+void put(Value &o, std::string_view key, bool v)
+{
+    if (v)
+        o[key] = v;
+}
+void put(Value &o, std::string_view key, int v)
+{
+    if (v)
+        o[key] = v;
+}
+void put(Value &o, std::string_view key, float v)
+{
+    if (v != 0.0f || std::signbit(v)) // -0.0 is written: it must come back bit for bit
+        o[key] = v;
+}
+void put(Value &o, std::string_view key, const std::string &v)
+{
+    if (!v.empty())
+        o[key] = v;
+}
+void put(Value &o, std::string_view key, Value &&v)
+{
+    if (!(v.is_array() && v.size() == 0))
+        o[key] = std::move(v);
+}
+} // namespace
+
 Value to_json(const State &st)
 {
     Value v = Value::object();
     v["schema"] = st.schema;
+    v["revision"] = static_cast<int64_t>(st.revision);
     v["group"] = st.group;
     v["career"] = st.career;
     v["year"] = st.year;
@@ -3377,6 +3533,44 @@ Value to_json(const State &st)
     v["rounds"] = st.rounds;
     v["round_base"] = st.round_base;
     v["results_read"] = st.results_read;
+    {
+        Value rk = Value::array(), fk = Value::array(), sc = Value::array();
+        for (uint32_t k : st.result_keys)
+            rk.push_back(static_cast<int64_t>(k));
+        for (uint32_t k : st.foreign_keys)
+            fk.push_back(static_cast<int64_t>(k));
+        for (const State::SeatCheck &c : st.seat_checks) {
+            Value o = Value::object();
+            o["team"] = c.team;
+            o["driver"] = c.driver;
+            o["seat"] = c.seat;
+            o["year"] = c.year;
+            o["state"] = c.state;
+            if (c.misses)
+                o["misses"] = c.misses;
+            if (c.have_prev) {
+                o["prev_team"] = c.prev_team;
+                o["prev_contract"] = c.prev_contract;
+                o["prev_salary"] = static_cast<double>(c.prev_salary);
+            }
+            sc.push_back(std::move(o));
+        }
+        if (!st.result_keys.empty())
+            v["result_keys"] = std::move(rk);
+        if (!st.foreign_keys.empty())
+            v["foreign_keys"] = std::move(fk);
+        v["key_scheme"] = st.key_scheme;
+        if (!st.counted.empty()) {
+            Value cm = Value::object();
+            for (const auto &[season, marks] : st.counted)
+                cm[std::to_string(season)] = marks;
+            v["counted"] = std::move(cm);
+        }
+        if (!st.seat_checks.empty())
+            v["seat_checks"] = std::move(sc);
+        if (st.track_rounds)
+            v["track_rounds"] = st.track_rounds;
+    }
     v["last_meeting"] = static_cast<int64_t>(st.last_meeting);
     v["seed"] = std::to_string(st.seed);
     v["rng"] = std::to_string(st.rng);
@@ -3391,11 +3585,11 @@ Value to_json(const State &st)
     for (const auto &[id, d] : st.drivers) {
         Value o = Value::object();
         o["name"] = d.name;
-        o["nat"] = d.nat;
+        put(o, "nat", d.nat);
         o["kind"] = d.kind;
-        o["academy"] = d.academy;
+        put(o, "academy", d.academy);
         o["born"] = d.born;
-        o["stat"] = d.stat;
+        put(o, "stat", d.stat);
         o["pace"] = d.pace;
         o["racecraft"] = d.racecraft;
         o["awareness"] = d.awareness;
@@ -3404,70 +3598,77 @@ Value to_json(const State &st)
         o["racecraft_peak"] = d.racecraft_peak;
         o["awareness_peak"] = d.awareness_peak;
         o["experience_peak"] = d.experience_peak;
-        o["team"] = d.team;
+        put(o, "team", d.team);
         o["seat"] = d.seat;
-        o["contract"] = d.contract;
-        o["form"] = d.form;
-        o["points"] = d.points;
-        o["starts"] = d.starts;
-        o["seasons"] = d.seasons;
-        o["retiring"] = d.retiring;
-        o["retired"] = d.retired;
-        o["released"] = d.released;
-        o["ratings_seen"] = d.ratings_seen;
-        o["game_overall"] = d.game_overall;
-        o["focus"] = d.focus;
-        o["pressured"] = d.pressured;
-        o["reserve_of"] = d.reserve_of;
-        o["salary"] = d.salary;
-        o["initials"] = d.initials;
-        o["female"] = d.female;
+        put(o, "contract", d.contract);
+        put(o, "form", d.form);
+        put(o, "points", d.points);
+        put(o, "starts", d.starts);
+        put(o, "seasons", d.seasons);
+        put(o, "retiring", d.retiring);
+        put(o, "retired", d.retired);
+        put(o, "released", d.released);
+        put(o, "ratings_seen", d.ratings_seen);
+        put(o, "game_overall", d.game_overall);
+        put(o, "focus", d.focus);
+        put(o, "rating_shift", d.rating_shift);
+        put(o, "s_overtakes", d.s_overtakes);
+        put(o, "s_overtaken", d.s_overtaken);
+        put(o, "s_incidents", d.s_incidents);
+        put(o, "s_failures", d.s_failures);
+        put(o, "failed_round", d.failed_round);
+        put(o, "s_track_rounds", d.s_track_rounds);
+        put(o, "pressured", d.pressured);
+        put(o, "reserve_of", d.reserve_of);
+        put(o, "salary", d.salary);
+        put(o, "initials", d.initials);
+        put(o, "female", d.female);
         Value keys = Value::array();
         for (const std::string &k : d.name_keys)
             keys.push_back(k);
-        o["name_keys"] = std::move(keys);
-        o["alias_first"] = d.alias_first;
-        o["alias_last"] = d.alias_last;
-        o["regen"] = d.regen;
-        o["backing"] = d.backing;
-        o["clause_rank"] = d.clause_rank;
-        o["wants_out"] = d.wants_out;
-        o["f2_pos"] = d.f2_pos;
+        put(o, "name_keys", std::move(keys));
+        put(o, "alias_first", d.alias_first);
+        put(o, "alias_last", d.alias_last);
+        put(o, "regen", d.regen);
+        put(o, "backing", d.backing);
+        put(o, "clause_rank", d.clause_rank);
+        put(o, "wants_out", d.wants_out);
+        put(o, "f2_pos", d.f2_pos);
         Value feuds = Value::array();
         for (const std::string &f : d.feuds)
             feuds.push_back(f);
-        o["feuds"] = std::move(feuds);
-        o["last_value"] = d.last_value;
-        o["trend"] = d.trend;
+        put(o, "feuds", std::move(feuds));
+        put(o, "last_value", d.last_value);
+        put(o, "trend", d.trend);
         o["ambition"] = d.ambition;
         o["loyalty"] = d.loyalty;
         o["money"] = d.money;
-        o["wins"] = d.wins;
-        o["podiums"] = d.podiums;
-        o["value_start"] = d.value_start;
-        o["number"] = d.number;
-        o["number_tries"] = d.number_tries;
-        o["home"] = d.home;
+        put(o, "wins", d.wins);
+        put(o, "podiums", d.podiums);
+        put(o, "value_start", d.value_start);
+        put(o, "number", d.number);
+        put(o, "number_tries", d.number_tries);
+        put(o, "home", d.home);
         auto floats = [](const std::vector<float> &v) {
             Value a = Value::array();
             for (float x : v)
                 a.push_back(x);
             return a;
         };
-        o["values"] = floats(d.values);
-        o["values_last"] = floats(d.values_last);
-        o["c_starts"] = d.c_starts;
-        o["c_wins"] = d.c_wins;
-        o["c_podiums"] = d.c_podiums;
-        o["c_points"] = d.c_points;
-        o["titles"] = d.titles;
+        put(o, "values", floats(d.values));
+        put(o, "values_last", floats(d.values_last));
+        put(o, "c_starts", d.c_starts);
+        put(o, "c_wins", d.c_wins);
+        put(o, "c_podiums", d.c_podiums);
+        put(o, "c_points", d.c_points);
+        put(o, "titles", d.titles);
         Value pos = Value::array(), rteam = Value::array();
         for (int p : d.race_pos)
             pos.push_back(p);
         for (const std::string &t : d.race_team)
             rteam.push_back(t);
-        o["race_pos"] = std::move(pos);
-        o["race_team"] = std::move(rteam);
+        put(o, "race_pos", std::move(pos));
+        put(o, "race_team", std::move(rteam));
         drivers[id] = std::move(o);
     }
     Value &teams = v["teams"];
@@ -3497,8 +3698,8 @@ Value to_json(const State &st)
     news = Value::array();
     for (const NewsItem &n : st.news)
         news.push_back(Value::object({{"id", n.id}, {"year", n.year}, {"round", n.round}, {"kind", n.kind},
-                                      {"title", n.title_en}, {"body", n.body_en}, {"title_es", n.title_es},
-                                      {"body_es", n.body_es}, {"official", n.official}, {"shown", n.shown}, {"driver", n.driver},
+                                      {"title", n.title_en}, {"body", n.body_en}, {"title_es", st.view_es ? n.title_es : std::string()},
+                                      {"body_es", st.view_es ? n.body_es : std::string()}, {"official", n.official}, {"shown", n.shown}, {"driver", n.driver},
                                       {"from", n.from}, {"to", n.to}, {"until", n.until}, {"big", n.big}}));
     Value &history = v["history"];
     history = Value::array();
@@ -3583,6 +3784,13 @@ Value to_json(const State &st)
     v["scout_told"] = st.scout_told;
     v["reveal_year"] = st.reveal_year;
     v["observer"] = st.observer;
+    v["overtakes_told"] = st.overtakes_told;
+    {
+        Value told = Value::array();
+        for (const std::string &k : st.track_told)
+            told.push_back(k);
+        v["track_told"] = std::move(told);
+    }
     // 1.1.0 phase 5
     Value changes = Value::array();
     for (const State::Change &c : st.changes) {
@@ -3625,6 +3833,43 @@ bool from_json(State &st, const Value &v)
     out.rounds = static_cast<int>(v["rounds"].as_int(24));
     out.round_base = static_cast<int>(v["round_base"].as_int(0));
     out.results_read = static_cast<int>(v["results_read"].as_int(0));
+    if (const json::Array *a = v["result_keys"].if_array())
+        for (const Value &x : *a)
+            out.result_keys.push_back(static_cast<uint32_t>(x.as_int()));
+    if (const json::Array *a = v["foreign_keys"].if_array())
+        for (const Value &x : *a)
+            out.foreign_keys.push_back(static_cast<uint32_t>(x.as_int()));
+    if (const json::Array *a = v["seat_checks"].if_array())
+        for (const Value &x : *a) {
+            State::SeatCheck c;
+            c.team = std::string(x["team"].as_string());
+            c.driver = std::string(x["driver"].as_string());
+            c.seat = static_cast<int>(x["seat"].as_int());
+            c.year = static_cast<int>(x["year"].as_int());
+            c.state = static_cast<int>(x["state"].as_int());
+            c.misses = static_cast<int>(x["misses"].as_int(0));
+            if (x["prev_team"].is_string() || x["prev_contract"].is_number()) {
+                c.have_prev = true;
+                c.prev_team = std::string(x["prev_team"].as_string());
+                c.prev_contract = static_cast<int>(x["prev_contract"].as_int(0));
+                c.prev_salary = static_cast<float>(x["prev_salary"].as_double(0));
+            }
+            if (!c.team.empty() && !c.driver.empty())
+                out.seat_checks.push_back(c);
+        }
+    out.revision = static_cast<uint64_t>(v["revision"].as_int(0));
+    out.key_scheme = static_cast<int>(v["key_scheme"].as_int(1)); // a save from before 15 Nov: the first scheme
+    if (const json::Object *cm = v["counted"].if_object()) {
+        for (const auto &[season, marks] : *cm)
+            out.counted[std::atoi(season.c_str())] = std::string(marks.as_string());
+    } else if (out.season_index >= 0 && out.round > 0) {
+        // an older save: the rounds it took from the standings, then the ones it simulated
+        std::string marks;
+        for (int r = 1; r <= out.round && r <= 40; ++r)
+            marks += r <= out.results_read ? 't' : r <= out.round_base ? '-' : 's';
+        out.counted[out.season_index] = marks;
+    }
+    out.track_rounds = static_cast<int>(v["track_rounds"].as_int(0));
     out.last_meeting = static_cast<uint32_t>(v["last_meeting"].as_int(0));
     out.seed = std::stoull(std::string(v["seed"].as_string("1")));
     out.rng = std::stoull(std::string(v["rng"].as_string("1")));
@@ -3650,6 +3895,13 @@ bool from_json(State &st, const Value &v)
             d.ratings_seen = o["ratings_seen"].as_bool();
             d.game_overall = static_cast<float>(o["game_overall"].as_double());
             d.focus = static_cast<float>(o["focus"].as_double());
+            d.rating_shift = static_cast<float>(o["rating_shift"].as_double());
+            d.s_overtakes = static_cast<float>(o["s_overtakes"].as_double());
+            d.s_overtaken = static_cast<float>(o["s_overtaken"].as_double());
+            d.s_incidents = static_cast<float>(o["s_incidents"].as_double());
+            d.s_failures = static_cast<float>(o["s_failures"].as_double());
+            d.failed_round = static_cast<int>(o["failed_round"].as_int());
+            d.s_track_rounds = static_cast<int>(o["s_track_rounds"].as_int());
             d.pressured = o["pressured"].as_bool();
             d.reserve_of = std::string(o["reserve_of"].as_string());
             d.salary = static_cast<float>(o["salary"].as_double());
@@ -3757,6 +4009,12 @@ bool from_json(State &st, const Value &v)
             n.body_en = std::string(o["body"].as_string());
             n.title_es = std::string(o["title_es"].as_string());
             n.body_es = std::string(o["body_es"].as_string());
+            // 1.1.3: a save made while the texts were shown in English keeps no Spanish ones (half of a long career's
+            // news): should the language change later, those items read in English
+            if (n.title_es.empty())
+                n.title_es = n.title_en;
+            if (n.body_es.empty())
+                n.body_es = n.body_en;
             n.title = n.title_en;
             n.body = n.body_en;
             n.official = o["official"].as_bool();
@@ -3860,6 +4118,10 @@ bool from_json(State &st, const Value &v)
     out.scout_told = static_cast<int>(v["scout_told"].as_int());
     out.reveal_year = static_cast<int>(v["reveal_year"].as_int());
     out.observer = v["observer"].as_bool(); // a save from before: the plugin sets it again from the career's mode
+    out.overtakes_told = static_cast<int>(v["overtakes_told"].as_int());
+    if (const json::Array *told = v["track_told"].if_array())
+        for (const Value &k : *told)
+            out.track_told.insert(std::string(k.as_string()));
     // 1.1.0 phase 5 (a save from before it: no changes to undo, a neutral press record, principals drawn now)
     if (const json::Array *changes = v["changes"].if_array())
         for (const Value &o : *changes) {
@@ -4042,19 +4304,27 @@ std::string report_history(const State &st, const Settings &s)
     return out;
 }
 
+// 1.1.3 (15 Nov): banner_news is how far the news were looked through; only an item actually handed to the banner is
+// marked shown. A breaking item that doesn't fit this time stops the look-through, so it comes next time (it was
+// marked as seen before, and a deal taken back later wasn't told as off).
 std::vector<NewsItem> take_breaking(State &st, size_t max)
 {
     std::vector<NewsItem> out;
-    for (const NewsItem &n : st.news) {
+    for (NewsItem &n : st.news) {
         if (n.id <= st.banner_news)
             continue;
-        st.banner_news = n.id;
         bool breaking = n.official && (n.kind == "official" || n.kind == "retirement" || n.kind == "sacking" ||
                                        n.kind == "standin" || n.kind == "staff" || n.kind == "clause" ||
                                        n.kind == "press" || n.kind == "talents" || n.kind == "f2" || n.kind == "deadline" ||
                                        n.kind == "media" || n.kind == "swap" || n.kind == "principal" || n.kind == "farewell");
-        if (breaking && n.body.find('\n') == std::string::npos && out.size() < max)
+        breaking = breaking && n.body.find('\n') == std::string::npos;
+        if (breaking && out.size() >= max)
+            break;
+        st.banner_news = n.id;
+        if (breaking) {
+            n.shown = true;
             out.push_back(n);
+        }
     }
     return out;
 }

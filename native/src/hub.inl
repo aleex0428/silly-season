@@ -319,6 +319,56 @@ inline void card(ov::Paint *p, float x, float y, float w, float h, float k, bool
     ov::gradient(p, x + w / 2, y + 1 * k, (w - 2 * r) / 2, 1 * k, 0xFFFFFF22, 0xFFFFFF00, true);
 }
 
+// ----- 1.1.3: the shared measures and pieces ------------------------------------------------------
+// One scale for the gaps, one for the text and one for the corners, so every page and overlay is built from the same
+// steps (multiply by k). New and reworked drawing uses these; the rest follows them by eye.
+namespace space {
+constexpr float xs = 4, s = 8, m = 12, l = 16, xl = 24, xxl = 32;
+}
+namespace type {
+constexpr float caption = 11.5f, label = 12.5f, note = 14, body = 15, body_l = 17, heading = 20, title = 24;
+}
+namespace radius {
+constexpr float chip = 5, row = 9, card = 12, panel = 14;
+}
+
+// a team colour (0xRRGGBB) as an accent that reads on the dark panel: dark liveries (Williams' navy, Racing Bulls'
+// blue) are lifted, bright ones kept
+inline uint32_t vivid(uint32_t col)
+{
+    float lum = 0.299f * ((col >> 16) & 0xFF) + 0.587f * ((col >> 8) & 0xFF) + 0.114f * (col & 0xFF);
+    uint32_t c = rgb(col);
+    return lum < 105 ? shade(c, 1.0f + (105 - lum) / 190.0f) : c;
+}
+
+// a table's columns over the whole width: each a minimum width and a share of the room left. Returns each column's
+// left edge, then the table's right edge.
+inline std::vector<float> columns(float x0, float w, std::initializer_list<std::pair<float, float>> spec, float k)
+{
+    float fixed = 0, grow = 0;
+    for (auto [min_w, share] : spec) {
+        fixed += min_w * k;
+        grow += share;
+    }
+    float extra = std::max(0.0f, w - fixed), x = x0;
+    std::vector<float> xs;
+    for (auto [min_w, share] : spec) {
+        xs.push_back(x);
+        x += min_w * k + (grow > 0 ? extra * share / grow : 0);
+    }
+    xs.push_back(x);
+    return xs;
+}
+
+// a key and what it does, as the footers say it; returns the width
+inline float hint(ov::Paint *p, float x, float cy, std::string_view key, std::string_view what, float k)
+{
+    float kw = keycap(p, x, cy - 12 * k, key, k);
+    ov::TextStyle s = ts(type::note * k, kText2, ov::align::left | ov::align::middle, 0.2f * k);
+    ov::text(p, x + kw + space::s * k, cy, s, what);
+    return kw + space::s * k + text_w(p, s, what);
+}
+
 // a team's livery band: its colour fading out, with racing stripes
 // (radius rounds the top corners; the caller clips the band to h)
 inline void livery(ov::Paint *p, float x, float y, float w, float h, uint32_t col, float k, float strength = 1, float radius = 0)
@@ -716,6 +766,26 @@ float empty_state(const Ctx &c, float y, ui::Icon ic, std::string_view line1, st
     return h;
 }
 
+// 1.1.3: a section with nothing in it yet: a slim dashed card with the icon and one line (empty_state is for a whole
+// page). w 0: the content's full width from x
+float empty_note(const Ctx &c, float x, float y, float w, ui::Icon ic, std::string_view line)
+{
+    float k = c.k, h = 60 * k;
+    if (w <= 0)
+        w = c.area.x + c.area.w - x;
+    if (c.visible(y, h)) {
+        Reveal r(c, 8);
+        ov::rect_rounded(c.p, x, y, w, h, ui::radius::card * k, 0xFFFFFF05);
+        ui::dashed_rect(c.p, x, y, w, h, k, 0xFFFFFF14);
+        float cx = x + 34 * k, cy = y + h / 2;
+        ov::circle(c.p, cx, cy, 17 * k, 0xFFFFFF0A);
+        ui::icon(c.p, ic, cx, cy, 17 * k, ui::kMuted, k);
+        ov::TextStyle s = ui::ts(ui::type::body * k, ui::kText2, ov::align::left | ov::align::middle);
+        ov::text(c.p, x + 64 * k, cy, s, ui::fit(c.p, s, std::string(line), w - 80 * k));
+    }
+    return h + ui::space::s * k;
+}
+
 // ---------------------------------------------------------------------------------------------------
 // 1.1.0 phase 4: rows you can pick, the cards they open, the tables' search, sort and filter, and the
 // full-screen moments (the grid reveal, the signing card, the Team HQ widget)
@@ -752,6 +822,10 @@ std::string filter;          // "" everyone, "trait:<name>" or a team name
 bool sort_next = false, filter_next = false;
 // the moments
 bool reveal_on = false, reveal_manual = false;
+// 1.1.3: the story the race report sent the player to: the News page shows it marked and scrolls to it once
+int story_focus = 0;
+bool story_scroll = false;
+float story_y = -1;
 Clock::time_point reveal_at;
 bool signing_on = false;
 Clock::time_point signing_at;
@@ -759,6 +833,7 @@ UiSigning signing;
 Clock::time_point widget_at;
 bool widget_hq = false;
 int widget_unread = -1;
+bool pad_mode = false; // 1.1.3: the last input came from a pad (the footer shows its buttons)
 
 void open_card(int kind, const std::string &id)
 {
@@ -1042,11 +1117,14 @@ float page_transfers(const Ctx &c, float y0)
         char note[48];
         std::snprintf(note, sizeof note, "%zu %s", d.chains.size(), d.chains.size() == 1 ? c.T("cadena", "chain") : c.T("cadenas", "chains"));
         y += section_title(c, c.area.x, y, c.T("EFECTO DOMINÓ", "THE DOMINOES"), note);
-        float w = 300 * k, h = 96 * k, gap = 54 * k;
-        int per_line = std::max(1, static_cast<int>((c.area.w + gap) / (w + gap)));
+        float h = 96 * k, gap = 54 * k;
+        int fit_line = std::max(1, static_cast<int>((c.area.w + gap) / (300 * k + gap)));
         int n = 0;
         for (const std::vector<UiLink> &chain : d.chains) {
             ++n;
+            // 1.1.3: a short chain's cards share the width (they kept 300 px and left most of the page empty)
+            int per_line = std::clamp(static_cast<int>(chain.size()), 1, fit_line);
+            float w = std::min(470 * k, (c.area.w - gap * static_cast<float>(per_line - 1)) / static_cast<float>(per_line));
             if (c.visible(y, 24 * k)) {
                 char head[48];
                 std::snprintf(head, sizeof head, "%s %d  ·  %zu %s", c.T("CADENA", "CHAIN"), n, chain.size(), c.T("movimientos", "moves"));
@@ -1068,7 +1146,12 @@ float page_transfers(const Ctx &c, float y0)
             y += h + 26 * k;
         }
     }
-    if (!d.waiting.empty()) {
+    if (d.waiting.empty()) {
+        // 1.1.3: the section says it is empty instead of leaving the rest of the page blank
+        y += section_title(c, c.area.x, y, c.T("ESPERANDO ASIENTO", "WAITING FOR A SEAT"));
+        y += empty_note(c, c.area.x, y, 0, ui::Icon::chain,
+                        c.T("Ningún fichaje espera a que se libere su asiento.", "No signing is waiting for its seat to open."));
+    } else {
         y += section_title(c, c.area.x, y, c.T("ESPERANDO ASIENTO", "WAITING FOR A SEAT"),
                            c.T("no se anuncian hasta que se vaya el piloto", "announced once the seat's driver has gone"));
         float w = (c.area.w - 16 * k) / 2, h = 96 * k;
@@ -1382,6 +1465,26 @@ void draw_driver_card(ov::Paint *p, const ov::Input &in, float k, float W, float
                                n(c.c_podiums, "podio", "podios", "podium", "podiums") + "  ·  " +
                                n(c.c_titles, "título", "títulos", "title", "titles") + "  ·  " +
                                n(c.c_teams, "equipo", "equipos", "team", "teams");
+            ov::text(p, lx, ly + 4 * k, ui::ts(13.5f * k, ui::kText2, ov::align::left | ov::align::middle, 0.3f * k), ui::fit(p, ui::ts(13.5f * k), line, lw));
+            ly += 24 * k;
+        }
+        // 1.1.3: this season on track, from the game's telemetry
+        // a race with telemetry: the counts, zeros included; none yet: "no data", never a clean record it can't know
+        if (c.t_on && c.t_rounds == 0 && !c.team.empty()) {
+            ov::text(p, lx, ly + 4 * k, ui::ts(13.5f * k, ui::kMuted, ov::align::left | ov::align::middle, 0.3f * k),
+                     ui::fit(p, ui::ts(13.5f * k),
+                             T("EN PISTA:  aún sin datos de telemetría (activa la telemetría UDP del juego)",
+                               "ON TRACK:  no telemetry data yet (turn on the game's UDP telemetry)"),
+                             lw));
+            ly += 24 * k;
+        } else if (c.t_rounds > 0 || c.t_overtakes > 0 || c.t_incidents > 0 || c.t_failures > 0) {
+            auto n = [&](int v, const char *one_es, const char *many_es, const char *one_en, const char *many_en) {
+                return std::to_string(v) + " " + (v == 1 ? T(one_es, one_en) : T(many_es, many_en));
+            };
+            std::string line = std::string(T("EN PISTA:  ", "ON TRACK:  ")) +
+                               n(c.t_overtakes, "adelantamiento", "adelantamientos", "overtake", "overtakes") + "  ·  " +
+                               n(c.t_incidents, "incidente", "incidentes", "incident", "incidents") + "  ·  " +
+                               n(c.t_failures, "avería", "averías", "mechanical DNF", "mechanical DNFs");
             ov::text(p, lx, ly + 4 * k, ui::ts(13.5f * k, ui::kText2, ov::align::left | ov::align::middle, 0.3f * k), ui::fit(p, ui::ts(13.5f * k), line, lw));
             ly += 24 * k;
         }
@@ -1816,6 +1919,12 @@ float page_news(const Ctx &c, float y0)
         }
         float h = news_card(c, cx, y, cw, n, false);
         news_pick(c, cx, y, cw, h, n);
+        if (n.id && n.id == ui4::story_focus) { // 1.1.3: the story the race report sent the player to
+            ui4::story_y = y - y0;
+            if (c.visible(y, h))
+                ov::rect_rounded_outline(c.p, cx - 4 * k, y - 4 * k, cw + 8 * k, h + 8 * k, 14 * k, 2 * k,
+                                         ui::alpha(ui::news_tag(n.kind).col, 0.9f));
+        }
         if (c.visible(y, h)) {
             ov::circle(c.p, lx, y + 30 * k, 3.5f * k, ui::news_tag(n.kind).col);
             ov::rect(c.p, lx + 4 * k, y + 29.5f * k, cx - lx - 8 * k, 1 * k, 0xFFFFFF20);
@@ -2069,7 +2178,7 @@ float page_press(const Ctx &c, float y0, const ov::Input &in)
             ov::ClipScope clip(c.p, c.area.x, y0, c.area.w, h);
             ov::gradient(c.p, c.area.x, y0, c.area.w * 0.6f, h, 0x30D15826, 0x30D15800, true, 12 * k);
         }
-        float pop = ui::ease_back(since / 0.5f);
+        float pop = ui::g_lite ? 1.0f : ui::ease_back(since / 0.5f); // 1.1.3: "Panel effects" off: no pop
         ov::circle(c.p, c.area.x + 70 * k, y0 + 70 * k, 30 * k * pop, ui::kGreen);
         float pts[6] = {c.area.x + 56 * k, y0 + 70 * k, c.area.x + 66 * k, y0 + 81 * k, c.area.x + 86 * k, y0 + 58 * k};
         ov::polyline(c.p, pts, 3, 4 * k * pop, 0x0B2A14FF);
@@ -2111,7 +2220,8 @@ float page_press(const Ctx &c, float y0, const ov::Input &in)
         ov::text(c.p, c.area.x + c.area.w - 40 * k, y - 30 * k, ui::ts(260 * k, 0xFFFFFF0C, ov::align::right | ov::align::top), "\xE2\x80\x9D");
         ov::circle(c.p, c.area.x + 70 * k, y + 70 * k, 38 * k, 0x1A1408FF);
         ov::circle_outline(c.p, c.area.x + 70 * k, y + 70 * k, 38 * k, 2 * k, ui::kAmber);
-        ov::arc(c.p, c.area.x + 70 * k, y + 70 * k, 46 * k, ui::clock_s() * 1.2f, ui::clock_s() * 1.2f + 1.2f, 2 * k, 0xFFB02080);
+        float spin = ui::g_lite ? 0.0f : ui::clock_s() * 1.2f; // 1.1.3: "Panel effects" off: the arc stands still
+        ov::arc(c.p, c.area.x + 70 * k, y + 70 * k, 46 * k, spin, spin + 1.2f, 2 * k, 0xFFB02080);
         ui::icon(c.p, ui::Icon::press, c.area.x + 70 * k, y + 70 * k, 32 * k, ui::kAmber, k);
         ui::tag(c.p, c.area.x + 134 * k, y + 26 * k, c.T("RUEDA DE PRENSA", "PRESS CONFERENCE"), ui::kAmber, k, 12, true);
         ov::text(c.p, c.area.x + 134 * k + 190 * k, y + 37 * k, ui::ts(13 * k, ui::kAmber, ov::align::left | ov::align::middle, 1.6f * k),
@@ -2363,11 +2473,8 @@ float page_deals(const Ctx &c, float y0)
     y += 20 * k;
     std::snprintf(head, sizeof head, "%s %d", c.T("MOVIMIENTOS DE", "MOVES OF"), d.year);
     y += section_title(c, c.area.x, y, head);
-    if (d.moves_year.empty()) {
-        if (c.visible(y, 40 * k))
-            ov::text(c.p, c.area.x, y + 6 * k, ui::ts(16 * k, ui::kText2), c.T("Ningún cambio esta temporada.", "No changes this season."));
-        y += 40 * k;
-    }
+    if (d.moves_year.empty())
+        y += empty_note(c, c.area.x, y, 0, ui::Icon::history, c.T("Ningún cambio esta temporada.", "No changes this season."));
     for (const UiMove &m : d.moves_year)
         y += move_row(c, c.area.x, c.area.w, y, m, false) + 8 * k;
     return y - y0;
@@ -2507,9 +2614,13 @@ float page_drivers(const Ctx &c, float y0, bool free_agents)
     if (list.empty())
         return y - y0 + empty_state(c, y, ui::Icon::drivers, c.T("Nadie coincide", "Nobody matches"),
                                     c.T("Prueba otra búsqueda u otro filtro.", "Try another search or filter."));
-    // column header
-    float cx_rank = c.area.x + 14 * k, cx_name = c.area.x + 70 * k, cx_team = c.area.x + 390 * k, cx_age = c.area.x + 490 * k,
-          cx_val = c.area.x + 570 * k, cx_trend = c.area.x + 830 * k, cx_con = c.area.x + 930 * k, cx_sal = c.area.x + 1040 * k;
+    // column header. 1.1.3: the columns spread over the whole width (they stopped at 1100 px and left the right of a
+    // wide panel empty); the name and the value bar take most of the room a larger panel adds
+    std::vector<float> col = ui::columns(c.area.x + 14 * k, c.area.w - 14 * k,
+                                         {{56.f, 0.f}, {320.f, 3.f}, {100.f, 0.6f}, {80.f, 0.f}, {260.f, 2.2f}, {100.f, 0.6f}, {110.f, 0.6f}, {100.f, 1.f}}, k);
+    float cx_rank = col[0], cx_name = col[1], cx_team = col[2], cx_age = col[3], cx_val = col[4], cx_trend = col[5], cx_con = col[6],
+          cx_sal = col[7];
+    float name_w = (cx_team - cx_name) * 0.72f;
     {
         ov::gradient(c.p, c.area.x, y, c.area.w, 32 * k, 0xFFFFFF0E, 0xFFFFFF06, false, 7 * k);
         ov::TextStyle hs = ui::ts(12 * k, ui::kText2, ov::align::left | ov::align::middle, 1.6f * k);
@@ -2539,6 +2650,8 @@ float page_drivers(const Ctx &c, float y0, bool free_agents)
             Reveal r(c, 10);
             bool hov = c.hover(c.area.x, y, c.area.w, h);
             ov::rect_rounded(c.p, c.area.x, y, c.area.w, h, 9 * k, hov ? ui::kCardHi : (rank % 2 ? 0x1A1C25FF : 0x15171FFF));
+            if (u.player) // the player's own row stands out a little
+                ov::gradient(c.p, c.area.x, y, c.area.w * 0.5f, h, 0xE1060026, 0xE1060000, true, 9 * k);
             pick_mark(c, c.area.x, y, c.area.w, h, picked);
             if (hov) {
                 ov::rect_rounded_outline(c.p, c.area.x, y, c.area.w, h, 9 * k, 1 * k, ui::rgb(u.col, 0x80));
@@ -2554,9 +2667,11 @@ float page_drivers(const Ctx &c, float y0, bool free_agents)
             } else {
                 ov::text(c.p, cx_rank + 18 * k, my, ui::ts(15 * k, ui::kMuted, ov::align::center | ov::align::middle), std::to_string(rank));
             }
-            ov::text(c.p, cx_name, my, ui::ts(18 * k, ui::kText, ov::align::left | ov::align::middle), ui::fit(c.p, ui::ts(18 * k), u.name, 230 * k));
-            // badges after the name
-            float bx = cx_name + std::min(ui::text_w(c.p, ui::ts(18 * k), u.name), 230 * k) + 10 * k;
+            ov::text(c.p, cx_name, my, ui::ts(18 * k, ui::kText, ov::align::left | ov::align::middle), ui::fit(c.p, ui::ts(18 * k), u.name, name_w));
+            // badges after the name (1.1.3: the player's own row first, marked YOU)
+            float bx = cx_name + std::min(ui::text_w(c.p, ui::ts(18 * k), u.name), name_w) + 10 * k;
+            if (u.player && u.name != c.T("Tú", "You"))
+                bx += ui::tag(c.p, bx, my - 10 * k, c.T("TÚ", "YOU"), ui::kRed, k, 10, true) + 4 * k;
             if (u.pressure)
                 bx += ui::tag(c.p, bx, my - 10 * k, c.T("PRESIÓN", "PRESSURE"), ui::kDanger, k, 10) + 4 * k;
             if (u.clause && bx < cx_team - 80 * k)
@@ -2574,14 +2689,16 @@ float page_drivers(const Ctx &c, float y0, bool free_agents)
                 ui::team_chip(c.p, cx_team, my - 12 * k, u.code, u.col, k);
             }
             ov::text(c.p, cx_age + 14 * k, my, ui::ts(16 * k, ui::kText2, ov::align::center | ov::align::middle), std::to_string(u.age));
-            float vw = 170 * k;
+            // the bar fills its column, leaving room for the number after it; 1.1.3: in the team's colour (free
+            // agents: blue, their potential as a paler bar behind)
+            float vw = std::max(140 * k, cx_trend - cx_val - (free_agents ? 96 : 64) * k);
             if (free_agents) {
                 ov::rect_rounded(c.p, cx_val, my - 4 * k, vw, 8 * k, 4 * k, 0xFFFFFF12);
                 ov::rect_rounded(c.p, cx_val, my - 4 * k, std::max(8 * k, vw * std::clamp((u.potential - 55) / 45.0f, 0.0f, 1.0f) * c.grow()), 8 * k,
                                  4 * k, 0x0A84FF55);
                 ui::bar(c.p, cx_val, my - 4 * k, vw, 8 * k, (u.value - 55) / 45.0f * c.grow(), ui::kBlue);
             } else {
-                ui::bar(c.p, cx_val, my - 4 * k, vw, 8 * k, (u.value - 55) / 45.0f * c.grow(), ui::kRed);
+                ui::bar(c.p, cx_val, my - 4 * k, vw, 8 * k, (u.value - 55) / 45.0f * c.grow(), u.col ? ui::vivid(u.col) : ui::kRed);
             }
             char v[32];
             if (free_agents)
@@ -2746,9 +2863,15 @@ float page_stock(const Ctx &c, float y0)
             bool hov = c.hover(c.area.x, y, c.area.w, h);
             if (hov || picked)
                 ov::rect_rounded(c.p, c.area.x, y, c.area.w, h, 7 * k, picked ? 0xE106002A : 0xFFFFFF0C);
+            else if (u->player)
+                ov::gradient(c.p, c.area.x, y, name_w, h, 0xE1060022, 0xE1060000, true, 7 * k);
             ui::team_chip(c.p, c.area.x, y + 6 * k, u->code, u->col, k);
-            ov::text(c.p, c.area.x + 66 * k, y + h / 2, ui::ts(16 * k, ui::kText, ov::align::left | ov::align::middle),
-                     ui::fit(c.p, ui::ts(16 * k), u->name, name_w - 80 * k));
+            ov::TextStyle ns = ui::ts(16 * k, ui::kText, ov::align::left | ov::align::middle);
+            bool you_tag = u->player && u->name != c.T("Tú", "You");
+            std::string shown = ui::fit(c.p, ns, u->name, name_w - (you_tag ? 130 : 80) * k);
+            ov::text(c.p, c.area.x + 66 * k, y + h / 2, ns, shown);
+            if (you_tag) // 1.1.3: the player is on the chart too
+                ui::tag(c.p, c.area.x + 74 * k + ui::text_w(c.p, ns, shown), y + h / 2 - 10 * k, c.T("TÚ", "YOU"), ui::kRed, k, 10, true);
             float len = (chart_w / 2 - 6 * k) * std::fabs(u->trend) / maxv * c.grow();
             bool up = u->trend >= 0;
             uint32_t col = up ? ui::kGreen : ui::kDanger;
@@ -3098,10 +3221,8 @@ float page_future(const Ctx &c, float y0)
         }
         ly += h + 8 * k;
     }
-    if (f.suitors.empty()) {
-        ov::text(c.p, c.area.x, ly + 6 * k, ui::ts(15 * k, ui::kMuted), c.T("Nadie pregunta por ti todavía.", "Nobody is asking about you yet."));
-        ly += 36 * k;
-    }
+    if (f.suitors.empty())
+        ly += empty_note(c, c.area.x, ly, lw, ui::Icon::future, c.T("Nadie pregunta por ti todavía.", "Nobody is asking about you yet."));
     ry += section_title(c, rx, ry, c.T("TU VALOR, CARRERA A CARRERA", "YOUR VALUE, RACE BY RACE"), {}, rw);
     if (c.visible(ry, 220 * k)) {
         Reveal r(c);
@@ -3404,21 +3525,91 @@ void draw_season_bar(ov::Paint *p, const OverlayData &d, float x, float y, float
     }
 }
 
+// 1.1.3: the header when space is short (720p and smaller, or the "Large" panel size): one line instead of two, with
+// the year, the round and the window's status still in sight, and the season as a thin bar along its bottom. The
+// rows below get the height it gives back.
+void draw_header_compact(ov::Paint *p, const OverlayData &d, float px, float py, float pw, float hh, float k)
+{
+    auto T = [&](const char *es, const char *en) { return d.es ? es : en; };
+    {
+        ov::ClipScope clip(p, px, py, pw, hh);
+        ui::hatch(p, px + pw * 0.3f, py, pw * 0.7f, hh, k, 0xFFFFFF06, 9 * k);
+        ui::glow(p, px + 90 * k, py + hh / 2, 180 * k, 0xE1060030);
+        for (int i = 0; i < 4; ++i)
+            ui::para(p, px + 330 * k + i * 48 * k, py, 10 * k, hh, 28 * k, ui::alpha(0xE1060000 | 0x1C, 1.0f - i * 0.2f));
+    }
+    ui::logo(p, px + 22 * k, py + 14 * k, 34 * k, k);
+    ov::text(p, px + 74 * k, py + hh / 2 - 2 * k,
+             ui::lifted(ui::ts(26 * k, ui::kText, ov::align::left | ov::align::middle, 2.0f * k), k, 0xE1060070), "SILLY SEASON");
+    // the year, on the right, and the round beside it
+    float rx = px + pw - 24 * k;
+    char season[16];
+    if (d.waiting_year)
+        std::snprintf(season, sizeof season, "%s", "\xE2\x80\x94");
+    else
+        std::snprintf(season, sizeof season, "%d", d.year);
+    ov::TextStyle ys = ui::lifted(ui::ts(30 * k, ui::kText, ov::align::right | ov::align::middle, 1.2f * k), k);
+    ov::text(p, rx, py + hh / 2 - 2 * k, ys, season);
+    float x = rx - std::max(ui::text_w(p, ys, season), 64 * k) - 18 * k;
+    int R = std::max(1, d.rounds), done = std::clamp(d.round, 0, R);
+    if (!d.waiting_year) {
+        char round[40];
+        std::snprintf(round, sizeof round, "%s %d / %d", T("CARRERA", "ROUND"), done, R);
+        ov::TextStyle rs = ui::ts(12 * k, ui::kText2, ov::align::right | ov::align::middle, 1.8f * k);
+        ov::text(p, x, py + hh / 2 - 2 * k, rs, round);
+        x -= ui::text_w(p, rs, round) + 20 * k;
+    }
+    ov::rect(p, x, py + 16 * k, 1 * k, hh - 32 * k, 0xFFFFFF18);
+    // the window's status, as a chip
+    // 1.1.3 (15 Nov): "confirmed" only once the game confirms it: the market's closed grid is a projection until its
+    // seats are written, and the written ones the game hasn't shown yet are pending
+    const char *status = d.waiting_year     ? T("LEYENDO LA TEMPORADA REAL", "READING THE REAL SEASON")
+                         : d.open_seats > 0 ? T("PENDIENTE DE CONFIRMAR", "PENDING CONFIRMATION")
+                         : d.finalised      ? (d.real ? T("PARRILLA CERRADA", "GRID CONFIRMED") : T("PARRILLA PREVISTA", "PROJECTED GRID"))
+                         : d.real           ? T("TEMPORADA REAL", "THE REAL SEASON")
+                         : d.deadline       ? (d.deadline == 1 ? "DEADLINE DAY · LAST RACE" : "DEADLINE DAY · 2 RACES LEFT")
+                                            : T("MERCADO ABIERTO", "TRANSFER WINDOW OPEN");
+    uint32_t scol = d.waiting_year ? ui::kAmber : d.finalised ? ui::kGold : d.deadline ? ui::kRed : ui::kGreen;
+    ov::TextStyle ss_ = ui::ts(12 * k, ui::kText, ov::align::right | ov::align::middle, 1.6f * k);
+    float cw = ui::text_w(p, ss_, status) + 44 * k, ch = 30 * k;
+    float cx = x - 18 * k - cw, cy = py + (hh - ch) / 2 - 1 * k;
+    ov::rect_rounded(p, cx, cy, cw, ch, 8 * k, d.deadline && !d.finalised && !d.waiting_year ? 0xE1060040 : 0xFFFFFF08);
+    ov::rect_rounded_outline(p, cx, cy, cw, ch, 8 * k, 1 * k, d.deadline && !d.finalised && !d.waiting_year ? 0xE10600C0 : 0xFFFFFF14);
+    if (d.finalised)
+        ov::circle(p, cx + 16 * k, cy + ch / 2, 4 * k, scol);
+    else
+        ui::live_dot(p, cx + 16 * k, cy + ch / 2, 4 * k, scol);
+    ov::text(p, cx + cw - 12 * k, cy + ch / 2, ss_, status);
+    // the season along the header's foot: the races run, the windows faint behind
+    float by = py + hh - 3 * k;
+    ov::rect(p, px, by, pw, 3 * k, 0xFFFFFF10);
+    if (!d.waiting_year) {
+        auto at = [&](float r) { return px + pw * std::clamp(r / static_cast<float>(R), 0.0f, 1.0f); };
+        if (d.midseason_on)
+            ov::rect(p, at(std::ceil(0.40f * R) - 1), by, at(std::floor(0.65f * R)) - at(std::ceil(0.40f * R) - 1), 3 * k,
+                     ui::alpha(ui::kAmber, 0.35f));
+        if (d.deadline_on && R >= 8)
+            ov::rect(p, at(static_cast<float>(R - 3)), by, at(static_cast<float>(R - 1)) - at(static_cast<float>(R - 3)), 3 * k,
+                     ui::alpha(ui::kRed, 0.35f));
+        if (done > 0)
+            ov::gradient(p, px, by, at(static_cast<float>(done)) - px, 3 * k, 0xE1060060, ui::kRed, true);
+    }
+}
+
 // the headline ticker under the header: the latest stories scroll past like a broadcast crawl
 void draw_ticker(ov::Paint *p, const OverlayData &d, float x, float y, float w, float h, float k)
 {
     ov::rect(p, x, y, w, h, 0x00000040);
     ov::rect(p, x, y, w, 1 * k, 0xFFFFFF10);
     ov::rect(p, x, y + h - 1 * k, w, 1 * k, 0xFFFFFF10);
-    bool dl = d.deadline && !d.finalised;
+    bool dl = d.deadline && !d.finalised && !d.waiting_year; // 1.1.3: no market state while the real year is read
     float tagw = (dl ? 196 : 150) * k;
     ui::para(p, x, y, tagw + 14 * k, h, 14 * k, ui::kRed);
     ui::para(p, x, y, tagw + 14 * k, h * 0.45f, 6 * k, 0xFFFFFF14);
     float dot_x = x + 26 * k;
     ov::circle(p, dot_x, y + h / 2, 4.5f * k, 0xFFFFFF60 + static_cast<uint32_t>(0x9F * ui::pulse(1.2f)));
-    const char *label = d.deadline && !d.finalised ? (d.deadline == 1 ? "DEADLINE · 1 TO GO" : "DEADLINE · 2 TO GO")
-                                                   : d.es ? "ÚLTIMA HORA" : "LATEST";
-    ov::text(p, dot_x + 14 * k, y + h / 2, ui::ts(d.deadline && !d.finalised ? 12.5f * k : 14 * k, 0xFFFFFFFF, ov::align::left | ov::align::middle, 1.6f * k),
+    const char *label = dl ? (d.deadline == 1 ? "DEADLINE · 1 TO GO" : "DEADLINE · 2 TO GO") : d.es ? "ÚLTIMA HORA" : "LATEST";
+    ov::text(p, dot_x + 14 * k, y + h / 2, ui::ts(dl ? 12.5f * k : 14 * k, 0xFFFFFFFF, ov::align::left | ov::align::middle, 1.6f * k),
              label);
     float cx = x + tagw + 24 * k, cw = w - tagw - 24 * k;
     ov::TextStyle s = ui::ts(15 * k, ui::kText, ov::align::left | ov::align::middle, 0.4f * k);
@@ -3431,6 +3622,8 @@ void draw_ticker(ov::Paint *p, const OverlayData &d, float x, float y, float w, 
     // each story: its headline, then its first sentence
     std::vector<Item> items;
     for (const UiNews &n : d.news) {
+        if (d.waiting_year)
+            break; // 1.1.3: the baseline's stories are no part of this career yet
         if (items.size() >= 10)
             break;
         std::string line = n.body.substr(0, n.body.find('\n')); // a list (the grid, the awards): its first line
@@ -3445,7 +3638,9 @@ void draw_ticker(ov::Paint *p, const OverlayData &d, float x, float y, float w, 
     }
     if (items.empty())
         items.push_back({"SILLY SEASON",
-                         d.es ? "El paddock empieza a hablar después de las primeras carreras" : "The paddock starts talking after the first races",
+                         d.waiting_year ? (d.es ? "Leyendo la temporada real: el mercado abre en tu próxima visita a Team HQ"
+                                                : "Reading the real season: the market opens at your next Team HQ visit")
+                         : d.es ? "El paddock empieza a hablar después de las primeras carreras" : "The paddock starts talking after the first races",
                          ui::kMuted, 0, 0});
     float sep = 56 * k, total = 0;
     for (Item &it : items) {
@@ -3515,6 +3710,19 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
             ui4::query.clear();
         }
     }
+    // 1.1.3: which device is in use, for the footer's controls: a pad's button makes it the pad, a key or a click the
+    // keyboard
+    if (in.pad_pressed) {
+        ui4::pad_mode = true;
+    } else if (in.pressed) {
+        ui4::pad_mode = false;
+    } else {
+        for (uint8_t b : in.keys_pressed)
+            if (b) {
+                ui4::pad_mode = false;
+                break;
+            }
+    }
     bool keys_free = !ui4::typing && !card_open && !in.key_pressed(VK_ESCAPE);
     bool table = table_page;
     if (keys_free && table) {
@@ -3547,7 +3755,7 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
     }
 
     float t_open = std::chrono::duration<float>(Clock::now() - opened_at).count();
-    float oa = ui::ease_out(t_open / 0.3f);
+    float oa = ui::g_lite ? 1.0f : ui::ease_out(t_open / 0.3f); // 1.1.3: "Panel effects" off: no fade in
     const PageDef &page = kPages[tab];
 
     // the backdrop: the game dims behind the hub, with a red light in one corner and the page's in the other
@@ -3557,7 +3765,7 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
     ov::OpacityScope fade(p, oa);
     float pw = std::min(W - 48 * k, 1800 * k), ph = std::min(H - 40 * k, 1010 * k);
     float px = std::round((W - pw) / 2), py = std::round((H - ph) / 2);
-    float sc = 0.97f + 0.03f * ui::ease_back(t_open / 0.4f);
+    float sc = ui::g_lite ? 1.0f : 0.97f + 0.03f * ui::ease_back(t_open / 0.4f); // and no scale
     ov::push_scale(p, sc, sc, W / 2, H / 2);
 
     // the panel: tinted glass with a deep shadow
@@ -3566,8 +3774,13 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
     ov::rect_rounded_outline(p, px, py, pw, ph, 18 * k, 1 * k, 0xFFFFFF1C);
     ov::gradient(p, px + 18 * k, py, pw * 0.45f, 2 * k, ui::kRed, 0xE1060000, true);
 
-    // header: the mark and the wordmark, the window's status and the season
-    float hh = 100 * k;
+    // header: the mark and the wordmark, the window's status and the season. 1.1.3: compact when space is short (720p
+    // and smaller, or the "Large" panel size): one line, a thinner ticker and footer and a narrower menu
+    bool compact = H < 900 || d.scale > 1.05f;
+    float hh = compact ? 62 * k : 100 * k;
+    if (compact)
+        draw_header_compact(p, d, px, py, pw, hh, k);
+    else {
     {
         ov::ClipScope clip(p, px, py, pw, hh);
         ui::hatch(p, px + pw * 0.3f, py, pw * 0.7f, hh, k, 0xFFFFFF06, 9 * k);
@@ -3594,7 +3807,11 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
         // the season, on the right
         float rx = px + pw - 32 * k;
         char season[16];
-        std::snprintf(season, sizeof season, "%d", d.year);
+        // 1.1.3: while Progressive's real year is unknown, no year, no window and no season bar: just the wait
+        if (d.waiting_year)
+            std::snprintf(season, sizeof season, "%s", "\xE2\x80\x94"); // an em dash: no year yet
+        else
+            std::snprintf(season, sizeof season, "%d", d.year);
         ov::TextStyle ys = ui::lifted(ui::ts(40 * k, ui::kText, ov::align::right | ov::align::top, 1.5f * k), k);
         ov::text(p, rx, py + 34 * k, ys, season);
         float yw = ui::text_w(p, ys, season);
@@ -3602,12 +3819,16 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
         float lx = rx - std::max(yw, 90 * k) - 26 * k;
         ov::rect(p, lx, py + 24 * k, 1 * k, 52 * k, 0xFFFFFF18);
         // the transfer window: open while the season runs, closed once the grid is final
-        const char *status = d.finalised  ? T("PARRILLA CERRADA", "GRID CONFIRMED")
-                             : d.real     ? T("TEMPORADA REAL", "THE REAL SEASON")
-                             : d.deadline ? "DEADLINE DAY"
-                                          : T("MERCADO ABIERTO", "TRANSFER WINDOW OPEN");
+        const char *status = d.waiting_year     ? T("LEYENDO LA TEMPORADA REAL", "READING THE REAL SEASON")
+                             : d.open_seats > 0 ? T("PENDIENTE DE CONFIRMAR", "PENDING CONFIRMATION")
+                             : d.finalised      ? (d.real ? T("PARRILLA CERRADA", "GRID CONFIRMED") : T("PARRILLA PREVISTA", "PROJECTED GRID"))
+                             : d.real           ? T("TEMPORADA REAL", "THE REAL SEASON")
+                             : d.deadline   ? "DEADLINE DAY"
+                                            : T("MERCADO ABIERTO", "TRANSFER WINDOW OPEN");
         char sub[48];
-        if (d.deadline && !d.finalised)
+        if (d.waiting_year)
+            std::snprintf(sub, sizeof sub, "%s", T("EL MERCADO ABRE EN TEAM HQ", "THE MARKET OPENS AT TEAM HQ"));
+        else if (d.deadline && !d.finalised)
             std::snprintf(sub, sizeof sub, "%s", d.deadline == 1 ? T("ÚLTIMA CARRERA", "LAST RACE") : T("QUEDAN 2 CARRERAS", "2 RACES LEFT"));
         else
             std::snprintf(sub, sizeof sub, "%s %d", d.real ? T("LA HISTORIA HACIA", "THE STORY TO") : T("FICHAJES PARA", "MOVES FOR"),
@@ -3617,8 +3838,8 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
         float bx = lx - 26 * k - sw_ - 40 * k, bw = sw_ + 40 * k + 14 * k;
         ov::rect_rounded(p, bx, py + 24 * k, bw, 52 * k, 10 * k, 0xFFFFFF08);
         ov::rect_rounded_outline(p, bx, py + 24 * k, bw, 52 * k, 10 * k, 1 * k, 0xFFFFFF14);
-        uint32_t scol = d.finalised ? ui::kGold : d.deadline ? ui::kRed : ui::kGreen;
-        if (d.deadline && !d.finalised) {
+        uint32_t scol = d.waiting_year ? ui::kAmber : d.finalised ? ui::kGold : d.deadline ? ui::kRed : ui::kGreen;
+        if (d.deadline && !d.finalised && !d.waiting_year) {
             // deadline day: the chip burns red and pulses
             ov::rect_rounded(p, bx, py + 24 * k, bw, 52 * k, 10 * k, ui::alpha(0xE1060000 | 0x30, 0.5f + 0.5f * ui::pulse(1.1f)));
             ov::rect_rounded_outline(p, bx, py + 24 * k, bw, 52 * k, 10 * k, 1.2f * k, 0xE10600C0);
@@ -3632,37 +3853,43 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
         ov::text(p, bx + bw - 14 * k, py + 55 * k, ui::ts(11.5f * k, ui::kMuted, ov::align::right | ov::align::top, 1.8f * k), sub);
         // the season bar, between the wordmark and the window's status, when there's room for it
         float sbx = px + 560 * k, sbw = bx - 40 * k - sbx;
-        if (sbw >= 260 * k)
+        if (sbw >= 260 * k && !d.waiting_year)
             draw_season_bar(p, d, sbx, py + 30 * k, std::min(sbw, 700 * k), k);
     }
-    float tk_h = 40 * k, body_top = py + hh + tk_h;
+    }
+    float tk_h = compact ? 28 * k : 40 * k, body_top = py + hh + tk_h;
     draw_ticker(p, d, px, py + hh, pw, tk_h, k);
 
     // the footer: the controls and where you are
-    float fh = 50 * k, fy = py + ph - fh;
+    float fh = compact ? 36 * k : 50 * k, fy = py + ph - fh;
     {
         ov::ClipScope clip(p, px, fy, pw, fh);
         ov::rect_rounded(p, px, fy - 20 * k, pw, fh + 20 * k, 18 * k, 0x00000036);
         ov::rect(p, px, fy, pw, 1 * k, 0xFFFFFF10);
         ov::TextStyle hs = ui::ts(13 * k, ui::kText2, ov::align::left | ov::align::middle, 0.4f * k);
         float x = px + 28 * k, cy = fy + fh / 2 - 12 * k;
-        auto hint = [&](std::initializer_list<const char *> keys, const char *what) {
-            for (const char *key : keys)
+        if (compact)
+            cy = fy + fh / 2 - 11 * k;
+        // 1.1.3: the keys of the device in use only (a pad's buttons once a pad was used, the keyboard's otherwise)
+        bool pad = ui4::pad_mode;
+        auto hint = [&](std::initializer_list<const char *> keys, std::initializer_list<const char *> buttons, const char *what) {
+            for (const char *key : pad ? buttons : keys)
                 x += ui::keycap(p, x, cy, key, k) + 4 * k;
             x += 6 * k;
             ov::text(p, x, cy + 12 * k, hs, what);
-            x += ui::text_w(p, hs, what) + 28 * k;
+            x += ui::text_w(p, hs, what) + (compact ? 20 * k : 28 * k);
         };
-        hint({"Q", "E", "LB", "RB"}, T("cambiar de página", "change page"));
-        hint({T("Arriba", "Up"), T("Abajo", "Down")}, ui4::rows_last > 0 ? T("elegir", "pick") : T("desplazar", "scroll"));
+        hint({"Q", "E"}, {"LB", "RB"}, T("cambiar de página", "change page"));
+        hint({T("Arriba", "Up"), T("Abajo", "Down")}, {T("Arriba", "Up"), T("Abajo", "Down")},
+             ui4::rows_last > 0 ? T("elegir", "pick") : T("desplazar", "scroll"));
         if (tab == P_PRESS && d.press_pending)
-            hint({"1", "2", "3"}, T("responder", "answer"));
+            hint({"1", "2", "3"}, {"A"}, T("responder", "answer"));
         if (table_page)
-            hint({"/", "S", "F"}, T("buscar, ordenar, filtrar", "search, sort, filter"));
+            hint({"/", "S", "F"}, {"X", "Y"}, pad ? T("ordenar, filtrar", "sort, filter") : T("buscar, ordenar, filtrar", "search, sort, filter"));
         else
-            hint({"/", "Y"}, T("buscar a cualquiera", "find anyone"));
-        hint({"Enter", "A"}, T("ficha", "details"));
-        hint({"F7", "Esc", "B"}, T("cerrar", "close"));
+            hint({"/"}, {"Y"}, T("buscar a cualquiera", "find anyone"));
+        hint({"Enter"}, {"A"}, T("ficha", "details"));
+        hint({panel_key_label(), "Esc"}, {"B"}, T("cerrar", "close"));
         // page dots
         float dx = px + pw - 30 * k;
         for (int i = kPageCount - 1; i >= 0; --i) {
@@ -3677,14 +3904,14 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
     }
 
     // the side menu, in groups, with a highlight that slides to the open page
-    float sw = 292 * k, menu_top = body_top + 16 * k;
+    float sw = compact ? 228 * k : 292 * k, menu_top = body_top + (compact ? 10 * k : 16 * k);
     ov::rect(p, px, body_top, sw, fy - body_top, 0x0000001E);
     ov::rect(p, px + sw, body_top, 1 * k, fy - body_top, 0xFFFFFF10);
     float item_y[kPageCount];
     // the items' spacing: 44 px, closer together when the pages don't fit the panel's height (17 pages at 1080p)
     constexpr int kGroupCount = static_cast<int>(std::size(kGroups));
     float heads = kGroupCount * 22 * k + (kGroupCount - 1) * 10 * k;
-    float step = std::clamp((fy - 12 * k - menu_top - heads) / kPageCount, 30 * k, 44 * k);
+    float step = std::clamp((fy - 12 * k - menu_top - heads) / kPageCount, compact ? 26 * k : 30 * k, compact ? 36 * k : 44 * k);
     {
         float y = menu_top;
         int g = 0;
@@ -3720,15 +3947,17 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
         if (hov && !on)
             ov::rect_rounded(p, ix, iy, iw, ih, 9 * k, 0xFFFFFF0A);
         uint32_t col = on ? ui::kText : hov ? 0xD8DAE2FF : ui::kText2;
-        float tx = ix + 12 * k, ty = iy + ih / 2 - 15 * k;
+        float box = compact ? 24 * k : 30 * k; // 1.1.3: compact: a smaller icon box and label
+        float tx = ix + 12 * k, ty = iy + ih / 2 - box / 2;
         if (on) {
-            ov::rect_rounded(p, tx, ty, 30 * k, 30 * k, 8 * k, ui::kRed);
-            ov::rect_rounded(p, tx, ty, 30 * k, 14 * k, 8 * k, 0xFFFFFF1A);
+            ov::rect_rounded(p, tx, ty, box, box, 8 * k, ui::kRed);
+            ov::rect_rounded(p, tx, ty, box, box * 0.47f, 8 * k, 0xFFFFFF1A);
         } else {
-            ov::rect_rounded(p, tx, ty, 30 * k, 30 * k, 8 * k, hov ? 0xFFFFFF16 : 0xFFFFFF09);
+            ov::rect_rounded(p, tx, ty, box, box, 8 * k, hov ? 0xFFFFFF16 : 0xFFFFFF09);
         }
-        ui::icon(p, kPages[i].icon, tx + 15 * k, ty + 15 * k, 16 * k, on ? 0xFFFFFFFF : col, k * 0.9f);
-        ov::text(p, tx + 44 * k, iy + ih / 2, ui::ts(16.5f * k, col, ov::align::left | ov::align::middle, 0.2f * k), T(kPages[i].es, kPages[i].en));
+        ui::icon(p, kPages[i].icon, tx + box / 2, ty + box / 2, box * 0.53f, on ? 0xFFFFFFFF : col, k * 0.9f);
+        ov::text(p, tx + box + 14 * k, iy + ih / 2, ui::ts(compact ? 14 * k : 16.5f * k, col, ov::align::left | ov::align::middle, 0.2f * k),
+                 T(kPages[i].es, kPages[i].en));
         // badges: unread news, a waiting question, open rumours
         std::string badge;
         uint32_t bcol = ui::kRed;
@@ -3752,6 +3981,8 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
                     badge = "P" + std::to_string(r + 1), bcol = 0x3A3D4AFF;
                     break;
                 }
+        if (d.waiting_year)
+            badge.clear(); // 1.1.3: no market numbers while the real year is read
         if (!badge.empty()) {
             ov::TextStyle bs = ui::ts(12 * k, bcol == ui::kAmber ? 0x111111FF : ui::kText, ov::align::center | ov::align::middle);
             float bw = std::max(22 * k, ui::text_w(p, bs, badge) + 12 * k);
@@ -3887,7 +4118,11 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
         float slide = ui::g_lite ? 0.0f : (1 - ui::ease_out(t_tab / 0.3f)) * 48 * k * static_cast<float>(tab_dir);
         if (slide != 0)
             ov::push_translate(p, slide, 0);
-        switch (tab) {
+        if (d.waiting_year)
+            h = empty_state(c, y0, ui::Icon::history, T("Leyendo la temporada real", "Reading the real season"),
+                            T("Silly Season reconoce el año en la próxima visita a Team HQ y entonces se abre el mercado.",
+                              "Silly Season tells the year at your next Team HQ visit, and the market opens then."));
+        else switch (tab) {
         case P_PADDOCK: h = page_paddock(c, y0); break;
         case P_NEWS: h = page_news(c, y0); break;
         case P_PRESS: h = page_press(c, y0, in); break;
@@ -3910,6 +4145,10 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
         if (slide != 0)
             ov::pop_transform(p);
         content_h = h + 16 * k;
+        if (ui4::story_scroll && tab == P_NEWS && ui4::story_y >= 0) { // 1.1.3: to the report's story, once
+            scroll_target = std::max(0.0f, ui4::story_y - 24 * k);
+            ui4::story_scroll = false;
+        }
         // the picked row stays in view
         ui4::rows_last = ui4::rows.size();
         if (!card_open)

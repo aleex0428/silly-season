@@ -21,6 +21,7 @@ int report_shown = 0;  // the race report already shown (its id)
 int awards_local = 0;  // the season whose ceremony this session showed (until the flow thread saves it)
 int cover_local = 0;
 int press_answered = -1; // the answer just picked on screen (shown for a moment)
+int generation_seen = -1; // 1.1.3: the career generation (g_ov_generation) the remembered state belongs to
 Clock::time_point press_answered_at;
 
 float secs(Clock::time_point t) { return std::chrono::duration<float>(Clock::now() - t).count(); }
@@ -101,6 +102,61 @@ void backdrop(ov::Paint *p, float W, float H, float k, float a, uint32_t light)
     ui::hatch(p, 0, 0, W, H, k, ui::alpha(0xFFFFFF04, a), 14 * k);
 }
 
+// ----- 1.1.3: the frame, the header and the timing every small overlay shares ----------------------------------------
+// (the race report, the alert, the Team HQ card and the press question each had their own fill, border, top line,
+// corner and entrance)
+
+constexpr float kEnter = 0.42f, kLeave = 0.5f; // seconds in and out, the same for every one
+
+// how present an overlay is: 0 -> 1 over kEnter, 1 while it holds, 1 -> 0 over kLeave after `hold` seconds
+float presence(float t, float hold)
+{
+    if (ui::g_lite) // "Panel effects" off: on and off, no fade or slide
+        return t >= 0 && t <= hold + kLeave * 0.5f ? 1.0f : 0.0f;
+    float a = ui::ease_out(t / kEnter);
+    if (t > hold)
+        a *= 1 - ui::ease_out((t - hold) / kLeave);
+    return std::clamp(a, 0.0f, 1.0f);
+}
+
+// the panel of a small overlay: its shadow, a dark glass fill with a breath of the accent from the top left, a
+// hairline border, the accent line along the top and, for a team's story, the team's livery behind the left side
+void frame(ov::Paint *p, float x, float y, float w, float h, float k, uint32_t accent, uint32_t team_col = 0)
+{
+    float r = ui::radius::panel * k;
+    ui::shadow(p, x, y, w, h, k, 1.6f);
+    ov::gradient(p, x, y, w, h, 0x181922F5, 0x0D0E13F5, false, r);
+    {
+        ov::ClipScope clip(p, x, y, w, h);
+        if (team_col) {
+            ui::livery(p, x, y, w * 0.34f, h, team_col, k, 0.65f, r);
+            ov::gradient(p, x + w * 0.14f, y, w * 0.22f, h, 0x18192200, 0x181922F5, true);
+        }
+        ui::glow(p, x + w * 0.12f, y, std::max(w, h) * 0.55f, ui::alpha(accent, 0.16f)); // soft: no edge where it ends
+        ui::hatch(p, x + w * 0.62f, y, w * 0.38f, h, k, 0xFFFFFF04, 10 * k);
+    }
+    ov::rect_rounded_outline(p, x, y, w, h, r, 1 * k, 0xFFFFFF1C);
+    ov::gradient(p, x + r, y, (w - 2 * r) * 0.6f, 3 * k, accent, ui::alpha(accent, 0.0f), true);
+}
+
+// the header line of a small overlay: the mark, a caption in capitals, and whatever the caller puts on the right;
+// returns the height it takes
+float head(ov::Paint *p, float x, float y, float w, float k, std::string_view caption)
+{
+    (void)w;
+    ui::logo(p, x + ui::space::l * k, y + ui::space::l * k, 22 * k, k);
+    ov::text(p, x + 56 * k, y + 27 * k, ui::ts(13.5f * k, ui::kText, ov::align::left | ov::align::middle, 1.8f * k), caption);
+    return 50 * k;
+}
+
+// the footer line of a small overlay: a key and what it does, and the time it has left as a line along the bottom
+void foot(ov::Paint *p, float x, float y, float w, float h, float k, std::string_view key, std::string_view what, float left, uint32_t accent)
+{
+    if (!key.empty())
+        ui::hint(p, x + ui::space::l * k, y + h - 26 * k, key, what, k);
+    time_left(p, x, y + h - 3 * k, w, k, left, accent);
+}
+
 // the "skip" keys of a full-screen overlay
 bool skip_pressed(const ov::Input &in)
 {
@@ -145,7 +201,7 @@ void draw_banner(ov::Paint *p)
     const UiDriverCard *who = banner.driver.empty() ? nullptr : g_ov.card(banner.driver);
     std::string text = banner.body;
     if (press)
-        text += es ? "   (F7 para responder)" : "   (F7 to answer)";
+        text += std::string("   (") + panel_key_label() + (es ? " para responder)" : " to answer)");
     float logo_w = 104 * k;
     ov::TextStyle body = ui::ts(19 * k, 0xDDDFE6FF, ov::align::left | ov::align::top, 0, w - logo_w - 2 * pad - 12 * k);
     body.line_height = 1.3f;
@@ -241,15 +297,21 @@ void draw_banner(ov::Paint *p)
         }
     }
     // the kind and the brand on a white strip next to it, the team's chip at its end
+    // 1.1.3: the strip is the same dark glass as the story under it, with the kind in its own colour (a white strip
+    // made a third style of label next to the red one and the team's chip)
     if (a_strip > 0) {
         ov::OpacityScope sf(p, a_strip);
-        ov::TextStyle ks = ui::ts(14.5f * k, 0x111218FF, ov::align::left | ov::align::middle, 1.6f * k);
-        std::string kind_text = std::string("SILLY SEASON  ·  ") + (es ? kind.es : kind.en);
-        float kw = ui::text_w(p, ks, kind_text) + 40 * k;
+        ov::TextStyle bs = ui::ts(13 * k, ui::kText2, ov::align::left | ov::align::middle, 1.6f * k);
+        ov::TextStyle ks = ui::ts(13.5f * k, ui::shade(accent, 1.25f), ov::align::left | ov::align::middle, 1.6f * k);
+        std::string brand = "SILLY SEASON", kind_text = es ? kind.es : kind.en;
+        float bw = ui::text_w(p, bs, brand), kw = bw + 26 * k + ui::text_w(p, ks, kind_text) + 40 * k;
         float sx = x + logo_w + lw + 2 * k + slide(a_strip);
-        ui::para(p, sx, y + 6 * k, kw + 14 * k, tag_h - 6 * k, 12 * k, 0xF2F3F7FF);
+        ui::para(p, sx, y + 6 * k, kw + 14 * k, tag_h - 6 * k, 12 * k, 0x15161FF0);
+        ui::para(p, sx, y + 6 * k, kw + 14 * k, 1.2f * k, 0, ui::alpha(accent, 0.6f));
         ui::para(p, sx + kw - 2 * k, y + 6 * k, 14 * k, tag_h - 6 * k, 12 * k, accent);
-        ov::text(p, sx + 22 * k, y + tag_h / 2 + 3 * k, ks, kind_text);
+        ov::text(p, sx + 22 * k, y + tag_h / 2 + 3 * k, bs, brand);
+        ui::para(p, sx + 22 * k + bw + 9 * k, y + tag_h / 2 - 3 * k, 5 * k, 10 * k, 3 * k, accent);
+        ov::text(p, sx + 22 * k + bw + 22 * k, y + tag_h / 2 + 3 * k, ks, kind_text);
         if (team)
             ui::team_chip(p, sx + kw + 24 * k, y + 10 * k, team->code, team->col, k, 26);
     }
@@ -470,24 +532,27 @@ bool draw_press_popup(ov::Paint *p, const ov::Input &in)
     if (answered && answers.empty())
         answers.push_back(paint_state::answered_a);
     float qh = ui::text_h(p, q, question);
-    float h = 70 * k + qh + 24 * k + static_cast<float>(std::min<size_t>(answers.size(), 3)) * 46 * k + 34 * k;
+    float h = 70 * k + qh + 24 * k + static_cast<float>(std::min<size_t>(answers.size(), 3)) * 46 * k + 48 * k;
     float x = safe.x + (safe.w - w) / 2, y = safe.y + safe.h - h - 80 * k;
-    float a = ui::ease_out(t / 0.5f), out = answered ? ui::ease_out((end - 1.1f) / 0.5f) : t > 24.4f ? (t - 24.4f) / 0.6f : 0.0f;
-    ov::OpacityScope fade(p, a * (1 - std::clamp(out, 0.0f, 1.0f)));
-    ov::push_translate(p, 0, (1 - a) * 40 * k);
-    ui::shadow(p, x, y, w, h, k, 2.0f);
-    ov::gradient(p, x, y, w, h, 0x1B1810F6, 0x0D0C09F6, false, 16 * k);
+    // 1.1.3: the same frame, timing and entrance as the other small overlays (it rises from below: it sits low, centred)
+    // 1.1.3: "Panel effects" off: on and off, no slide, no fade of the confirmation
+    float a = answered ? (ui::g_lite ? 1.0f : ovl::presence(t, 1e9f) * (1 - ui::ease_out((end - 1.1f) / ovl::kLeave)))
+                       : ovl::presence(t, 24.4f);
+    ov::OpacityScope fade(p, std::clamp(a, 0.0f, 1.0f));
+    ov::push_translate(p, 0, ui::g_lite ? 0.0f : (1 - ui::ease_out(t / ovl::kEnter)) * 40 * k);
+    ovl::frame(p, x, y, w, h, k, ui::kAmber);
     {
         ov::ClipScope clip(p, x, y, w, h);
-        ov::gradient(p, x, y, w * 0.7f, h, 0xFFB02020, 0xFFB02000, true);
-        ui::glow(p, x + 60 * k, y + 50 * k, 200 * k, 0xFFB02040);
+        ui::glow(p, x + 60 * k, y + 50 * k, 200 * k, 0xFFB02030);
         ov::text(p, x + w - 30 * k, y - 40 * k, ui::ts(240 * k, 0xFFFFFF0A, ov::align::right | ov::align::top), "\xE2\x80\x9D");
     }
-    ov::rect_rounded_outline(p, x, y, w, h, 16 * k, 1.2f * k, ui::alpha(ui::kAmber, 0.5f + 0.3f * ui::pulse(1.6f)));
-    // the microphone, live
+    ov::rect_rounded_outline(p, x, y, w, h, ui::radius::panel * k, 1.2f * k,
+                             ui::alpha(ui::kAmber, ui::g_lite ? 0.5f : 0.35f + 0.3f * ui::pulse(1.6f)));
+    // the microphone, live (still with "Panel effects" off)
     ov::circle(p, x + 52 * k, y + 46 * k, 26 * k, 0x1A1408FF);
     ov::circle_outline(p, x + 52 * k, y + 46 * k, 26 * k, 2 * k, ui::kAmber);
-    ov::arc(p, x + 52 * k, y + 46 * k, 33 * k, ui::clock_s() * 1.3f, ui::clock_s() * 1.3f + 1.2f, 2 * k, 0xFFB02090);
+    float spin = ui::g_lite ? 0.0f : ui::clock_s() * 1.3f;
+    ov::arc(p, x + 52 * k, y + 46 * k, 33 * k, spin, spin + 1.2f, 2 * k, 0xFFB02090);
     ui::icon(p, ui::Icon::press, x + 52 * k, y + 46 * k, 22 * k, ui::kAmber, k);
     ui::tag(p, x + 96 * k, y + 22 * k, es ? "RUEDA DE PRENSA" : "PRESS CONFERENCE", ui::kAmber, k, 12, true);
     ov::text(p, x + 96 * k, y + 60 * k, q, question);
@@ -504,10 +569,23 @@ bool draw_press_popup(ov::Paint *p, const ov::Input &in)
                  ui::fit(p, ui::ts(17 * k), answers[i], rw - kw - 20 * k));
         ay += 46 * k;
     }
-    ov::text(p, x + w - 24 * k, y + h - 24 * k, ui::ts(13 * k, ui::kMuted, ov::align::right | ov::align::middle, 0.6f * k),
-             answered ? (es ? "Respuesta enviada" : "Answer sent") : (es ? "1 · 2 · 3  responder   ·   F7  abrir el panel" : "1 · 2 · 3  answer   ·   F7  open the panel"));
-    if (!answered)
+    // the footer: the keys as key caps, as in every other overlay (answered: what happened, in green)
+    if (answered) {
+        ov::text(p, x + w - 24 * k, y + h - 24 * k, ui::ts(13 * k, ui::kGreen, ov::align::right | ov::align::middle, 0.6f * k),
+                 es ? "Respuesta enviada" : "Answer sent");
+    } else {
+        float fx = x + w - 24 * k;
+        ov::TextStyle hs = ui::ts(ui::type::note * k, ui::kText2, ov::align::left | ov::align::middle, 0.2f * k);
+        std::string open = es ? "abrir el panel" : "open the panel", reply = es ? "responder" : "answer";
+        float wo = ui::text_w(p, hs, open) + ui::space::s * k + std::max(26 * k, ui::text_w(p, ui::ts(12.5f * k), panel_key_label()) + 14 * k);
+        float wr = ui::text_w(p, hs, reply) + ui::space::s * k + 3 * 26 * k + 2 * 4 * k;
+        float hx = fx - wo - wr - ui::space::xl * k, cy = y + h - 26 * k;
+        for (int i = 0; i < 3; ++i)
+            hx += ui::keycap(p, hx, cy - 12 * k, std::to_string(i + 1), k) + 4 * k;
+        ov::text(p, hx + ui::space::s * k - 4 * k, cy, hs, reply);
+        ui::hint(p, fx - wo, cy, panel_key_label(), open, k);
         ovl::time_left(p, x, y + h - 3 * k, w, k, 1 - t / 25.0f, ui::kAmber);
+    }
     ov::pop_transform(p);
     return true;
 }
@@ -518,45 +596,69 @@ bool draw_press_popup(ov::Paint *p, const ov::Input &in)
 bool draw_report(ov::Paint *p)
 {
     float t = ovl::secs(ovl::at);
-    constexpr float hold = 9.0f;
+    constexpr float hold = 10.0f;
     if (t > hold + 0.6f)
         return false;
     const UiReport &r = g_ov.report;
     bool es = g_ov.es;
     ov::Rect safe = ov::safe_area(p);
     float k = ov::ui_scale(p);
-    float w = 460 * k, h = 300 * k + static_cast<float>(r.headlines.size()) * 26 * k;
-    float a = ui::ease_out(t / 0.45f) * (t > hold ? 1 - (t - hold) / 0.6f : 1.0f);
-    float x = safe.x + safe.w - w - 24 * k + (1 - a) * 60 * k, y = safe.y + safe.h * 0.16f;
+    float w = 480 * k, pad = 20 * k, iw = w - 2 * pad;
+    // 1.1.3: the round's main story first, big, with the panel's key to read it; then the player's value and place,
+    // the market's three numbers and the round's other stories
+    ui::Tag tag = ui::news_tag(r.lead_kind);
+    ov::TextStyle ls = ui::ts(21 * k, ui::kText, ov::align::left | ov::align::top, 0.2f * k, iw);
+    ls.line_height = 1.18f;
+    ov::TextStyle bs = ui::ts(14 * k, ui::kText2, ov::align::left | ov::align::top, 0, iw);
+    bs.line_height = 1.3f;
+    float lead_h = 0;
+    if (!r.lead_title.empty())
+        lead_h = 30 * k + ui::text_h(p, ls, r.lead_title) + (r.lead_text.empty() ? 0 : 8 * k + ui::text_h(p, bs, r.lead_text)) + 16 * k;
+    float h = 58 * k + lead_h + 92 * k + 78 * k + static_cast<float>(r.headlines.size()) * 26 * k + 48 * k;
+    float a = ovl::presence(t, hold);
+    float x = safe.x + safe.w - w - 24 * k + (ui::g_lite ? 0 : (1 - a) * 40 * k), y = safe.y + safe.h * 0.12f;
     ov::OpacityScope fade(p, a);
-    ui::shadow(p, x, y, w, h, k, 1.6f);
-    ov::gradient(p, x, y, w, h, 0x181922F4, 0x0E0F14F4, false, 14 * k);
-    ov::rect_rounded_outline(p, x, y, w, h, 14 * k, 1 * k, 0xFFFFFF1C);
-    ov::rect(p, x + 14 * k, y, w * 0.55f, 3 * k, ui::kRed);
-    ui::logo(p, x + 18 * k, y + 16 * k, 22 * k, k);
+    ovl::frame(p, x, y, w, h, k, ui::kRed);
     char head[64];
     std::snprintf(head, sizeof head, es ? "DESPUÉS DE LA CARRERA %d / %d" : "AFTER ROUND %d / %d", r.round, r.rounds);
-    ov::text(p, x + 56 * k, y + 27 * k, ui::ts(13.5f * k, ui::kText, ov::align::left | ov::align::middle, 1.8f * k), head);
-    // the player's value and its move
-    float vy = y + 70 * k;
-    ov::text(p, x + 20 * k, vy, ui::ts(11.5f * k, ui::kMuted, ov::align::left | ov::align::top, 1.6f * k), es ? "TU VALOR" : "YOUR VALUE");
+    ovl::head(p, x, y, w, k, head);
+    float cy = y + 58 * k;
+    // the main story
+    if (lead_h > 0) {
+        ui::tag(p, x + pad, cy, es ? tag.es : tag.en, tag.col, k, 11, true);
+        cy += 30 * k;
+        ov::text(p, x + pad, cy, ui::lifted(ls, k), r.lead_title);
+        cy += ui::text_h(p, ls, r.lead_title);
+        if (!r.lead_text.empty()) {
+            cy += 8 * k;
+            ov::text(p, x + pad, cy, bs, r.lead_text);
+            cy += ui::text_h(p, bs, r.lead_text);
+        }
+        cy += 16 * k;
+        ov::rect(p, x + pad, cy - 8 * k, iw, 1 * k, 0xFFFFFF14);
+    }
+    // the player's value and its move, and his place
+    ov::text(p, x + pad, cy, ui::ts(11.5f * k, ui::kMuted, ov::align::left | ov::align::top, 1.6f * k), es ? "TU VALOR" : "YOUR VALUE");
     char v[16];
     std::snprintf(v, sizeof v, "%.1f", r.value);
-    ov::text(p, x + 20 * k, vy + 18 * k, ui::lifted(ui::ts(46 * k, ui::kText), k), v);
+    ov::text(p, x + pad, cy + 18 * k, ui::lifted(ui::ts(42 * k, ui::kText), k), v);
+    float dx = x + pad + ui::text_w(p, ui::ts(42 * k), v) + 16 * k;
     if (std::fabs(r.delta) >= 0.05f) {
         bool up = r.delta > 0;
-        float dx = x + 20 * k + ui::text_w(p, ui::ts(46 * k), v) + 18 * k;
-        ui::triangle(p, dx + 6 * k, vy + 46 * k, 7 * k, up, up ? ui::kGreen : ui::kDanger);
-        char dv[16];
+        ui::triangle(p, dx + 6 * k, cy + 44 * k, 7 * k, up, up ? ui::kGreen : ui::kDanger);
+        char dv[24];
         std::snprintf(dv, sizeof dv, "%+.1f", r.delta);
-        ov::text(p, dx + 20 * k, vy + 46 * k, ui::ts(20 * k, up ? ui::kGreen : ui::kDangerText, ov::align::left | ov::align::middle), dv);
+        ov::text(p, dx + 20 * k, cy + 44 * k, ui::ts(20 * k, up ? ui::kGreen : ui::kDangerText, ov::align::left | ov::align::middle), dv);
+    } else {
+        ov::text(p, dx, cy + 44 * k, ui::ts(13 * k, ui::kMuted, ov::align::left | ov::align::middle, 1 * k), es ? "SIN CAMBIOS" : "UNCHANGED");
     }
     if (r.position > 0) {
         char pos[16];
         std::snprintf(pos, sizeof pos, "P%d", r.position);
-        ov::text(p, x + w - 20 * k, vy + 18 * k, ui::lifted(ui::ts(40 * k, ui::kGold, ov::align::right | ov::align::top), k), pos);
-        ov::text(p, x + w - 20 * k, vy, ui::ts(11.5f * k, ui::kMuted, ov::align::right | ov::align::top, 1.6f * k), es ? "CAMPEONATO" : "CHAMPIONSHIP");
+        ov::text(p, x + w - pad, cy + 18 * k, ui::lifted(ui::ts(38 * k, ui::kGold, ov::align::right | ov::align::top), k), pos);
+        ov::text(p, x + w - pad, cy, ui::ts(11.5f * k, ui::kMuted, ov::align::right | ov::align::top, 1.6f * k), es ? "CAMPEONATO" : "CHAMPIONSHIP");
     }
+    cy += 92 * k;
     // three numbers of the market
     struct Stat {
         int v;
@@ -565,26 +667,27 @@ bool draw_report(ov::Paint *p)
     };
     const Stat stats[3] = {{r.rumours, "RUMORES", "RUMOURS", 0x8E9AAFFF}, {r.signings, "OFICIALES", "OFFICIAL", ui::kGreen},
                            {r.keen, "TE QUIEREN", "KEEN ON YOU", ui::kRed}};
-    float sy = vy + 92 * k, sw = (w - 40 * k) / 3;
+    float sw = iw / 3;
     for (int i = 0; i < 3; ++i) {
-        float sx = x + 20 * k + sw * static_cast<float>(i);
-        ov::rect_rounded(p, sx, sy, sw - 10 * k, 64 * k, 9 * k, ui::alpha(stats[i].col, 0.10f));
-        ov::rect(p, sx, sy, sw - 10 * k, 2 * k, stats[i].col);
-        ov::text(p, sx + (sw - 10 * k) / 2, sy + 26 * k, ui::ts(26 * k, ui::kText, ov::align::center | ov::align::middle),
-                 std::to_string(static_cast<int>(std::lround(stats[i].v * ui::ease_out((t - 0.3f) / 0.8f)))));
-        ov::text(p, sx + (sw - 10 * k) / 2, sy + 50 * k, ui::ts(10.5f * k, ui::kMuted, ov::align::center | ov::align::middle, 1.2f * k),
+        float sx = x + pad + sw * static_cast<float>(i);
+        ov::rect_rounded(p, sx, cy, sw - 10 * k, 58 * k, 9 * k, ui::alpha(stats[i].col, 0.10f));
+        ov::rect(p, sx, cy, sw - 10 * k, 2 * k, stats[i].col);
+        float grow = ui::g_lite ? 1.0f : ui::ease_out((t - 0.3f) / 0.8f);
+        ov::text(p, sx + (sw - 10 * k) / 2, cy + 23 * k, ui::ts(24 * k, ui::kText, ov::align::center | ov::align::middle),
+                 std::to_string(static_cast<int>(std::lround(stats[i].v * grow))));
+        ov::text(p, sx + (sw - 10 * k) / 2, cy + 45 * k, ui::ts(10.5f * k, ui::kMuted, ov::align::center | ov::align::middle, 1.2f * k),
                  es ? stats[i].es : stats[i].en);
     }
-    // the round's headlines
-    float hy = sy + 86 * k;
+    cy += 78 * k;
+    // the round's other stories
     for (const std::string &line : r.headlines) {
-        ui::para(p, x + 20 * k, hy - 5 * k, 6 * k, 10 * k, 3 * k, ui::kRed);
-        ov::text(p, x + 34 * k, hy, ui::ts(14.5f * k, ui::kText2, ov::align::left | ov::align::middle), ui::fit(p, ui::ts(14.5f * k), line, w - 54 * k));
-        hy += 26 * k;
+        ui::para(p, x + pad, cy - 5 * k, 6 * k, 10 * k, 3 * k, ui::kRed);
+        ov::text(p, x + pad + 14 * k, cy, ui::ts(14 * k, ui::kText2, ov::align::left | ov::align::middle), ui::fit(p, ui::ts(14 * k), line, iw - 14 * k));
+        cy += 26 * k;
     }
-    float kx = x + 20 * k + ui::keycap(p, x + 20 * k, y + h - 38 * k, "F7", k) + 8 * k;
-    ov::text(p, kx, y + h - 26 * k, ui::ts(13 * k, ui::kText2, ov::align::left | ov::align::middle), es ? "todo en el panel" : "everything in the panel");
-    ovl::time_left(p, x, y + h - 3 * k, w, k, 1 - t / hold, ui::kRed);
+    ovl::foot(p, x, y, w, h, k, panel_key_label(),
+              r.lead_id ? (es ? "leer la historia" : "read the story") : (es ? "todo en el panel" : "everything in the panel"), 1 - t / hold,
+              ui::kRed);
     return true;
 }
 
@@ -602,18 +705,10 @@ bool draw_alert(ov::Paint *p)
     ov::Rect safe = ov::safe_area(p);
     float k = ov::ui_scale(p);
     float w = 420 * k, h = 78 * k;
-    float a = ui::ease_out(t / 0.35f) * (t > hold ? 1 - (t - hold) / 0.5f : 1.0f);
-    float x = safe.x + safe.w - w - 24 * k, y = safe.y + 24 * k - (1 - a) * 30 * k;
+    float a = ovl::presence(t, hold);
+    float x = safe.x + safe.w - w - 24 * k + (1 - a) * 40 * k, y = safe.y + 24 * k;
     ov::OpacityScope fade(p, a);
-    uint32_t col = ui::rgb(al.col);
-    ui::shadow(p, x, y, w, h, k, 1.4f);
-    ov::gradient(p, x, y, w, h, 0x181922F4, 0x0E0F14F4, false, 12 * k);
-    {
-        ov::ClipScope clip(p, x, y, w, h);
-        ui::livery(p, x, y, 140 * k, h, al.col, k, 0.7f, 12 * k);
-        ov::gradient(p, x + 60 * k, y, 120 * k, h, 0x18192200, 0x181922F4, true);
-    }
-    ov::rect_rounded_outline(p, x, y, w, h, 12 * k, 1 * k, ui::alpha(col, 0.6f));
+    ovl::frame(p, x, y, w, h, k, ui::vivid(al.col), al.col);
     ui::team_chip(p, x + 16 * k, y + h / 2 - 13 * k, al.code, al.col, k, 26);
     ov::text(p, x + 100 * k, y + 26 * k, ui::ts(11.5f * k, ui::kText2, ov::align::left | ov::align::middle, 1.8f * k), es ? "TU FUTURO" : "YOUR FUTURE");
     std::string line = es ? al.team + " va a por ti" : al.team + " want you";
@@ -816,7 +911,8 @@ bool draw_reveal(ov::Paint *p, const ov::Input &in)
     ov::text(p, W / 2, H * 0.06f + (1 - ta) * 20 * k, ui::lifted(ui::ts(58 * k, ui::alpha(0xFFFFFFFF, ta), ov::align::center | ov::align::top, 4 * k), k, 0xE1060080),
              title);
     ov::text(p, W / 2, H * 0.06f + 74 * k, ui::ts(15 * k, ui::alpha(ui::kText2, ta), ov::align::center | ov::align::top, 3 * k),
-             d.es ? "SILLY SEASON  ·  PARRILLA CONFIRMADA" : "SILLY SEASON  ·  GRID CONFIRMED");
+             d.real ? (d.es ? "SILLY SEASON  ·  PARRILLA CONFIRMADA" : "SILLY SEASON  ·  GRID CONFIRMED")
+                    : (d.es ? "SILLY SEASON  ·  PARRILLA PREVISTA" : "SILLY SEASON  ·  PROJECTED GRID"));
     ov::gradient(p, W / 2 - 260 * k * ta, H * 0.06f + 104 * k, 520 * k * ta, 2 * k, 0xE1060000, ui::kRed, true);
     // where each driver is now, and who leaves the grid
     auto now_team = [&](const std::string &id) -> const UiTeam * {
@@ -945,19 +1041,15 @@ void draw_widget(ov::Paint *p)
     constexpr float hold = 12.0f;
     if (t > hold + 0.6f)
         return;
-    float a = ui::ease_out(t / 0.4f) * (t > hold ? 1 - (t - hold) / 0.6f : 1.0f);
+    float a = ovl::presence(t, hold);
     ov::Rect safe = ov::safe_area(p);
     float k = ov::ui_scale(p);
     size_t lines = std::min<size_t>(3, d.news.size());
     float w = 440 * k, h = 112 * k + static_cast<float>(std::max<size_t>(1, lines)) * 26 * k;
     float x = safe.x + safe.w - w - 24 * k + (1 - a) * 40 * k, y = safe.y + safe.h * 0.2f;
     ov::OpacityScope fade(p, a);
-    ui::shadow(p, x, y, w, h, k, 1.4f);
-    ov::gradient(p, x, y, w, h, 0x181922F2, 0x0E0F14F2, false, 12 * k);
-    ov::rect_rounded_outline(p, x, y, w, h, 12 * k, 1 * k, 0xFFFFFF1C);
-    ov::rect(p, x + 12 * k, y, w * 0.5f, 2 * k, ui::kRed);
-    ui::logo(p, x + 16 * k, y + 16 * k, 22 * k, k);
-    ov::text(p, x + 56 * k, y + 27 * k, ui::ts(15 * k, ui::kText, ov::align::left | ov::align::middle, 1.8f * k), "SILLY SEASON");
+    ovl::frame(p, x, y, w, h, k, ui::kRed);
+    ovl::head(p, x, y, w, k, "SILLY SEASON");
     float tx = x + w - 16 * k;
     if (d.unread > 0) {
         char b[32];
@@ -994,14 +1086,29 @@ void draw_widget(ov::Paint *p)
         ov::text(p, cx, cy, ui::ts(16 * k, ui::kText, ov::align::center | ov::align::middle), std::to_string(d.deadline));
         ov::text(p, cx, cy + 32 * k, ui::ts(9 * k, 0xFF6A63FF, ov::align::center | ov::align::middle, 1.2f * k), "DEADLINE");
     }
-    float fy = y + h - 26 * k;
-    float kx = x + 16 * k + ui::keycap(p, x + 16 * k, fy - 12 * k, "F7", k) + 8 * k;
-    ov::text(p, kx, fy, ui::ts(13 * k, ui::kText2, ov::align::left | ov::align::middle), d.es ? "abre el mercado" : "open the market hub");
+    ovl::foot(p, x, y, w, h, k, panel_key_label(), d.es ? "abre el mercado" : "open the market hub", 1 - t / hold, ui::kRed);
 }
 
 // ---------------------------------------------------------------------------------------------------
 // The manager: one overlay at a time, the most important first. Full-screen moments take the keys; the rest leave
 // them to the game. Nothing shows during a session or while the panel is open.
+
+// render thread: every remembered thing of the overlays, as when the addon loaded
+void reset_paint_state()
+{
+    ovl::current = ovl::Show::none;
+    ovl::press_shown = ovl::report_shown = ovl::awards_local = ovl::cover_local = 0;
+    ovl::press_answered = -1;
+    ovl::alert_on = false;
+    ui4::reveal_on = ui4::reveal_manual = false;
+    ui4::modal = 0;
+    ui4::modal_back.clear();
+    ui4::typing = false;
+    ui4::widget_hq = false;
+    ui4::widget_unread = -1;
+    g_board_open = false;
+    ov::focus(false);
+}
 
 void paint(ov::Paint *p, void *)
 {
@@ -1012,8 +1119,15 @@ void paint(ov::Paint *p, void *)
     dt = std::clamp(dt, 0.0f, 0.1f);
     ov::Input in = ov::input(p);
     std::lock_guard lock(g_ov_lock);
+    if (int gen = g_ov_generation.load(); gen != ovl::generation_seen) {
+        ovl::generation_seen = gen;
+        reset_paint_state();
+    }
     ui::g_lite = !g_ov.effects;
     bool usable = g_ov.career && g_ov.enabled && !g_in_session.load();
+    // 1.1.3: the F7 panel also opens while a session is paused (the pause menu), and closes when the game runs again.
+    // The other overlays still wait for Team HQ. On a core without the pause query, view::paused() is false.
+    bool panel_ok = g_ov.career && g_ov.enabled && (!g_in_session.load() || swofty::view::paused());
     bool open = g_board_open.load();
     bool hq = g_at_hq.load();
     using ovl::Show;
@@ -1037,26 +1151,36 @@ void paint(ov::Paint *p, void *)
         g_board_open = false;
         return;
     }
-    bool toggle = in.key_pressed(VK_F7) || (in.pad_held(ov::pad::back) && in.pad_hit(ov::pad::y));
+    bool toggle = in.key_pressed(panel_key_vk()) || (in.pad_held(ov::pad::back) && in.pad_hit(ov::pad::y));
     bool back = in.key_pressed(VK_ESCAPE) || in.pad_hit(ov::pad::b);
     bool inner = ui4::modal != 0 || ui4::typing; // Esc closes the card or the search first
     bool full = ovl::current == Show::awards || ovl::current == Show::cover;
-    if (open && (!usable || toggle || (back && !inner))) {
+    if (open && (!panel_ok || toggle || (back && !inner))) {
         open = false;
         ov::focus(false);
         ui4::modal = 0;
         ui4::modal_back.clear();
         ui4::typing = false;
         page_scroll[static_cast<size_t>(tab)] = scroll_target; // found where it was next time
-    } else if (!open && usable && toggle && !full) {
+    } else if (!open && panel_ok && toggle && !full) {
         open = true;
         ov::focus(true);
         scroll = scroll_target = page_scroll[static_cast<size_t>(tab)];
         press_sel = 0;
         menu_y = -1;
         opened_at = tab_at = now;
-        // a waiting question opens on the press page
-        if (g_ov.press_pending) {
+        ui4::story_focus = 0;
+        // 1.1.3: from the race report: straight to its main story on the News page
+        if (ovl::current == Show::report && g_ov.report.lead_id) {
+            tab = P_NEWS;
+            scroll = scroll_target = 0;
+            ui4::story_focus = g_ov.report.lead_id;
+            ui4::story_scroll = true;
+            ui4::story_y = -1;
+            ovl::current = Show::none;
+        }
+        // a waiting question opens on the press page (unless the race report sent the player to its story)
+        if (g_ov.press_pending && !ui4::story_focus) {
             tab = P_PRESS;
             scroll = scroll_target = 0;
         }
@@ -1074,7 +1198,7 @@ void paint(ov::Paint *p, void *)
         }
         return;
     }
-    if (!usable) {
+    if (!usable || g_ov.waiting_year) { // 1.1.3: nothing from the baseline's market while the real year is unknown
         if (full)
             ov::focus(false);
         ovl::current = Show::none;

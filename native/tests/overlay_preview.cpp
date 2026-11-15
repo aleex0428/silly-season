@@ -450,6 +450,13 @@ int main(int argc, char **argv)
         if (!d.team.empty() && id != "player" && !d.regen)
             ss::observe_game_ratings(g_state, id, std::min(99.0f, d.overall() + 2.0f), d.experience, d.racecraft,
                                      60.0f + static_cast<float>(id.size() % 30), d.awareness, d.pace);
+    // what the game's telemetry would have counted on track (1.1.3)
+    for (auto &[id, d] : g_state.drivers)
+        if (!d.team.empty()) {
+            d.s_overtakes = static_cast<float>(id.size() % 17);
+            d.s_incidents = static_cast<float>(id.size() % 4);
+            d.s_failures = static_cast<float>(id.size() % 3 == 0 ? 1 : 0);
+        }
     ss::season_preview(g_state, s);
     uint64_t seed = 7;
     for (int r = 1; r <= rounds; ++r) {
@@ -586,8 +593,28 @@ int main(int argc, char **argv)
         ovl::at = Clock::now() - std::chrono::milliseconds(1800);
         shot("strip.svg", [&] { draw_strip(reinterpret_cast<ov::Paint *>(1)); });
         g_ov.report = {1, g_ov.round, g_ov.rounds, 14, 3, 2, 1, 71.4f, 0.8f, {}};
-        for (size_t i = 0; i < g_ov.news.size() && i < 3; ++i)
-            g_ov.report.headlines.push_back(g_ov.news[i].title);
+        // 1.1.3: the round's main story on top (the newest signing, else the newest story), two more below
+        {
+            const UiNews *lead = nullptr;
+            for (const UiNews &x : g_ov.news)
+                if (x.kind == "official") {
+                    lead = &x;
+                    break;
+                }
+            if (!lead && !g_ov.news.empty())
+                lead = &g_ov.news.front();
+            if (lead) {
+                g_ov.report.lead_id = lead->id;
+                g_ov.report.lead_kind = lead->kind;
+                g_ov.report.lead_title = lead->title;
+                std::string line = lead->body.substr(0, lead->body.find('\n'));
+                size_t end = line.find(". ");
+                g_ov.report.lead_text = end == std::string::npos ? line : line.substr(0, end + 1);
+            }
+            for (const UiNews &x : g_ov.news)
+                if ((!lead || x.id != lead->id) && g_ov.report.headlines.size() < 2)
+                    g_ov.report.headlines.push_back(x.title);
+        }
         ovl::at = Clock::now() - std::chrono::milliseconds(2500);
         shot("report.svg", [&] { draw_report(reinterpret_cast<ov::Paint *>(1)); });
         {
@@ -631,7 +658,9 @@ int main(int argc, char **argv)
     ss::NewsItem n;
     n.kind = "official";
     n.driver = "carlos_sainz-jr";
-    n.to = g_ov.teams.size() > 2 ? g_ov.teams[2].id : std::string();
+    for (const UiTeam &t : g_ov.teams) // the team the story names (Ferrari), so the chip and the livery match the text
+        if (t.code == "FER")
+            n.to = t.id;
     n.title = lang == "en" ? "OFFICIAL: NEW SIGNING" : "OFICIAL: NUEVO FICHAJE";
     n.body = lang == "en" ? "Carlos Sainz joins Ferrari from Williams on a deal until 2027. The team calls it \"the missing piece\"."
                           : "Carlos Sainz ficha por Ferrari desde Williams con contrato hasta 2027. El equipo lo llama \"la pieza que faltaba\".";
@@ -644,6 +673,35 @@ int main(int argc, char **argv)
     preview::begin();
     draw_banner(reinterpret_cast<ov::Paint *>(1));
     preview::save(dir / "banner.svg");
+    // 1.1.3: the compact panel (720p, and the "Large" size at 1080p) on the pages with long lists, and the header while
+    // Progressive's real year is being read
+    auto hub_shot = [&](int page, float w, float h, float scale, bool waiting, const char *file) {
+        preview::W = w;
+        preview::H = h;
+        float was_scale = g_ov.scale;
+        bool was_waiting = g_ov.waiting_year;
+        g_ov.scale = scale;
+        g_ov.waiting_year = waiting;
+        preview::begin();
+        tab = page;
+        menu_y = -1;
+        scroll = scroll_target = 0;
+        opened_at = tab_at = past;
+        preview::mouse_x = preview::mouse_y = -1;
+        draw_board(reinterpret_cast<ov::Paint *>(1), in, 0.016f);
+        preview::save(dir / file);
+        g_ov.scale = was_scale;
+        g_ov.waiting_year = was_waiting;
+        preview::W = 1920;
+        preview::H = 1080;
+    };
+    hub_shot(P_DRIVERS, 1280, 720, 1.0f, false, "hub_720_drivers.svg");
+    hub_shot(P_RUMOURS, 1280, 720, 1.0f, false, "hub_720_rumours.svg");
+    hub_shot(P_STANDINGS, 1280, 720, 1.0f, false, "hub_720_standings.svg");
+    hub_shot(P_DRIVERS, 1920, 1080, 1.12f, false, "hub_large_drivers.svg");
+    hub_shot(P_STANDINGS, 1920, 1080, 1.12f, false, "hub_large_standings.svg");
+    hub_shot(P_PADDOCK, 1920, 1080, 1.0f, true, "hub_waiting_year.svg");
+    hub_shot(P_PADDOCK, 1280, 720, 1.0f, true, "hub_720_waiting_year.svg");
     std::printf("wrote %d hub pages and the banner to %s\n", kPageCount, dir.string().c_str());
     return 0;
 }

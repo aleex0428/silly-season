@@ -4,10 +4,11 @@
 
 namespace {
 
-// the player has seen this item: in a popup, the banner or the panel
+// the player has seen this item: in a popup, the banner or the panel. 1.1.3 (15 Nov): the banner marks the items it
+// shows (NewsItem::shown); how far it looked through the news (banner_news) says nothing of the ones it left out.
 bool news_seen(const State &st, const NewsItem &n)
 {
-    return n.shown || n.id <= st.seen_news || n.id <= st.banner_news;
+    return n.shown || n.id <= st.seen_news;
 }
 
 // the grid item of the last winter, told again from the seats the market holds now (the game's), while unseen
@@ -60,11 +61,13 @@ void refresh_season_summary(State &st)
 
 } // namespace
 
-bool season_change_refused(State &st, const std::string &team, const std::string &driver)
+bool season_change_refused(State &st, const std::string &team, const std::string &driver, bool in_game)
 {
-    const Driver *d = st.driver(driver);
-    if (d && d->team == team)
+    // 1.1.3: what a read of the game's rows says, never the market's own grid (which may still hold the plan when the
+    // rows couldn't be read again)
+    if (in_game)
         return false; // the game has him in that car after all
+    const Driver *d = st.driver(driver);
     bool told = false;
     for (auto it = st.news.end(); it != st.news.begin();) {
         --it;
@@ -197,4 +200,102 @@ bool observe_game_ratings(State &st, const std::string &driver, float overall, f
     d->pace_peak = std::max(d->pace_peak, pace);
     d->ratings_seen = true;
     return true;
+}
+
+void apply_track_events(State &st, const Settings &s, const std::vector<TrackEvent> &events, int round)
+{
+    if (!s.on_track || events.empty() || round <= 0)
+        return;
+    // 1.1.3: this race came with the game's telemetry: every driver who raced it has data now (a card tells "0
+    // incidents" from "no data yet")
+    st.track_rounds += 1;
+    for (const Team &t : st.teams)
+        for (const std::string &who : t.seats)
+            if (Driver *d = st.driver(who))
+                d->s_track_rounds += 1;
+    if (!st.player.empty())
+        if (Driver *p = st.driver(st.player); p && p->team.empty())
+            p->s_track_rounds += 1; // the player in his own My Team team
+    std::map<std::string, float> form; // this race's nudge per driver, kept small
+    for (const TrackEvent &e : events) {
+        Driver *a = st.driver(e.a), *b = st.driver(e.b);
+        if (e.kind == "overtake" && a && b) {
+            a->s_overtakes += 1;
+            b->s_overtaken += 1;
+            form[a->id] += 0.01f;
+        } else if (e.kind == "collision") {
+            for (Driver *d : {a, b})
+                if (d) {
+                    d->s_incidents += 1;
+                    form[d->id] -= 0.03f;
+                }
+        } else if (e.kind == "retirement" && a && e.reason == 8) {
+            a->s_failures += 1;
+            a->failed_round = round;
+            if (Team *t = st.team(a->team)) {
+                int failures = 0;
+                for (const std::string &who : t->seats)
+                    if (const Driver *x = st.driver(who))
+                        failures += static_cast<int>(x->s_failures);
+                std::string key = "reliability|" + t->id + "|" + std::to_string(failures >= 5 ? 5 : 3);
+                if (failures >= 3 && !st.track_told.count(key)) {
+                    st.track_told.insert(key);
+                    std::string tn = t->name;
+                    add_news(st, round, "reliability", [&](text::Lang l) { return text::h_reliability(l, tn); },
+                             [&](text::Lang l) { return text::reliability(l, tn, failures); }, false);
+                    tag_news(st, "", t->id);
+                }
+            }
+        }
+    }
+    for (const auto &[id, f] : form)
+        if (Driver *d = st.driver(id))
+            d->form = clampf(d->form + clampf(f, -0.08f, 0.05f), -1, 1);
+    // incident-prone: a story at the third and the fifth incident of the season (not the player's own)
+    for (auto &[id, d] : st.drivers) {
+        if (id == st.player || d.team.empty())
+            continue;
+        for (int at : {5, 3}) {
+            std::string key = "incidents|" + id + "|" + std::to_string(at);
+            if (d.s_incidents >= static_cast<float>(at) && !st.track_told.count(key)) {
+                st.track_told.insert(key);
+                std::string dn = d.name, tn = team_name(st, d.team);
+                int n = static_cast<int>(d.s_incidents);
+                add_news(st, round, "incidents", [&](text::Lang l) { return text::h_incidents(l, dn, n); },
+                         [&](text::Lang l) { return text::incidents(l, dn, tn, n); }, false);
+                tag_news(st, id, d.team);
+                break;
+            }
+        }
+    }
+    // past half distance, once a season: the best overtaker so far
+    if (st.overtakes_told != st.year && st.rounds > 0 && round * 2 >= st.rounds) {
+        const Driver *best = nullptr;
+        for (const auto &[id, d] : st.drivers)
+            if (!d.team.empty() && (!best || d.s_overtakes > best->s_overtakes))
+                best = &d;
+        if (best && best->s_overtakes >= 8) {
+            st.overtakes_told = st.year;
+            std::string dn = driver_name(st, best->id), tn = team_name(st, best->team);
+            int n = static_cast<int>(best->s_overtakes);
+            add_news(st, round, "overtakes", [&](text::Lang l) { return text::h_overtake_king(l, dn); },
+                     [&](text::Lang l) { return text::overtake_king(l, dn, tn, n); }, false);
+            tag_news(st, best->id, best->team);
+        }
+    }
+}
+
+float calibrate_ratings(State &st)
+{
+    double gap = 0;
+    int n = 0;
+    for (const auto &[id, d] : st.drivers)
+        if (d.game_overall > 0 && !d.regen) {
+            gap += d.game_overall - model_overall(d);
+            ++n;
+        }
+    float shift = n >= 8 ? clampf(static_cast<float>(gap / n), -6.0f, 8.0f) : 0.0f;
+    for (auto &[id, d] : st.drivers)
+        d.rating_shift = d.game_overall > 0 ? 0.0f : shift;
+    return shift;
 }

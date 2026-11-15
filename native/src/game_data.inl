@@ -16,6 +16,7 @@ using probe::u8;
 struct Finish {
     uint32_t stat = 0; // the driver's stat id
     int position = 0;  // 1.., 0 when not classified
+    uint32_t status = 0; // 1.1.3: the record's last word (+0xc): logged per round, its meaning still to be seen in game
 };
 using Round = std::vector<Finish>;
 
@@ -75,7 +76,7 @@ int read_round(uintptr_t round, Round &out, std::string &why)
             out.clear();
             return -1;
         }
-        out.push_back({key >> 16, pos + 1});
+        out.push_back({key >> 16, pos + 1, u32(at + 0xc)});
     }
     return 1;
 }

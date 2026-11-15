@@ -41,6 +41,7 @@ struct Settings {
     bool deadline = true;           // deadline day: the last two races, deals close fast
     bool living = true;             // 1.1.0 phase 5: sister-team swaps, budgets and sponsors, team principals
     bool academies = true;          // 1.1.0 phase 6: reserve drivers, academies that sign and promote, partner teams
+    bool on_track = true;           // 1.1.3: overtakes, incidents and mechanical failures (game telemetry) move the market
     std::string lang = "en";        // "en" or "es"
 };
 
@@ -77,6 +78,14 @@ struct Driver {
     // 1.1.0: what the game shows for him in this career (read at Team HQ): its overall rating, with the perks,
     // specialists and car the game counts in, and his focus, a statistic the market doesn't model. 0: not read
     float game_overall = 0, focus = 0;
+    // 1.1.3: for a driver the game doesn't rate, how far the game's ratings sit above the market's model on average
+    // (calibrate_ratings), so every driver is on the game's scale
+    float rating_shift = 0;
+    // 1.1.3: this season on track, from the game's telemetry (races only; zero without UDP telemetry): passes made
+    // and suffered, incidents he was involved in, retirements with a mechanical failure, and the round of his last
+    float s_overtakes = 0, s_overtaken = 0, s_incidents = 0, s_failures = 0;
+    int failed_round = 0;
+    int s_track_rounds = 0; // 1.1.3: races he ran this season that came with the game's telemetry (0: no data yet)
 
     // career state
     std::string team;     // team label while on the grid, else empty
@@ -203,6 +212,9 @@ struct RatingChange {
 
 struct State {
     int schema = 1;
+    // 1.1.3 (15 Nov): goes up by one with every save written: of two copies of one career (the career data and the
+    // storage), the higher is the newer. 0: a save from before 1.1.3, taken as before.
+    uint64_t revision = 0;
     std::string group;      // career data group: f1_career_2026
     std::string career;     // the core's career id
     int year = 2026;
@@ -211,6 +223,43 @@ struct State {
     int rounds = 24;
     int round_base = 0;     // rounds of this season raced before the market met the career (no results for them)
     int results_read = 0;   // rounds of this season whose real results the market has taken from the game
+    // 1.1.3: a fingerprint of each round of results the market took (index round - 1; its winner, runner-up and
+    // classified cars), so a shorter standings table is told apart from another career's
+    std::vector<uint32_t> result_keys;
+    // 1.1.3: standings the market found before this career raced (another championship's: F2 Revamp's F1 table),
+    // by their fingerprints: left out of the results and of the round count while the game still shows them
+    std::vector<uint32_t> foreign_keys;
+    // 1.1.3 (15 Nov): how result_keys and foreign_keys were made. 1: the winner, runner-up and classified count; 2: the
+    // whole classification (two races can share a winner and a runner-up). A save of scheme 1 is moved to 2 once its
+    // keys are checked against the standings.
+    int key_scheme = 2;
+    // 1.1.3 (15 Nov): each round of each season, once counted, and how: by season index, one character a round
+    // (index round - 1): 's' simulated by the market, 't' taken from the game's standings, 'k' the standings came
+    // after the market had simulated it (the simulated count stays), '-' not counted. A round is counted once.
+    std::map<int, std::string> counted;
+    char counted_as(int round) const;           // for this season ('-' when not counted)
+    void count_round(int round, char how);      // for this season
+    // the game's results waiting for their round in complete_round (round -> driver ids and positions): each round's
+    // results go in before that round's market decisions. Not saved.
+    std::map<int, std::vector<std::pair<std::string, int>>> incoming;
+    // 1.1.3: the new season's seat writes, from the news to the game's rows: announced (the market's plan), requested
+    // (the game said ok) and confirmed (a later read of the rows shows the driver in that team's seat)
+    struct SeatCheck {
+        std::string team, driver;
+        int seat = 0;
+        int year = 0;
+        int state = 0; // 0 announced, 1 requested, 2 confirmed
+        // 1.1.3 (15 Nov): reads of the rows that didn't show a requested seat yet (the game can be slow to show it):
+        // taken back after two
+        int misses = 0;
+        // the driver's deal before the market's plan, given back if the game never takes the move
+        std::string prev_team;
+        int prev_contract = 0;
+        float prev_salary = 0;
+        bool have_prev = false;
+    };
+    std::vector<SeatCheck> seat_checks;
+    int track_rounds = 0;   // 1.1.3: rounds of this season whose race came with the game's telemetry
     uint32_t last_meeting = 0; // the player's last secret meeting reported (the game's id)
     uint64_t seed = 1;
     uint64_t rng = 1;
@@ -348,6 +397,9 @@ struct State {
     int reserves_year = 0;           // the season whose reserves were signed (for the next one)
     // the overlays the player has seen, once a season each
     int awards_shown = 0;            // the awards ceremony of this season
+    // 1.1.3, on track: the season whose best overtaker was told; incident (3, 5) and reliability stories told
+    int overtakes_told = 0;
+    std::set<std::string> track_told;
     int cover_shown = 0;             // the cover of this season
     // 1.1.0, from player reports: a career whose race seats only the game can change (My Team: the core can't write
     // seats there). The market tells rumours and talks, never signs or sacks anyone itself, and reports as official
@@ -385,6 +437,9 @@ void refresh_from_baseline(State &st, const Value &baseline);
 struct GridCar {
     std::string driver, team;
     bool human = false;
+    // 1.1.3: the game's own seat index in the team (0 or 1) when the source says it (the career's rows); -1 when it
+    // doesn't (a session's cars). The market keeps the game's index, because a seat is written to the game by it.
+    int seat = -1;
 };
 void sync_grid(State &st, const std::vector<GridCar> &cars);
 
@@ -441,9 +496,15 @@ void cancel_standin(State &st, const std::string &team, int seat, const std::str
 // Next season's grid as planned right now (final, or a projection with the deals so far).
 std::map<std::string, std::array<std::string, 2>> projected_grid(const State &st, const Settings &s);
 
-// Persistence.
+// Persistence. dump_save is the save's text (1.1.3): compact JSON, and every number with a fraction, which in the
+// save is always a float, in its float's shortest text ("70.123", not the double's "70.12300109863281"). It reads back
+// to the very same float. One pass over the tree: 1.1.3 first shortened the numbers in the tree and then dumped it,
+// which made building the save half as slow again (tools/bench_ab.py).
 Value to_json(const State &st);
 bool from_json(State &st, const Value &v);
+std::string dump_save(const Value &v);
+#define SS_HAS_DUMP_SAVE 1 // tests/bench.cpp also builds against older commits (tools/bench_ab.py)
+
 
 // Texts for the in-game menu (news.cpp).
 std::string report_rumours(const State &st, const Settings &s);
@@ -589,7 +650,9 @@ int apply_outside(State &st);
 // a seat of the new season's grid the game refused, after the plugin read the grid again (the market now holds the
 // game's grid): the signing it told falls through. Its news goes if the player hasn't seen it; if he has, a story
 // says the deal is off. True when the market had told such a signing.
-bool season_change_refused(State &st, const std::string &team, const std::string &driver);
+// in_game: a read of the game's rows (made after the writes) shows the driver in that team. 1.1.3: the caller says so;
+// the market's own grid never decides it
+bool season_change_refused(State &st, const std::string &team, const std::string &driver, bool in_game);
 // observer careers (My Team): `before` is each driver's team before the grid was read again (driver -> team id).
 // The moves the game made are told as official signings, the deals that predicted them come true. `winter`: the
 // game's new season has begun and the market hasn't turned yet. Returns the moves told (0 when the read looks
@@ -597,11 +660,25 @@ bool season_change_refused(State &st, const std::string &team, const std::string
 int observe_grid(State &st, const Settings &s, const std::map<std::string, std::string> &before, bool winter);
 // the career turns out to be one only the game can change seats in: the market becomes an observer, and says so once
 void become_observer(State &st);
+
+// 1.1.3: one race's on-track events, read from the game's telemetry while it ran
+struct TrackEvent {
+    std::string kind;    // overtake, collision, retirement
+    std::string a, b;    // overtake: who passed, who was passed; collision: the two cars; retirement: the driver
+    int reason = 0;      // retirement: the game's reason (8: mechanical failure, 3: terminal damage)
+};
+// the race of round `round` (the one whose results come next): counts, form and the stories they make. A mechanical
+// failure leaves that round's retirement out of the driver's form. Off with Settings::on_track.
+void apply_track_events(State &st, const Settings &s, const std::vector<TrackEvent> &events, int round);
 // what the game shows for a driver now (its ratings screen): the overall and experience, racecraft, focus, awareness
 // and pace. The market's model takes them, so it never drifts from the game. A new talent keeps the market's own
 // numbers (his game row still holds the old reserve's until the plugin writes his). False: unknown driver or skipped.
 bool observe_game_ratings(State &st, const std::string &driver, float overall, float experience, float racecraft, float focus,
                           float awareness, float pace);
+// 1.1.3: after the game's ratings were read, the drivers it doesn't rate (F2, some free agents, new talents) are moved
+// onto its scale by the average gap between the game's overall and the market's model. Returns that gap (0 with
+// fewer than 8 drivers read).
+float calibrate_ratings(State &st);
 
 // --- 1.1.0 phase 6: academies and reserves -------------------------------------------------------------
 

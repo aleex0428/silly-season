@@ -82,6 +82,87 @@ int main(int argc, char **argv)
         check(g_real_first <= 2016 || g_real_first == 2019, "the data starts in 2016 (or 2019 with an older Progressive)");
     }
 
+    std::printf("the real year is told from the rows' looks (the driver at +0x50, his look at +0x54)\n");
+    {
+        // the game's layout: each driver keeps his own stat id (a season addon's driver one from the launcher), and
+        // his look has another. 1.1.0-1.1.2 matched the drivers against the looks: no year, ever
+        auto grid_of = [](int year, bool with_looks) {
+            std::vector<RealSeat> seats;
+            uint32_t own = 300; // drivers' and looks' stat ids overlap in number (2025's and 2026's looks are 261-342)
+            for (const json::Value &t : *g_real["seasons"][std::to_string(year)]["teams"].if_array())
+                for (const json::Value &d : *t["drivers"].if_array()) {
+                    RealSeat s;
+                    s.driver = own++;
+                    s.team = static_cast<uint32_t>(t["slot"].as_int());
+                    s.seat = static_cast<int>(d["position"].as_int());
+                    uint32_t look = static_cast<uint32_t>(d["look"]["stat_id"].as_int());
+                    if (with_looks)
+                        s.look = look;
+                    else
+                        s.driver = look; // a layout with the look in the driver's field still counts
+                    seats.push_back(s);
+                }
+            return seats;
+        };
+        for (int y : {g_real_first, 2016, 2021, 2025, g_real_last}) {
+            g_last_seats = grid_of(y, true);
+            check(detect_real_year() == y, ("the looks tell " + std::to_string(y)).c_str());
+        }
+        g_last_seats = grid_of(2019, false);
+        check(detect_real_year() == 2019, "a row without a look counts by its driver field");
+        for (RealSeat &s : g_last_seats)
+            s.look = kNoLook, s.driver = 7;
+        check(detect_real_year() == 0, "drivers alone tell no year");
+        // 15 Nov: six looks of 2015, six of 2016 and eight cars nobody knows: no clear year, the market waits
+        if (g_real_first <= 2015) {
+            std::vector<RealSeat> a = grid_of(2015, true), b = grid_of(2016, true), mixed;
+            for (size_t i = 0; i < 6; ++i) {
+                mixed.push_back(a[i]);
+                mixed.push_back(b[i]);
+            }
+            for (size_t i = 0; i < 8; ++i) {
+                RealSeat s = a[6 + i];
+                s.look = 60000 + static_cast<uint32_t>(i);
+                mixed.push_back(s);
+            }
+            g_last_seats = mixed;
+            check(detect_real_year() == 0, "6 cars of 2015, 6 of 2016 and 8 unknown: no year yet");
+            g_last_seats = a;
+            for (size_t i = 0; i < 4; ++i)
+                g_last_seats[i].look = 60000 + static_cast<uint32_t>(i);
+            check(detect_real_year() == 2015, "16 of 20 cars of 2015: the year is clear");
+        }
+        g_last_seats.clear();
+    }
+
+    // 15 Nov: Progressive 0.5.0 starts in 2014: its people have names, and 2014 is told through to 2015's real grid
+    if (g_real_first <= 2014) {
+        std::printf("2014, told through to 2015's real grid\n");
+        start_real_season(2014, 19);
+        check(g_state.real && g_state.year == 2014, "a real season, 2014");
+        for (const char *id : {"sw14_bianchi", "sw14_chilton", "sw14_kobayashi", "sw14_sutil", "sw14_vergne"}) {
+            const ss::Driver *d = g_state.driver(id);
+            check(d && d->name.find('_') == std::string::npos && d->name.rfind("Sw", 0) != 0,
+                  (std::string(id) + " has his own name: " + (d ? d->name : "?")).c_str());
+        }
+        ss::Settings s14;
+        s14.standins = s14.talents = s14.midseason = false;
+        for (int r = 1; r <= 19; ++r)
+            ss::complete_round(g_state, s14, r, 19);
+        check(g_state.finalised, "2014 closes");
+        ss::start_new_season(g_state, s14);
+        start_real_season(g_state.year, 19);
+        check(g_state.year == 2015 && g_state.real, "2015 follows as a real season");
+        std::string unseated;
+        for (const auto &[team, pair] : real_season_of(2015).grid)
+            for (const std::string &id : pair) {
+                const ss::Team *t = g_state.team(team);
+                if (!id.empty() && (!t || (t->seats[0] != id && t->seats[1] != id)))
+                    unseated += " " + id;
+            }
+        check(unseated.empty(), ("every 2015 driver in his real seat" + unseated).c_str());
+    }
+
     if (g_real_first <= 2016) {
         std::printf("2016, told through to 2017's real grid\n");
         start_real_season(2016, 21);

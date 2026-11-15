@@ -4,7 +4,7 @@ A living driver market for F1 25's **Career mode**. Through the season rumours a
 signings, others are denied. Veterans announce their retirement, impatient teams sack underperforming drivers and the
 academies promote their F2 youngsters. When a new season starts, the game's grid really changes.
 
-- **Addon:** `alexs.silly-season` 1.1.2
+- **Addon:** `alexs.silly-season` 1.1.3
 - **Requires:** Swofty Launcher 1.8.36 or later and F1 25 on Steam (tested on the Steam copy)
 - **Careers:** Driver Career and My Team (where the game makes the moves: see Known limits) for 2026 (`f1_career_2026`) and 2025 (`f1_career_2025`), and Progressive
   Career on the Swofty Seasons (`swofty.swofty-seasons-progressive`) in history mode. Careers from other addons keep
@@ -45,7 +45,7 @@ The news comes to you without opening any menu:
   - They are the game's own mails: Silly Season adds its mail groups to the database and fills their text live.
 - **BREAKING NEWS banner** (overlay): a broadcast-style lower third with every official signing, retirement or sacking,
   outside sessions.
-- **The market hub: F7** (or **Back + Y** on a controller), outside sessions. A full-screen, broadcast-style panel with a
+- **The market hub: F7** (or the key you pick in **Panel key**, or **Back + Y** on a controller), outside sessions and while a session is paused. A full-screen, broadcast-style panel with a
   live headline ticker, a season bar, the transfer window's status, a grouped side menu, animated cards, gauges and
   charts, and 17 pages:
   - **Paddock:** the market at a glance (seats in play, open talks, done deals, unread news), the top stories, your team
@@ -176,6 +176,25 @@ Team intro, so this one is Silly Season's own.
 - **Signings and sackings include quotes from team management**, always by role and never by a real person's name.
 - **Estimated salaries** from the driver's level and the team's prestige.
 - **Market review** when each season closes: signing of the year, biggest leap, bet for the future and retirements.
+
+### On track (needs UDP telemetry)
+
+With **On-track reputation** on (the default) and the game's **UDP Telemetry** turned on (Settings > Telemetry
+Settings > UDP Telemetry: On), Silly Season counts what happens in your races:
+
+- **Overtakes** raise a driver's form and value a little, and past half distance the season's best overtaker makes the
+  news.
+- **Incidents** (every collision a driver is involved in) cost form. The third and fifth of a season make a story, and a
+  driver with many is a worry for teams fighting at the front.
+- **Mechanical failures** don't count against the driver's form: the team takes the blame, and a team's third breakdown
+  of the season makes a reliability story.
+- Driver cards show the season's overtakes, incidents and mechanical DNFs.
+
+Only races count, from lights out to the end of the race. The game reports an overtake at every change of the running
+order, so each pair of cars counts once per fight: a place swapped back and forth within 30 seconds doesn't count, and
+neither does anything while the game is paused or before a flashback or a restart. Only the drivers of your career's
+grid count; cars another addon's entry list adds are left out, and the log names them. Without UDP telemetry nothing
+changes: the market runs on results alone, as before.
 
 ### Intensity
 
