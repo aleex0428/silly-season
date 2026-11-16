@@ -4879,6 +4879,14 @@ SWOFTY_ON_LOAD
     log("[silly-season] ready: version %s (built %s %s), market %s, intensity %.*s", SS_VERSION, __DATE__, __TIME__,
         std::string_view(game_market) == "game" ? "shared with the game" : "run by Silly Season",
         int(std::string_view(intensity).size()), std::string_view(intensity).data());
+    // 1.1.4: the game's build (the exe's PE timestamp and image size, as Swofty's build overlays name it), so a
+    // player's log says which game update it ran on
+    if (auto *base = reinterpret_cast<const uint8_t *>(GetModuleHandleW(nullptr))) {
+        auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+        auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+        log("[silly-season] game build: pe timestamp %u, image %u bytes", unsigned(nt->FileHeader.TimeDateStamp),
+            unsigned(nt->OptionalHeader.SizeOfImage));
+    }
 }
 
 SWOFTY_ADDON()

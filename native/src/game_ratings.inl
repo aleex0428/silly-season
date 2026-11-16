@@ -102,8 +102,11 @@ bool read_all(std::vector<Reading> &out, std::string &why)
     out.clear();
     auto overall = reinterpret_cast<OverallFn>(resolve("Career_Get_DriverOverallRating"));
     auto length = reinterpret_cast<LengthFn>(resolve("Career_Get_CareerLengthDays_Thunk"));
-    if (!overall || !length || !swofty::mem::in_image(reinterpret_cast<uintptr_t>(overall)))
-        return why = "Career_Get_DriverOverallRating or Career_Get_CareerLengthDays_Thunk doesn't resolve", false;
+    // 1.1.4: which launcher binding is missing, by name (a game update the launcher hasn't caught up with yet)
+    if (!overall || !swofty::mem::in_image(reinterpret_cast<uintptr_t>(overall)))
+        return why = "the launcher binding Career_Get_DriverOverallRating doesn't resolve on this game build", false;
+    if (!length)
+        return why = "the launcher binding Career_Get_CareerLengthDays_Thunk doesn't resolve on this game build", false;
     void *comp = component_by("k_Career_DriverCareerPlayerDriverStatisticsComponentDesc");
     if (!comp)
         comp = component_by("k_Career_DriverStatisticsComponentDesc");

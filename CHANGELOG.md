@@ -1,3 +1,9 @@
+# 1.1.4
+
+For the F1 25 1.0.145 update (16 Nov):
+- **Silly Season keeps working when the launcher hasn't caught up with a game update yet.** Every game function Silly Season calls comes from the launcher's bindings, none from its own offsets, and every read of the game's data is checked; if one of them isn't available on the running game version, that part is left out and the market carries on with its own values. On 1.0.145 the launcher's binding for the career's length (used by the game's driver ratings) doesn't match yet, so until the launcher is updated the RATING comes from Silly Season's own model.
+- The log names the launcher binding that's missing (`the launcher binding ... doesn't resolve on this game build`) and the game build the session ran on (`game build: pe timestamp ...`), to tell a game update apart from a bug in reports.
+
 # 1.1.3
 
 - **On-track reputation** (new option, **experimental and off by default**; needs **UDP Telemetry** on in the game's settings). When you switch it on, Silly Season reads your races' overtakes, collisions and retirements from the game's telemetry:
