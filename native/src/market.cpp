@@ -3820,6 +3820,24 @@ Value to_json(const State &st)
     return v;
 }
 
+// A 64-bit number the save keeps as text ("seed", "rng"), read without exceptions: a damaged or hand-edited save
+// (letters, an empty string, a number too big) gives the fallback instead of throwing out of the game's thread.
+// (16 Nov: std::stoull threw std::invalid_argument here, and nothing above caught it; tools/fuzz.py found it.)
+static uint64_t u64_of(const Value &x, uint64_t fallback)
+{
+    if (x.is_string()) {
+        std::string_view s = x.as_string();
+        uint64_t out = 0;
+        auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
+        return ec == std::errc() && end == s.data() + s.size() && !s.empty() ? out : fallback;
+    }
+    if (x.is_number()) {
+        long long n = x.as_int(0);
+        return n > 0 ? static_cast<uint64_t>(n) : fallback;
+    }
+    return fallback;
+}
+
 bool from_json(State &st, const Value &v)
 {
     if (!v.is_object() || v["schema"].as_int() != 1)
@@ -3871,8 +3889,10 @@ bool from_json(State &st, const Value &v)
     }
     out.track_rounds = static_cast<int>(v["track_rounds"].as_int(0));
     out.last_meeting = static_cast<uint32_t>(v["last_meeting"].as_int(0));
-    out.seed = std::stoull(std::string(v["seed"].as_string("1")));
-    out.rng = std::stoull(std::string(v["rng"].as_string("1")));
+    out.seed = u64_of(v["seed"], 1);
+    if (!out.seed)
+        out.seed = 1; // as init() does: the market's draws need a seed other than 0
+    out.rng = u64_of(v["rng"], mix(out.seed, 0x5eedull));
     out.player = std::string(v["player"].as_string());
     out.player_team = std::string(v["player_team"].as_string());
     out.retirements_drawn = v["retirements_drawn"].as_bool();

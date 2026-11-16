@@ -1,3 +1,7 @@
+# 1.1.5 (in progress)
+
+- **A damaged market save no longer crashes the game.** If Silly Season's save for a career was damaged or edited by hand so that its random seed wasn't a number, loading that career crashed F1 25. Now the career loads with its market as it was saved.
+
 # 1.1.4
 
 For the F1 25 1.0.145 update (16 Nov):

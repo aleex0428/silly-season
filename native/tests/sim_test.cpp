@@ -1121,6 +1121,24 @@ static void save_format_test(const Value &baseline)
     State legacy;
     CHECK(from_json(legacy, swofty::json::parse(old_text, &err)), "a 1.1.2 save doesn't load");
     CHECK(dump_save(to_json(legacy)) == compact, "a 1.1.2 save loads into another market");
+
+    // 16 Nov (tools/fuzz.py): a damaged or hand-edited save whose seed or rng isn't a number used to throw out of
+    // from_json (std::stoull), which in the game ends the game. Now it loads, with the market as it was saved.
+    for (Value bad_seed : {Value("abc"), Value(""), Value("99999999999999999999999"), Value("12x"), Value(-5), Value()}) {
+        Value damaged = saved;
+        damaged["seed"] = bad_seed;
+        damaged["rng"] = bad_seed;
+        State again;
+        bool loaded = false, threw = false;
+        try {
+            loaded = from_json(again, damaged);
+        } catch (...) {
+            threw = true;
+        }
+        CHECK(!threw && loaded && again.seed != 0 && again.drivers.size() == st.drivers.size() && again.year == st.year,
+              "a save with a damaged seed (%s) %s\n", swofty::json::dump(bad_seed, 0).c_str(),
+              threw ? "throws" : "doesn't load");
+    }
     std::printf("save format: %d floats back bit for bit; with 1.1.2's line breaks and 17-digit floats %.1f KB, as saved %.1f KB "
                 "(%.0f%% smaller; 1.1.2 also wrote every empty field: tools/bench_ab.py has the whole difference)\n", floats,
                 old_text.size() / 1024.0, compact.size() / 1024.0, 100.0 - 100.0 * compact.size() / old_text.size());

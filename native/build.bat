@@ -17,6 +17,8 @@ rem   build.bat benchexe <tree> <out.exe> -> only builds the bench from a source
 rem                              tools\bench_ab.py uses it to time an older commit against the working tree
 rem Every source of a run compiles once and in parallel (/MP); the engine (market, text, names) is shared by the
 rem DLL and the tests instead of being compiled again for each.
+rem The DLL is linked with its PDB (build\<name>.pdb, never packaged): /PDBALTPATH:%%_PDB%% keeps this PC's path out of
+rem the DLL. tools\crash_lab.py stores each version's PDB and names our frames in crash reports.
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
@@ -34,7 +36,7 @@ set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 
 if not exist build mkdir build
-set FLAGS=/nologo /std:c++latest /EHsc /O2 /MT /W3 /Zc:preprocessor /Zc:__cplusplus /utf-8 /permissive- /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /I include /Fobuild\
+set FLAGS=/nologo /std:c++latest /EHsc /O2 /MT /W3 /Zc:preprocessor /Zc:__cplusplus /utf-8 /permissive- /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /Z7 /I include /Fobuild\
 rem the addon's version, from the manifest, for the "ready" line it logs (a player's log then says which build ran)
 set "SSVER=dev"
 for /f "tokens=2 delims=:, " %%v in ('findstr /c:"\"version\"" ..\swofty.json') do if "!SSVER!"=="dev" set "SSVER=%%~v"
@@ -79,7 +81,7 @@ for %%t in (%TESTS%) do set "SRC=!SRC! tests\%%t_test.cpp"
 cl %FLAGS% /MP /c %SRC% || exit /b 1
 
 if "%DLL%"=="1" (
-    link /NOLOGO /DLL build\plugin.obj %ENGINE_OBJ% /OUT:silly_season.dll /IMPLIB:build\silly_season.lib || exit /b 1
+    link /NOLOGO /DLL build\plugin.obj %ENGINE_OBJ% /OUT:silly_season.dll /IMPLIB:build\silly_season.lib /DEBUG /PDB:build\silly_season.pdb /PDBALTPATH:%%_PDB%% /OPT:REF /OPT:ICF /INCREMENTAL:NO || exit /b 1
     del /q silly_season.exp 2>nul
     echo built %CD%\silly_season.dll
 )
