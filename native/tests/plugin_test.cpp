@@ -1980,6 +1980,99 @@ void older_save(::fake::Game &g, const json::Value &baseline)
     end();
 }
 
+// 1.1.51: a career loaded with Continue (no save slot picked) is named by the career tracker's key ("dc-..."), which
+// every career of that driver shares: the market is kept under the save slot's id, found in the core's career index
+void continue_keeps_slot(::fake::Game &g, const json::Value &baseline)
+{
+    begin("1.1.51: a career loaded with Continue keeps its market under its save slot");
+    const std::string grp = "f1_career_2026";
+    const std::string slot_a = grp + ".driver_career:a1a1a1a1a1a1a1a1";
+    const std::string slot_b = grp + ".driver_career:b2b2b2b2b2b2b2b2"; // its name once loaded from the save list
+    const std::string slot_c = grp + ".driver_career:c3c3c3c3c3c3c3c3";
+    Career c(g, baseline, grp, slot_a, "oscar_piastri");
+    const std::string key(::fake::career_state.key);
+    const std::string d = std::to_string(::fake::career_state.player_driver >> 16);
+    // A loaded from its slot before; B and C only listed; another profile's slot of the same driver, played last
+    auto index = [&](int64_t a_played, int64_t b_played, bool with_c) {
+        auto slot = [&](const std::string &id, const char *profile, const char *s, int64_t played, bool content) {
+            return R"({"career":")" + id + R"(","mode":"driver_career",)" + (content ? R"("content":")" + grp + R"(",)" : "") +
+                   R"("status":"present","profile":")" + profile + R"(","slot":")" + s + R"(","driver_raw":)" + d +
+                   R"(,"last_played":)" + std::to_string(played) + "}";
+        };
+        std::string t = R"({"version":1,"careers":[{"career":")" + key + R"(","mode":"driver_career","content":")" + grp +
+                        R"(","status":"present","profile":"p"},)" + slot(slot_a, "p", "a1a1a1a1a1a1a1a1", a_played, true) +
+                        "," + slot("driver_career:b2b2b2b2b2b2b2b2", "p", "b2b2b2b2b2b2b2b2", b_played, false) + "," +
+                        slot("driver_career:d4d4d4d4d4d4d4d4", "other", "d4d4d4d4d4d4d4d4", 99999, false);
+        if (with_c)
+            t += "," + slot("driver_career:c3c3c3c3c3c3c3c3", "p", "c3c3c3c3c3c3c3c3", 5000, false);
+        return t + "]}";
+    };
+    auto career_in = [&](const std::string &id) {
+        auto it = g.files.find(storage_path(id));
+        if (it == g.files.end())
+            return std::string("(none)");
+        json::Error err;
+        return std::string(json::parse(it->second, &err)["career"].as_string());
+    };
+
+    g.career_index = index(2000, 1000, false);
+    c.load(); // from the save list: the slot's id
+    c.enter_hub();
+    g.frames(2.5);
+    c.weekend(false);
+    c.weekend(false);
+    int starts = player_starts();
+    c.unload();
+    check(career_in(slot_a) == slot_a, "(set up: saved under the slot's id)");
+
+    c.id = key; // Continue: the tracker key
+    size_t from = ::fake::log_lines.size();
+    c.load();
+    check(g_state.career == slot_a && player_starts() == starts &&
+              ::fake::Game::logged("the market is kept under its save slot " + slot_a, from) == 1,
+          "Continue loads the slot's market: " + g_state.career + ", " + std::to_string(player_starts()) + " start(s)");
+    c.enter_hub();
+    g.frames(2.5);
+    c.weekend(false);
+    c.unload();
+    check(g.files.count(storage_path(key)) == 0 && career_in(slot_a) == slot_a && player_starts() == starts + 1,
+          "it saves under the slot's id, never the tracker key");
+
+    g.career_index = index(2000, 3000, false); // another career of the same driver was played last
+    from = ::fake::log_lines.size();
+    c.load();
+    check(g_state.career == slot_b, "Continue on the other career: its own slot, named like the data group's: " + g_state.career);
+    c.unload();
+    check(career_in(slot_a) == slot_a, "the first career's market is left alone");
+
+    g.career_index = index(2000, 1000, false);
+    Career n(g, baseline, grp, key, "oscar_piastri"); // a new career named by the tracker key
+    from = ::fake::log_lines.size();
+    n.create();
+    check(g_state.career == key + ":new" && ::fake::Game::logged("a new career named by the career tracker's key", from) == 1,
+          "a new career runs under its own provisional id, not the driver's newest slot: " + g_state.career);
+    n.enter_hub();
+    g.frames(2.5);
+    n.weekend(false);
+    check(g_state.career == key + ":new" && g.files.count(storage_path(key + ":new")) == 1,
+          "until the index lists its slot it stays there: " + g_state.career);
+    g.career_index = index(2000, 1000, true); // the game saved it: a slot of this driver that wasn't there
+    n.game_save();
+    n.game_save();
+    check(g_state.career == slot_c && career_in(slot_c) == slot_c && g.files.count(storage_path(key + ":new")) == 0,
+          "then the market moves to its slot and the provisional copy goes: " + g_state.career);
+    n.unload();
+    check(career_in(slot_a) == slot_a, "the first career's market is still its own");
+
+    g.career_index.clear(); // no index: the tracker key, as before
+    from = ::fake::log_lines.size();
+    c.load();
+    check(g_state.career == key && ::fake::Game::logged("career index can't be read", from) == 1,
+          "without the core's index the market stays under the tracker key");
+    c.unload();
+    end();
+}
+
 // Two provisional markets of the same kind of career, either of which could be the loaded one
 void two_provisionals(::fake::Game &g, const json::Value &baseline)
 {
@@ -2305,6 +2398,7 @@ int main(int argc, char **argv)
     copies_on_load(g, baseline);
     older_save(g, baseline);
     two_provisionals(g, baseline);
+    continue_keeps_slot(g, baseline);
     track_attempts(g, baseline);
     banner_cursor();
     press_key(g, baseline);

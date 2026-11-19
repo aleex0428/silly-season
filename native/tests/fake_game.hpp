@@ -71,6 +71,7 @@ struct Game {
     bool fail_data_set = false;                      // 15 Nov: the core's career data refuses writes
     bool feed_late = false;                          // 15 Nov: the telemetry feed isn't there yet
     std::string career_id;                          // what career::saves::current() answers
+    std::string career_index;                       // 1.1.51: what career::saves::index() answers ("": unavailable)
     std::map<std::string, std::string> career_data;  // "<career>|<addon>" -> JSON
     int data_sets = 0, data_gets = 0, needs = 0;
 
@@ -276,6 +277,11 @@ struct Game {
         saves_t.version = SWOFTY_CAREER_SAVES_VERSION;
         saves_t.available = e_available;
         saves_t.current = [](char *id, size_t cap, size_t *len) { return put(game->career_id, id, cap, len); };
+        saves_t.index = [](char *json, size_t cap, size_t *len) {
+            if (game->career_index.empty())
+                return int(SWOFTY_ASSET_UNAVAILABLE);
+            return put(game->career_index, json, cap, len);
+        };
         saves_t.need = [](const char *, const char *, const char *) {
             ++game->needs;
             return int(SWOFTY_ASSET_OK);

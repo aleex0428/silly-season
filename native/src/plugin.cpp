@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -402,12 +403,14 @@ void note_provisional()
 // failed write keeps it: the next save tries again, and a load before that still finds it.
 std::string g_retire_after_save;
 
+std::string market_id_now(); // 1.1.51: the core's id, a tracker key mapped to the career's save slot (below)
+
 // g_lock held: the loaded career's id changed (a new career's first save): the market follows it
 void follow_career_id()
 {
     if (!g_loaded)
         return;
-    std::string now = career::saves::current();
+    std::string now = market_id_now();
     if (now.empty() || now == g_state.career || g_state.career.empty())
         return;
     std::string old = g_state.career;
@@ -661,6 +664,192 @@ std::string career_id(const events::Context *ctx)
     return id;
 }
 
+// ---------------------------------------------------------------------------------------------------
+// 1.1.51: careers loaded with Continue. With no save slot picked before the load (Continue on the main menu), the core
+// names the career by the career tracker's key for the whole session: "dc-00070000" (the player's driver) or
+// "mt-<team>-<driver>" in My Team. Every career of that driver shares the key, and the same career loaded from the save
+// list is named by its slot ("f1_career_2025.driver_career:748422188a9baea0"): two careers of one driver shared one
+// market, and one career loaded both ways had two. The market is kept under the save slot's id instead, found in the
+// core's career index: the slot of that driver (and team) in the same profile, present, played last. (F2 Revamp 0.9.2
+// does the same for its career data.)
+// A new career has no slot until its first save: it runs under "<key>:new" (a provisional market) until the index
+// lists a slot of its driver that wasn't there when it started.
+
+bool tracker_key(std::string_view id) { return id.rfind("dc-", 0) == 0 || id.rfind("mt-", 0) == 0; }
+
+std::string g_slot_raw;              // the tracker key the core names the loaded career by
+std::string g_slot_id;               // the save slot's id the market is kept under ("": none found)
+bool g_slot_waiting = false;         // a new career: its slot is looked for at each save
+std::set<std::string> g_slots_before; // a new career: the driver's save slots when it started
+
+void slot_reset()
+{
+    g_slot_raw.clear();
+    g_slot_id.clear();
+    g_slot_waiting = false;
+    g_slots_before.clear();
+}
+
+json::Value raw_index()
+{
+    const SwoftyCareerSaves *t = career::detail::live_saves();
+    if (!t || !t->index)
+        return json::Value();
+    std::string text = career::detail::grow([&](char *buf, size_t cap, size_t *len) { return t->index(buf, cap, len); });
+    json::Error err;
+    return text.empty() ? json::Value() : json::parse(text, &err);
+}
+
+// the driver and team a tracker key names (the game's raw ids, stat << 16), as the index's driver_raw and team_raw
+struct TrackerWho {
+    bool ok = false, my_team = false;
+    int64_t driver = -1, team = -1;
+};
+
+TrackerWho tracker_who(const std::string &key)
+{
+    TrackerWho w;
+    auto hex = [](std::string_view s, int64_t &out) {
+        uint32_t v = 0;
+        auto r = std::from_chars(s.data(), s.data() + s.size(), v, 16);
+        if (r.ec != std::errc() || r.ptr != s.data() + s.size() || s.size() != 8)
+            return false;
+        out = static_cast<int64_t>(v >> 16);
+        return true;
+    };
+    std::string_view k(key);
+    if (k.rfind("dc-", 0) == 0) {
+        w.ok = hex(k.substr(3), w.driver);
+    } else if (k.rfind("mt-", 0) == 0 && k.size() == 3 + 8 + 1 + 8 && k[11] == '-') {
+        w.my_team = true;
+        w.ok = hex(k.substr(3, 8), w.team) && hex(k.substr(12), w.driver);
+    }
+    return w;
+}
+
+struct SlotPick {
+    std::string id, slot, profile;
+    int fits = 0;
+};
+
+// the save slot a tracker key's career is in: same profile, same driver (and team in My Team), present and listed, not
+// another data group's, not in `skip`; of several, the one played last (Continue loads the last career played)
+SlotPick pick_slot(const json::Value &index, const std::string &key, const std::string &group,
+                   const std::set<std::string> *skip, std::set<std::string> *all = nullptr)
+{
+    SlotPick pick;
+    TrackerWho who = tracker_who(key);
+    const json::Array *list = index["careers"].if_array();
+    if (!who.ok || !list)
+        return pick;
+    for (const json::Value &e : *list)
+        if (e["career"].as_string() == key)
+            pick.profile = std::string(e["profile"].as_string());
+    std::string kind = who.my_team ? "my_team" : "driver_career";
+    int64_t newest = -1;
+    for (const json::Value &e : *list) {
+        std::string slot(e["slot"].as_string());
+        if (slot.empty() || e["status"].as_string() != "present" || e["mode"].as_string() != kind || e["hidden"].as_bool())
+            continue;
+        if (!pick.profile.empty() && e["profile"].as_string() != pick.profile)
+            continue;
+        if (e["driver_raw"].as_int(-2) != who.driver || (who.my_team && e["team_raw"].as_int(-2) != who.team))
+            continue;
+        if (all)
+            all->insert(slot);
+        std::string_view content = e["content"].as_string();
+        if (!content.empty() && content != group)
+            continue;
+        if (skip && skip->count(slot))
+            continue;
+        ++pick.fits;
+        int64_t played = e["last_played"].as_int(0);
+        if (played > newest) {
+            newest = played;
+            pick.slot = slot;
+            pick.id = std::string(e["career"].as_string());
+        }
+    }
+    if (pick.slot.empty())
+        return pick;
+    // a slot the core has only listed is named "<mode>:<slot>"; once loaded from the save list it is
+    // "<the data group's save container, else <group>.<mode>>:<slot>", the name the market must use. Another career
+    // of this data group loaded from its slot gives that name; else the core's default.
+    if (pick.id == kind + ":" + pick.slot) {
+        std::string prefix = group + "." + kind;
+        for (const json::Value &e : *list) {
+            std::string id(e["career"].as_string()), slot(e["slot"].as_string());
+            if (e["content"].as_string() != group || e["mode"].as_string() != kind || slot.empty() ||
+                id == kind + ":" + slot || provisional_id(id) || tracker_key(id) || id.size() <= slot.size() + 1 ||
+                id.compare(id.size() - slot.size() - 1, std::string::npos, ":" + slot) != 0)
+                continue;
+            prefix = id.substr(0, id.size() - slot.size() - 1);
+            break;
+        }
+        pick.id = prefix + ":" + pick.slot;
+    }
+    return pick;
+}
+
+// g_lock held: the id the market of the career just loaded is kept under (the career's own id unless the core names it
+// by the career tracker's key)
+std::string market_id(const std::string &raw, const std::string &group, bool fresh)
+{
+    // created, then loaded: the new career keeps the id it started with (its Loaded must not look for a slot: the
+    // driver's newest slot is another career's until this one saves)
+    if (g_loaded && !raw.empty() && raw == g_slot_raw)
+        return g_state.career;
+    slot_reset();
+    if (!tracker_key(raw))
+        return raw;
+    g_slot_raw = raw;
+    const json::Value index = raw_index();
+    if (!index["careers"].is_array()) {
+        log("[silly-season] career %s: no save slot was picked before this load and the core's career index can't be "
+            "read; the market stays under this id", raw.c_str());
+        return raw;
+    }
+    if (fresh) {
+        std::set<std::string> before;
+        pick_slot(index, raw, group, nullptr, &before);
+        g_slots_before = std::move(before);
+        g_slot_waiting = true;
+        log("[silly-season] career %s: a new career named by the career tracker's key (%zu other save slot(s) of this "
+            "driver); its market moves to its own save slot once the game has saved it", raw.c_str(), g_slots_before.size());
+        return raw + ":new";
+    }
+    SlotPick p = pick_slot(index, raw, group, nullptr);
+    if (p.id.empty()) {
+        log("[silly-season] career %s: no save slot was picked before this load and the core's index has no slot of this "
+            "driver; the market stays under this id", raw.c_str());
+        return raw;
+    }
+    g_slot_id = p.id;
+    log("[silly-season] career %s (loaded with Continue: no save slot picked): the market is kept under its save slot "
+        "%s (%d save slot(s) of this driver in profile '%s')", raw.c_str(), p.id.c_str(), p.fits, p.profile.c_str());
+    return p.id;
+}
+
+// g_lock held, at each save: the id the core gives now, mapped to the market's (follow_career_id)
+std::string market_id_now()
+{
+    std::string now = career::saves::current();
+    if (now.empty() || now != g_slot_raw)
+        return now;
+    if (!g_slot_id.empty())
+        return g_slot_id;
+    if (g_slot_waiting) {
+        SlotPick p = pick_slot(raw_index(), g_slot_raw, g_state.group, &g_slots_before);
+        if (p.id.empty())
+            return g_state.career; // not saved yet: the market stays where it is
+        g_slot_waiting = false;
+        g_slot_id = p.id;
+        log("[silly-season] career %s: the new career's save slot is %s", g_slot_raw.c_str(), p.id.c_str());
+        return p.id;
+    }
+    return now;
+}
+
 bool load_real_data();                // history.inl
 void real_people_in(ss::State &st);   // history.inl
 
@@ -727,7 +916,7 @@ void begin_career(const events::Context &ctx, bool fresh)
             team < 0 ? ", his row not read yet" : "");
         return;
     }
-    begin_market(group, career_id(&ctx), fresh);
+    begin_market(group, market_id(career_id(&ctx), group, fresh), fresh);
 }
 
 void begin_market(const std::string &group, const std::string &id, bool fresh)
@@ -4729,6 +4918,7 @@ SWOFTY_ON_LOAD
                 "the JSON", g_saves_written, g_saves_same, g_saves_skipped);
         g_saves_written = g_saves_same = g_saves_skipped = 0;
         g_loaded = false;
+        slot_reset();
         g_f2_waiting = false;
         g_report_seq = 0;
         g_keen_known = false;

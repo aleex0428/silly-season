@@ -1,3 +1,7 @@
+# 1.1.51
+
+- **Continue no longer mixes up markets.** A career loaded with Continue from the main menu, instead of from the save list, was named after its driver rather than its save. Every career with that driver shared one market, and the same career had one market when loaded with Continue and another when loaded from the save list. Each career now keeps its market with its own save, whichever way you load it. A career you played with Continue before this version takes that market the first time you load it.
+
 # 1.1.5
 
 - **More realistic transfers and retirements** (your vote: 108 votes). The market was measured against the real grids of 2012 to 2025 and now moves like F1 does, on the Realistic intensity (Lively and Chaos still move more):
