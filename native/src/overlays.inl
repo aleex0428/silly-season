@@ -415,9 +415,10 @@ bool draw_farewell(ov::Paint *p)
     ov::gradient(p, x, y, w, h, 0x18141FF8, 0x0B0A10F8, false, 16 * k);
     {
         ov::ClipScope clip(p, x, y, w, h);
-        if (f.col) {
-            ui::livery(p, x, y, w * 0.45f, h, f.col, k, 0.6f, 0);
-            ov::gradient(p, x, y, w * 0.6f, h, 0x18141F00, 0x18141FF8, true);
+        if (f.col) { // 1.1.4: the team's colour fades out across the card, no hard edge where it ends
+            ov::gradient(p, x, y, w * 0.62f, h, ui::rgb(f.col, 0x66), ui::rgb(f.col, 0x00), true);
+            for (int i = 0; i < 3; ++i)
+                ui::para(p, x + w * 0.08f + static_cast<float>(i) * 30 * k, y, 16 * k, h, h * 0.5f, 0xFFFFFF07);
         }
         ui::glow(p, x + w / 2, y, 500 * k, ui::alpha(violet, 0.18f));
         // a slow light that crosses the card
@@ -434,10 +435,22 @@ bool draw_farewell(ov::Paint *p)
     char sub[96];
     std::snprintf(sub, sizeof sub, es ? "%d años  ·  %s" : "%d  ·  %s", f.age, f.team.empty() ? (es ? "su último equipo" : "his last team") : f.team.c_str());
     ov::text(p, x + w / 2, y + 116 * k, ui::ts(16 * k, ui::kText2, ov::align::center | ov::align::middle, 0.8f * k), sub);
+    // 1.1.4: his initials in his last team's colour, at the left of his name
+    {
+        float cx = x + 92 * k, cy = y + 92 * k, r = 46 * k;
+        uint32_t mc = f.col ? ui::rgb(f.col) : violet;
+        ui::glow(p, cx, cy, r * 2.2f, ui::alpha(mc, 0.35f));
+        ov::circle(p, cx, cy, r, mc);
+        ov::circle_outline(p, cx, cy, r + 5 * k, 1.5f * k, ui::alpha(violet, 0.7f));
+        ov::text(p, cx, cy, ui::ts(30 * k, f.col ? ui::ink_on(f.col) : 0xFFFFFFFF, ov::align::center | ov::align::middle, 1 * k),
+                 ovl::initials(f.driver));
+        if (!f.code.empty())
+            ui::team_chip(p, cx - 26 * k, cy + r + 10 * k, f.code, f.col, k, 22);
+    }
     // the numbers of his career, counting up
     const int vals[5] = {f.seasons, f.starts, f.wins, f.podiums, f.titles};
     const char *es_l[5] = {"TEMPORADAS", "SALIDAS", "VICTORIAS", "PODIOS", "TÍTULOS"}, *en_l[5] = {"SEASONS", "STARTS", "WINS", "PODIUMS", "TITLES"};
-    float gw = (w - 120 * k) / 5, gx = x + 60 * k, gy = y + 160 * k;
+    float gw = (w - 240 * k) / 5, gx = x + 180 * k, gy = y + 160 * k; // 1.1.4: clear of the monogram
     float grow = ui::ease_out((t - 0.7f) / 1.6f);
     for (int i = 0; i < 5; ++i) {
         float cx = gx + gw * (static_cast<float>(i) + 0.5f);
@@ -603,7 +616,12 @@ bool draw_report(ov::Paint *p)
     bool es = g_ov.es;
     ov::Rect safe = ov::safe_area(p);
     float k = ov::ui_scale(p);
-    float w = 480 * k, pad = 20 * k, iw = w - 2 * pad;
+    float w = 560 * k, pad = 22 * k, iw = w - 2 * pad;
+    // 1.1.4: wider, with the player's value over the season beside its number and the team keenest on him
+    const UiSuitor *keenest = nullptr;
+    for (const UiSuitor &s : g_ov.future.suitors)
+        if (s.status == "keen" && (!keenest || s.interest > keenest->interest))
+            keenest = &s;
     // 1.1.3: the round's main story first, big, with the panel's key to read it; then the player's value and place,
     // the market's three numbers and the round's other stories
     ui::Tag tag = ui::news_tag(r.lead_kind);
@@ -614,7 +632,7 @@ bool draw_report(ov::Paint *p)
     float lead_h = 0;
     if (!r.lead_title.empty())
         lead_h = 30 * k + ui::text_h(p, ls, r.lead_title) + (r.lead_text.empty() ? 0 : 8 * k + ui::text_h(p, bs, r.lead_text)) + 16 * k;
-    float h = 58 * k + lead_h + 92 * k + 78 * k + static_cast<float>(r.headlines.size()) * 26 * k + 48 * k;
+    float h = 58 * k + lead_h + 92 * k + 78 * k + (keenest ? 40 * k : 0) + static_cast<float>(r.headlines.size()) * 26 * k + 48 * k;
     float a = ovl::presence(t, hold);
     float x = safe.x + safe.w - w - 24 * k + (ui::g_lite ? 0 : (1 - a) * 40 * k), y = safe.y + safe.h * 0.12f;
     ov::OpacityScope fade(p, a);
@@ -658,6 +676,13 @@ bool draw_report(ov::Paint *p)
         ov::text(p, x + w - pad, cy + 18 * k, ui::lifted(ui::ts(38 * k, ui::kGold, ov::align::right | ov::align::top), k), pos);
         ov::text(p, x + w - pad, cy, ui::ts(11.5f * k, ui::kMuted, ov::align::right | ov::align::top, 1.6f * k), es ? "CAMPEONATO" : "CHAMPIONSHIP");
     }
+    // 1.1.4: the season so far, race by race, between the value and the place
+    if (g_ov.future.values.size() >= 2) {
+        float sx = dx + 90 * k, sw = x + w - pad - 110 * k - sx;
+        if (sw >= 90 * k)
+            sparkline(p, sx, cy + 22 * k, sw, 40 * k, g_ov.future.values, r.delta < -0.04f ? ui::kDanger : ui::kGreen, k,
+                      ui::g_lite ? 1.0f : ui::ease_out((t - 0.3f) / 1.0f));
+    }
     cy += 92 * k;
     // three numbers of the market
     struct Stat {
@@ -679,6 +704,14 @@ bool draw_report(ov::Paint *p)
                  es ? stats[i].es : stats[i].en);
     }
     cy += 78 * k;
+    if (keenest) {
+        ov::text(p, x + pad, cy + 4 * k, ui::ts(11.5f * k, ui::kMuted, ov::align::left | ov::align::middle, 1.6f * k), es ? "MÁS INTERESADO" : "KEENEST ON YOU");
+        float kx = x + pad + 150 * k;
+        kx += ui::team_chip(p, kx, cy - 7 * k, keenest->code, keenest->col, k, 22) + 10 * k;
+        ov::text(p, kx, cy + 4 * k, ui::ts(16 * k, ui::kText, ov::align::left | ov::align::middle), ui::fit(p, ui::ts(16 * k), keenest->name, x + w - pad - 60 * k - kx));
+        ov::text(p, x + w - pad, cy + 4 * k, ui::ts(16 * k, keenest->interest >= 66 ? ui::kGreen : ui::kAmber, ov::align::right | ov::align::middle), std::to_string(keenest->interest) + "%");
+        cy += 40 * k;
+    }
     // the round's other stories
     for (const std::string &line : r.headlines) {
         ui::para(p, x + pad, cy - 5 * k, 6 * k, 10 * k, 3 * k, ui::kRed);
@@ -704,15 +737,25 @@ bool draw_alert(ov::Paint *p)
     bool es = g_ov.es;
     ov::Rect safe = ov::safe_area(p);
     float k = ov::ui_scale(p);
-    float w = 420 * k, h = 78 * k;
+    float w = 460 * k, h = 104 * k;
     float a = ovl::presence(t, hold);
+    // 1.1.4: the team's plan, from this season's teams
+    std::string strategy;
+    for (const UiTeam &tm : g_ov.teams)
+        if (tm.code == al.code)
+            strategy = tm.strategy;
     float x = safe.x + safe.w - w - 24 * k + (1 - a) * 40 * k, y = safe.y + 24 * k;
     ov::OpacityScope fade(p, a);
     ovl::frame(p, x, y, w, h, k, ui::vivid(al.col), al.col);
     ui::team_chip(p, x + 16 * k, y + h / 2 - 13 * k, al.code, al.col, k, 26);
-    ov::text(p, x + 100 * k, y + 26 * k, ui::ts(11.5f * k, ui::kText2, ov::align::left | ov::align::middle, 1.8f * k), es ? "TU FUTURO" : "YOUR FUTURE");
+    ov::text(p, x + 100 * k, y + 24 * k, ui::ts(11.5f * k, ui::kText2, ov::align::left | ov::align::middle, 1.8f * k), es ? "TU FUTURO" : "YOUR FUTURE");
     std::string line = es ? al.team + " va a por ti" : al.team + " want you";
-    ov::text(p, x + 100 * k, y + 52 * k, ui::ts(18 * k, ui::kText, ov::align::left | ov::align::middle), ui::fit(p, ui::ts(18 * k), line, w - 190 * k));
+    ov::text(p, x + 100 * k, y + 50 * k, ui::ts(19 * k, ui::kText, ov::align::left | ov::align::middle), ui::fit(p, ui::ts(19 * k), line, w - 190 * k));
+    if (!strategy.empty()) {
+        ui::Tag st = ui::strategy_tag(strategy);
+        ui::tag(p, x + 100 * k, y + 68 * k, es ? st.es : st.en, st.col, k, 10, true);
+    }
+    ui::hint(p, x + w - 190 * k, y + h - 18 * k, panel_key_label(), es ? "tu futuro" : "your future", k);
     // the interest as a ring
     float cx = x + w - 42 * k, cy = y + h / 2, r = 22 * k;
     ov::circle_outline(p, cx, cy, r, 4 * k, 0xFFFFFF14);
@@ -1045,7 +1088,9 @@ void draw_widget(ov::Paint *p)
     ov::Rect safe = ov::safe_area(p);
     float k = ov::ui_scale(p);
     size_t lines = std::min<size_t>(3, d.news.size());
-    float w = 440 * k, h = 112 * k + static_cast<float>(std::max<size_t>(1, lines)) * 26 * k;
+    // 1.1.4: one more line: your value and where the season took it
+    bool value_line = d.future.on && d.future.values.size() >= 2;
+    float w = 440 * k, h = 112 * k + static_cast<float>(std::max<size_t>(1, lines)) * 26 * k + (value_line ? 40 * k : 0);
     float x = safe.x + safe.w - w - 24 * k + (1 - a) * 40 * k, y = safe.y + safe.h * 0.2f;
     ov::OpacityScope fade(p, a);
     ovl::frame(p, x, y, w, h, k, ui::kRed);
@@ -1077,6 +1122,20 @@ void draw_widget(ov::Paint *p)
         ov::text(p, x + 30 * k, ly, s, ui::fit(p, s, n.title, w - 110 * k));
         ly += 26 * k;
     }
+    if (value_line) {
+        const std::vector<float> &v = d.future.values;
+        float delta = v.back() - v[v.size() - 2];
+        ly += 8 * k;
+        ov::rect(p, x + 16 * k, ly - 12 * k, w - 32 * k, 1 * k, 0xFFFFFF10);
+        ov::text(p, x + 16 * k, ly + 8 * k, ui::ts(11 * k, ui::kMuted, ov::align::left | ov::align::middle, 1.4f * k), d.es ? "TU VALOR" : "YOUR VALUE");
+        char b[24];
+        std::snprintf(b, sizeof b, "%.1f", v.back());
+        ov::text(p, x + 110 * k, ly + 8 * k, ui::ts(18 * k, ui::kText, ov::align::left | ov::align::middle), b);
+        std::snprintf(b, sizeof b, "%+.1f", delta);
+        uint32_t dc = delta > 0.04f ? ui::kGreen : delta < -0.04f ? ui::kDangerText : ui::kText2;
+        ov::text(p, x + 166 * k, ly + 8 * k, ui::ts(14 * k, dc, ov::align::left | ov::align::middle), b);
+        sparkline(p, x + 220 * k, ly - 4 * k, w - 236 * k, 24 * k, v, delta < -0.04f ? ui::kDanger : ui::kGreen, k, 1.0f);
+    }
     // the deadline countdown as a ring, at the right
     if (d.deadline && !d.finalised) {
         float cx = x + w - 40 * k, cy = y + 62 * k + 13 * k, r = 20 * k;
@@ -1092,6 +1151,49 @@ void draw_widget(ov::Paint *p)
 // ---------------------------------------------------------------------------------------------------
 // The manager: one overlay at a time, the most important first. Full-screen moments take the keys; the rest leave
 // them to the game. Nothing shows during a session or while the panel is open.
+
+// 1.1.4: what drawing the F7 panel costs on the render thread (the addon's layout plus the core taking every draw
+// call), page by page; one "paint:" line each time the panel closes (tools/swperf.py reads it)
+namespace paint_cost {
+struct Acc {
+    int frames = 0;
+    double sum = 0, worst = 0;
+    void add(double ms)
+    {
+        ++frames;
+        sum += ms;
+        worst = std::max(worst, ms);
+    }
+};
+std::array<Acc, kPageCount> pages{};
+Acc all;
+
+void add(int page, double ms)
+{
+    all.add(ms);
+    if (page >= 0 && page < kPageCount)
+        pages[static_cast<size_t>(page)].add(ms);
+}
+
+void report()
+{
+    if (all.frames >= 10) {
+        std::string parts;
+        for (int i = 0; i < kPageCount; ++i) {
+            const Acc &a = pages[static_cast<size_t>(i)];
+            if (!a.frames)
+                continue;
+            char b[96];
+            std::snprintf(b, sizeof b, "%s%s %.2f/%.2f", parts.empty() ? "" : ", ", kPages[i].en, a.sum / a.frames, a.worst);
+            parts += b;
+        }
+        swofty::log("[silly-season] paint: panel %d frame(s), mean %.2f ms, worst %.2f ms (%s)", all.frames,
+                    all.sum / all.frames, all.worst, parts.c_str());
+    }
+    pages = {};
+    all = Acc{};
+}
+} // namespace paint_cost
 
 // render thread: every remembered thing of the overlays, as when the addon loaded
 void reset_paint_state()
@@ -1118,7 +1220,7 @@ void paint(ov::Paint *p, void *)
     last_frame = now;
     dt = std::clamp(dt, 0.0f, 0.1f);
     ov::Input in = ov::input(p);
-    std::lock_guard lock(g_ov_lock);
+    adopt_overlay(); // 1.1.4: the newest data, then no lock while drawing
     if (int gen = g_ov_generation.load(); gen != ovl::generation_seen) {
         ovl::generation_seen = gen;
         reset_paint_state();
@@ -1157,6 +1259,7 @@ void paint(ov::Paint *p, void *)
     bool full = ovl::current == Show::awards || ovl::current == Show::cover;
     if (open && (!panel_ok || toggle || (back && !inner))) {
         open = false;
+        paint_cost::report();
         ov::focus(false);
         ui4::modal = 0;
         ui4::modal_back.clear();
@@ -1179,6 +1282,12 @@ void paint(ov::Paint *p, void *)
             ui4::story_y = -1;
             ovl::current = Show::none;
         }
+        // 1.1.4: from the alert of a team keen on the player: straight to Your Future
+        if (ovl::alert_on && !ui4::story_focus && !g_ov.press_pending) {
+            tab = P_FUTURE;
+            scroll = scroll_target = 0;
+            ovl::alert_on = false;
+        }
         // a waiting question opens on the press page (unless the race report sent the player to its story)
         if (g_ov.press_pending && !ui4::story_focus) {
             tab = P_PRESS;
@@ -1190,7 +1299,9 @@ void paint(ov::Paint *p, void *)
     }
     g_board_open = open;
     if (open) {
+        auto t0 = Clock::now();
         draw_board(p, in, dt);
+        paint_cost::add(tab, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         if (ui4::reveal_on) { // R on the Grid page: the hub makes way for the reveal
             g_board_open = false;
             ui4::modal = 0;
@@ -1275,7 +1386,8 @@ void paint(ov::Paint *p, void *)
 
     // the alerts of teams keen on the player, at the top right (not over a full-screen moment)
     if (!full) {
-        if (!ovl::alert_on && !g_ov.alerts.empty()) {
+        // 1.1.4: one at a time: the alert waits while another overlay is on screen
+        if (!ovl::alert_on && !g_ov.alerts.empty() && ovl::current == Show::none) {
             ovl::alert = std::move(g_ov.alerts.front());
             g_ov.alerts.pop_front();
             ovl::alert_on = true;

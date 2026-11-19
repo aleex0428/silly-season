@@ -2423,6 +2423,7 @@ struct UiSeat {
     std::string name;
     bool fresh = false, player = false;
     std::string id;
+    int game = -1; // 1.1.4: the seat in the game: -1 no write, 0 or 1 waiting for the game to show it, 2 confirmed
 };
 
 struct UiTeam {
@@ -2434,6 +2435,12 @@ struct UiTeam {
     UiSeat seat[2];
     std::string strategy; // the team's plan ("title", "rebuild"...)
 };
+
+// 1.1.5: the short name of the series a driver left F1 for (Driver::away), for the panel's chips
+inline std::string away_code(const std::string &series)
+{
+    return series == "wec" ? "WEC" : series == "indycar" ? "INDYCAR" : series == "formula_e" ? "FORMULA E" : "";
+}
 
 struct UiDriver {
     std::string id;
@@ -2659,6 +2666,7 @@ struct OverlayData {
     int cover_pending = 0;                   // the season whose cover waits (0: none)
     std::vector<UiMove> cover_moves;         // the winter's moves, for the cover
     bool press_popup = true, race_report = true;
+    bool fresh = false; // 1.1.4: another career (or none): nothing that waited to be shown is kept
     const UiDriverCard *card(const std::string &id) const
     {
         for (const UiDriverCard &c : cards)
@@ -2675,8 +2683,66 @@ struct OverlayData {
     }
 };
 
+// 1.1.4: the flow thread builds the overlays' data in a copy of its own and hands it over under g_ov_lock (a pointer
+// swap); the render thread takes it at the start of a frame (adopt_overlay) and draws from g_ov without any lock, so
+// neither thread waits for the other. g_ov belongs to the render thread.
 std::mutex g_ov_lock;
 OverlayData g_ov;
+std::unique_ptr<OverlayData> g_ov_next; // g_ov_lock: built, not taken yet
+std::atomic<int> g_ov_built{0};         // the last version built
+
+// what waits to be shown (the render thread takes these one at a time): the older first, the newest kept within cap
+template <class T> void carry(std::deque<T> &into, std::deque<T> &older, size_t cap)
+{
+    for (auto it = older.rbegin(); it != older.rend(); ++it)
+        into.push_front(std::move(*it));
+    while (into.size() > cap)
+        into.pop_front();
+}
+
+void carry_queues(OverlayData &into, OverlayData &older)
+{
+    carry(into.banners, older.banners, 6);
+    carry(into.signings, older.signings, 3);
+    carry(into.farewells, older.farewells, 4);
+    carry(into.strips, older.strips, 1);
+    carry(into.alerts, older.alerts, 3);
+}
+
+// render thread: the newest data built, if there is one
+bool adopt_overlay()
+{
+    std::unique_ptr<OverlayData> next;
+    {
+        std::lock_guard lock(g_ov_lock);
+        next = std::move(g_ov_next);
+    }
+    if (!next)
+        return false;
+    if (!next->fresh)
+        carry_queues(*next, g_ov);
+    g_ov = std::move(*next);
+    return true;
+}
+
+// flow thread: hands the data over (what the last hand-over still holds waits on in this one)
+void publish_overlay(OverlayData &&o)
+{
+    auto made = std::make_unique<OverlayData>(std::move(o));
+    {
+        std::lock_guard lock(g_ov_lock);
+        if (g_ov_next) {
+            if (g_ov_next->fresh)
+                made->fresh = true;
+            else if (!made->fresh)
+                carry_queues(*made, *g_ov_next);
+        }
+        g_ov_next = std::move(made);
+    }
+#ifdef SILLY_SEASON_PREVIEW
+    adopt_overlay(); // the tests and the previews have no render thread: the data is taken at once
+#endif
+}
 std::atomic<bool> g_in_session{false};
 std::atomic<bool> g_board_open{false};
 std::atomic<bool> g_seen_request{false};
@@ -2817,6 +2883,9 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
             const ss::Driver *d = st.driver(who);
             next.seat[k] = {who.empty() ? std::string() : dname(who), d && d->team != t.id,
                             !who.empty() && who == st.player, who};
+            for (const ss::State::SeatCheck &sc : st.seat_checks)
+                if (sc.year == st.year && sc.team == t.id && sc.driver == who && !who.empty())
+                    next.seat[k].game = sc.state;
         }
         o.teams.push_back(std::move(now));
         o.grid.push_back(std::move(next));
@@ -2879,6 +2948,11 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
             u.team = t->name;
             u.code = t->code;
             u.col = t->colour;
+        } else if (!d.away.empty()) {
+            // 1.1.5: racing in another series for now (he may come back)
+            u.role = "away";
+            u.role_code = away_code(d.away);
+            u.role_col = 0xFFB547;
         } else if (s.academies) {
             // 1.1.0 phase 6: a reserve driver, or a driver in a team's academy
             if (const ss::Team *rt = ss::reserve_team_of(st, d.id)) {
@@ -3125,8 +3199,11 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
             }
             c.rating[4] = c.peak[4] = d.focus; // the market doesn't model where focus goes
             c.game_rating = d.game_overall > 0 ? static_cast<int>(std::lround(d.game_overall)) : 0;
-            // 1.1.0 phase 6: his role off the grid
-            if (s.academies && d.team.empty()) {
+            // 1.1.0 phase 6: his role off the grid. 1.1.5: or the series he races in now
+            if (d.team.empty() && !d.away.empty()) {
+                c.role = "away";
+                c.role_team = away_code(d.away);
+            } else if (s.academies && d.team.empty()) {
                 if (const ss::Team *rt = ss::reserve_team_of(st, id)) {
                     c.role = "reserve";
                     c.role_team = rt->name;
@@ -3471,10 +3548,7 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
                 o.cover_moves.push_back(ui_move(m));
 
     auto breaking = ss::take_breaking(g_state, 4);
-    std::lock_guard lock(g_ov_lock);
-    o.farewells = std::move(g_ov.farewells);
-    o.strips = std::move(g_ov.strips);
-    o.alerts = std::move(g_ov.alerts);
+    // 1.1.4: only the new ones; what still waits on screen is carried over when the render thread takes this data
     for (UiAlert &a : new_alerts)
         o.alerts.push_back(std::move(a));
     while (o.alerts.size() > 3)
@@ -3485,9 +3559,7 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
     o.waiting_year = g_real_career && st.season_index < 0;
     o.enabled = headlines;
     o.effects = effects;
-    o.version = g_ov.version + 1;
-    o.banners = std::move(g_ov.banners);
-    o.signings = std::move(g_ov.signings);
+    o.version = ++g_ov_built;
     if (o.enabled)
         for (ss::NewsItem &n : breaking) {
             const ss::Driver *d = st.driver(n.driver);
@@ -3545,7 +3617,7 @@ void update_overlay(const ss::Settings &s) // flow thread, g_lock held
         o.strips.pop_front();
     while (o.banners.size() > 6)
         o.banners.pop_front();
-    g_ov = std::move(o);
+    publish_overlay(std::move(o));
 }
 
 // The drawing kit, the F7 hub and the banner
@@ -4687,15 +4759,11 @@ SWOFTY_ON_LOAD
         g_track_race = false;
         g_track_started = -1;
         g_grid_extra_said.clear();
-        std::lock_guard ov_lock(g_ov_lock);
-        g_ov.career = false;
-        g_ov.banners.clear();
-        // 1.1.3: nothing of this career waits to be shown in the next one
-        g_ov.signings.clear();
-        g_ov.farewells.clear();
-        g_ov.strips.clear();
-        g_ov.alerts.clear();
-        g_ov.report = UiReport{};
+        // 1.1.3: nothing of this career waits to be shown in the next one. 1.1.4: an empty hand-over (no career)
+        OverlayData blank;
+        blank.fresh = true;
+        blank.version = ++g_ov_built;
+        publish_overlay(std::move(blank));
         g_ov_generation.fetch_add(1);
     });
     // no banner or panel while a session runs

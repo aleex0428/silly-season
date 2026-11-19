@@ -1,5 +1,32 @@
-# 1.1.5 (in progress)
+# 1.1.5
 
+- **More realistic transfers and retirements** (your vote: 108 votes). The market was measured against the real grids of 2012 to 2025 and now moves like F1 does, on the Realistic intensity (Lively and Chaos still move more):
+  - **About four new faces each winter**, with quiet winters and big shake-ups, and about three drivers changing teams. Contracts follow the driver: stars sign for two to four years, the midfield and rookies for one or two. A team can end a contract early when its driver falls well short of his team-mate.
+  - **Retirements have a reason**, said in the story: age, no winning car in sight (a veteran out of contract at a team in the back half), or no seat for next year. Now and then a champion walks away at the very top, told after the last race.
+  - **Losing a seat isn't retiring.** A driver left out can become a reserve, race in **WEC, IndyCar or Formula E** (shown on his card and in the free agents), or wait for a chance. Drivers come back: about one a season returns to the grid after a year or more out.
+  - **Nobody waits for ever:** a veteran out of a seat, or a driver three seasons out of F1, retires quietly. The market always keeps enough free drivers to fill every seat.
+  - **Mid-season changes:** about one sacking or swap a season and one or two stand-ins, as in F1 since 2015. Teams with a sister team swap their drivers first; a driver just sacked isn't hired by another team in the same season.
+  - **Deals are told from the summer** (the summer break and after), retirements around it, as in the real silly season.
+- **Progressive's 2012 and 2013 seasons:** Charles Pic and Mark Webber have their names.
+- **A new F7 panel.** The same market, laid out to show more of it:
+  - A one-line header with the season bar, and the pages in **five sections** on a rail at the left (Market, You, Grid, Talent, Archive), each section's pages as tabs. The content gets the width the old menu took: more rows on every table.
+  - **1-5** (or **LT/RT** on a controller) jump between the sections, to the page you last had open in each; Q/E and LB/RB still step through every page. On the Press page, 1-3 still answer the question.
+  - The section icons on the rail light up with what waits in them: unread news, a question from the press, a team keen on you.
+  - **The Paddock is a front page:** the lead story across the top in its team's colours, the market's pulse beside it (the window, the races left, seats in play, rumours and done deals), then the other stories, your corner, the market movers with their value race by race, and the championship.
+  - **Driver cards take the whole panel:** a monogram in the team's colour, the contract as a line of years, a bigger ratings chart, the value race by race, who he's linked with (with the odds), the news, his career path year by year and his honours. Team cards too.
+  - **An inspector next to the tables** (Drivers, Free agents, Contracts, Stock, Formula 2, Scouting): the picked driver's value, potential and trend, his value race by race, his deal and what's said about him, without opening his card.
+  - **The Transfer Centre draws the dominoes:** each chain left to right, the teams as boxes and every move as an arrow into the seat it takes, with the seat the chain leaves open lit at its start.
+  - **The Grid shows each new seat's state in the game:** pending until the game shows it, then confirmed.
+  - Text is never smaller than 12 px at 1080p.
+  - **News has a filter:** all, official, rumours or the press, each with how many stories it holds (F, or Y on a controller).
+  - **Your Future** shows your season as a line next to your numbers, and what the paddock says about you under your value.
+  - **Team cards** show their two drivers' value race by race. **History** without moves yet takes one line instead of a page.
+- **The farewell card** shows the driver's initials in his last team's colour, with its badge, and the colour fades out across the card instead of ending in a hard edge. **The Team HQ card** adds your value and its move since the last race, with your season as a line.
+- **The race report** is wider, with your value over the season beside its number and the team keenest on you. **The interest alert** shows the team's plan, and the panel's key opens Your Future from it. **One overlay at a time:** the alert waits while another is on screen.
+- **Faster drawing.** The panel makes about a third fewer draw calls a frame (the weave behind it is one texture instead of a line every few pixels, long dashed boxes use longer dashes), text is measured once and remembered without building a string per call, and cutting a long text to fit no longer measures it letter by letter. A full text cache no longer makes one frame measure everything again (a 16 ms frame on the News page in the bench).
+- **No waiting between threads.** The overlays' data is handed to the render thread in one swap: drawing the panel never holds up Team HQ, and Team HQ never holds up a frame.
+- **Game memory reads on the current Swofty SDK** (1.9.55): they ask the launcher's shared page table, which removes a per-minute cost and its hitches. Still works with launcher 1.8.36 and later.
+- The log says what drawing the panel cost each time it closes (paint: panel ...), page by page, to help with reports.
 - **A damaged market save no longer crashes the game.** If Silly Season's save for a career was damaged or edited by hand so that its random seed wasn't a number, loading that career crashed F1 25. Now the career loads with its market as it was saved.
 
 # 1.1.4

@@ -2083,6 +2083,117 @@ void banner_cursor()
     check(second.size() == 2 && second[0].id == 5, "the two left out come next time");
 }
 
+// 1.1.4: the overlays' data goes from the flow thread to the render thread in one hand-over: what waits to be shown is
+// carried into the next data (oldest first, within each queue's cap), and another career's data drops it
+void overlay_hand_over()
+{
+    begin("1.1.4: the overlays' data is handed over between threads without losing what waits");
+    OverlayData saved = std::move(g_ov);
+    g_ov = OverlayData{};
+    g_ov.alerts.push_back({"Ferrari", "FER", 0xE8002D, 70});
+    {
+        // built twice before the render thread takes it: both builds' new items wait, the oldest first
+        OverlayData a;
+        a.alerts.push_back({"Mercedes", "MER", 0x27F4D2, 80});
+        auto made = std::make_unique<OverlayData>(std::move(a));
+        std::lock_guard lock(g_ov_lock);
+        g_ov_next = std::move(made);
+    }
+    {
+        OverlayData b;
+        b.alerts.push_back({"McLaren", "MCL", 0xFF8000, 90});
+        b.alerts.push_back({"Alpine", "ALP", 0x0093CC, 60});
+        auto made = std::make_unique<OverlayData>(std::move(b));
+        std::lock_guard lock(g_ov_lock);
+        carry_queues(*made, *g_ov_next); // what publish_overlay does when the last one wasn't taken
+        g_ov_next = std::move(made);
+    }
+    check(adopt_overlay(), "the render thread takes the newest data");
+    check(g_ov.alerts.size() == 3 && g_ov.alerts[0].code == "MER" && g_ov.alerts[2].code == "ALP",
+          "the queue keeps its cap of 3, the oldest dropped first: " + std::to_string(g_ov.alerts.size()));
+    check(!adopt_overlay(), "nothing new: nothing taken");
+    {
+        OverlayData blank;
+        blank.fresh = true;
+        auto made = std::make_unique<OverlayData>(std::move(blank));
+        std::lock_guard lock(g_ov_lock);
+        g_ov_next = std::move(made);
+    }
+    adopt_overlay();
+    check(g_ov.alerts.empty() && !g_ov.career, "another career: nothing of the last one waits");
+    g_ov = std::move(saved);
+}
+
+// 1.1.4: the panel's sections: every page once, in order, Q/E reach them all and come back
+void panel_sections()
+{
+    begin("1.1.4: the F7 panel's five sections hold every page once");
+    std::set<int> seen;
+    int covered = 0;
+    for (int s = 0; s < kSectionCount; ++s) {
+        covered += kSections[s].count;
+        for (int j = 0; j < kSections[s].count; ++j) {
+            int page = kOrder[kSections[s].first + j];
+            seen.insert(page);
+            check(section_of(page) == s, std::string("page ") + kPages[page].en + " is in its section");
+        }
+    }
+    check(covered == kPageCount && static_cast<int>(seen.size()) == kPageCount, "the sections hold the 17 pages, each once");
+    int at = P_PADDOCK, steps = 0;
+    std::set<int> visited;
+    do {
+        visited.insert(at);
+        at = kOrder[(order_of(at) + 1) % kPageCount];
+        ++steps;
+    } while (at != P_PADDOCK && steps < 100);
+    check(steps == kPageCount && static_cast<int>(visited.size()) == kPageCount, "E steps through every page and back to the Paddock");
+    check(section_of(P_PRESS) == section_of(P_FUTURE), "the press and Your Future share the YOU section");
+}
+
+// 1.1.4: the Grid page's seats say what the game shows: written and waiting, or confirmed
+void grid_seat_states(::fake::Game &g, const json::Value &baseline)
+{
+    begin("1.1.4: next season's seats carry their state in the game");
+    Career c(g, baseline, "f1_career_2025", "f1_career_2025.driver_career:{seatstate}", "lando_norris");
+    c.load();
+    c.enter_hub();
+    ss::Settings s = settings();
+    {
+        std::lock_guard lock(g_lock);
+        g_state.seat_checks.clear();
+        // a seat the market planned for next season, written and not shown yet, and one the game confirmed
+        auto grid = ss::projected_grid(g_state, s);
+        int made = 0;
+        for (const ss::Team &t : g_state.teams) {
+            const std::string &who = grid[t.id][0];
+            if (who.empty() || made >= 2)
+                continue;
+            ss::State::SeatCheck sc;
+            sc.team = t.id;
+            sc.driver = who;
+            sc.year = g_state.year;
+            sc.state = made == 0 ? 1 : 2;
+            g_state.seat_checks.push_back(sc);
+            ++made;
+        }
+        update_overlay(s);
+    }
+    int waiting = 0, confirmed = 0;
+    for (const UiTeam &t : g_ov.grid)
+        for (const UiSeat &seat : t.seat) {
+            waiting += seat.game == 1;
+            confirmed += seat.game == 2;
+        }
+    check(waiting == 1 && confirmed == 1, "one seat waits for the game, one is confirmed: " + std::to_string(waiting) + "/" +
+                                              std::to_string(confirmed));
+    {
+        std::lock_guard lock(g_lock);
+        g_state.seat_checks.clear();
+    }
+    c.leave_hub();
+    c.unload();
+}
+
 // The press hint at Team HQ names the panel's key as set
 void press_key(::fake::Game &g, const json::Value &baseline)
 {
@@ -2197,6 +2308,10 @@ int main(int argc, char **argv)
     track_attempts(g, baseline);
     banner_cursor();
     press_key(g, baseline);
+    // 1.1.4: the F7 panel and the overlays
+    overlay_hand_over();
+    panel_sections();
+    grid_seat_states(g, baseline);
 
     std::printf("\n%s\n", failures ? "plugin_test: FAILURES" : "all plugin checks passed");
     return failures ? 1 : 0;

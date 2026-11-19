@@ -9,6 +9,7 @@ rem   build.bat sim [n]          -> only sim_test; "grid", "history" and "plugin
 rem   build.bat plugin [what]    -> only plugin_test: plugin.cpp run through whole careers against a fake game
 rem                              (tests\fake_game.hpp). what: "bench" times the handlers, "quiet" hides the addon's log
 rem   build.bat preview <dir> [en|es] [rounds] -> draws the F7 hub, the cards and every overlay into SVG files
+rem   build.bat preview bench [en|es] [rounds]  -> 1.1.4: times drawing every F7 page (ms and draw calls a frame)
 rem   build.bat bench [careers] [seasons] -> times the engine (rounds, season turn, save, load) and the save's size,
 rem                              against the previous run (build\bench_last.json)
 rem   build.bat texts [careers] [seasons] -> every text the market writes over many careers, into build\texts.json

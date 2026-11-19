@@ -64,8 +64,8 @@ struct StateRng {
 float clampf(float v, float lo, float hi) { return std::max(lo, std::min(hi, v)); }
 
 double noise_sigma(Intensity i) { return i == Intensity::chaos ? 8.0 : i == Intensity::lively ? 4.5 : 2.5; }
-double poach_chance(Intensity i) { return i == Intensity::chaos ? 0.65 : i == Intensity::lively ? 0.40 : 0.20; }
-int midseason_cap(Intensity i) { return i == Intensity::chaos ? 3 : i == Intensity::lively ? 2 : 1; }
+double poach_chance(Intensity i) { return i == Intensity::chaos ? 0.65 : i == Intensity::lively ? 0.45 : 0.30; } // 1.1.5: was 0.20 in realistic
+int midseason_cap(Intensity i) { return i == Intensity::chaos ? 4 : i == Intensity::lively ? 3 : 2; } // 1.1.5: real F1 has 0-3 a season
 
 float value(const Driver &d) { return d.overall() + 4.0f * d.form; }
 
@@ -168,7 +168,8 @@ int contract_length(Rng &r, const Driver &d, int year, bool traits = true)
     int age = d.age(year);
     if (age >= 36)
         return 1;
-    int n = value(d) >= 88 ? r.range(2, 4) : age <= 22 ? r.range(2, 3) : r.range(1, 3);
+    // 1.1.5: as in F1: the stars sign long, rookies and the midfield one or two seasons at a time
+    int n = value(d) >= 88 ? r.range(2, 4) : value(d) >= 84 ? r.range(1, 3) : age <= 22 ? r.range(1, 2) : r.range(1, 2);
     // a loyal driver signs for longer; an ambitious star keeps his options open
     if (traits && d.loyalty >= 0.7f && n < 4 && r.chance(0.5))
         ++n;
@@ -184,7 +185,8 @@ double retire_chance(const Driver &d, int year, bool contracted_beyond, Intensit
     int age = d.age(year);
     if (age < 34)
         return 0;
-    static const double table[] = {0.03, 0.05, 0.08, 0.12, 0.18, 0.25, 0.32, 0.40, 0.48, 0.55, 0.62, 0.70};
+    // 1.1.5: a touch earlier (the real retirements of 2012-2022 came at 37 on average)
+    static const double table[] = {0.05, 0.10, 0.16, 0.23, 0.30, 0.36, 0.42, 0.48, 0.54, 0.60, 0.65, 0.70};
     double p = table[std::min(age - 34, 11)];
     float v = d.overall();
     if (v < 76)
@@ -196,6 +198,49 @@ double retire_chance(const Driver &d, int year, bool contracted_beyond, Intensit
     if (in == Intensity::chaos)
         p *= 1.3;
     return std::min(p, 0.9);
+}
+
+// 1.1.5: why a driver with a seat retires this season, and how likely (p): the age table, plus a veteran out of
+// contract in a car that can't win, who would rather stop (Vettel, Alonso in 2018)
+std::string retire_reason(const State &st, const Driver &d, double &p, Intensity in)
+{
+    p = retire_chance(d, st.year, d.contract > st.year, in);
+    std::string why = "age";
+    if (d.kind == "legend" || d.team.empty())
+        return why;
+    int age = d.age(st.year);
+    if (age >= 33 && d.contract <= st.year && d.overall() >= 82 && team_rank(st, d.team) >= 5) {
+        double extra = 0.09 * (in == Intensity::chaos ? 1.4 : in == Intensity::lively ? 1.2 : 1.0);
+        if (extra >= p)
+            why = "no_car";
+        p = std::min(0.9, p + extra);
+    }
+    return why;
+}
+
+// 1.1.5: the season a driver last raced. Where the market hasn't written it yet (a new career, a driver added later, a
+// save from before 1.1.5) a driver with a seat races this season, and one without a seat who has F1 seasons behind him
+// is taken to have raced the one before. Worked out when asked, so a save reads back exactly as it was written.
+// 1.1.5: free drivers the game can put in a race seat (raced, or free-agent rows; not juniors): the market keeps enough of
+// them that every seat can be filled, so a driver only retires out of a seat while there are plenty
+int seatable_free(const State &st)
+{
+    int n = 0;
+    for (const auto &[id, d] : st.drivers)
+        if (d.team.empty() && !d.retired && !d.retiring && (d.kind == "f1" || d.kind == "pool") && !st.shielded(id) &&
+            st.seatable(id))
+            ++n;
+    return n;
+}
+constexpr int kMinFreePool = 12;
+
+int last_raced_of(const State &st, const Driver &d)
+{
+    if (d.last_raced > 0 || d.kind == "legend" || d.kind == "player")
+        return d.last_raced;
+    if (!d.team.empty())
+        return st.year;
+    return d.seasons > 0 || d.kind == "f1" ? st.year - 1 : 0;
 }
 
 // --- personality ----------------------------------------------------------------------------------------
@@ -964,11 +1009,11 @@ float seat_score(const State &st, const Settings &s, const Team &t, const Driver
     const std::string plan = s.strategies ? t.strategy : t.performance >= 85 ? "title" : t.junior ? "youth" : "contend";
     bool top = plan == "title";
     bool young_plan = plan == "rebuild" || plan == "youth";
-    float stay = s.intensity == Intensity::chaos ? 2.0f : s.intensity == Intensity::lively ? 4.0f : 6.0f;
+    float stay = s.intensity == Intensity::chaos ? 1.0f : s.intensity == Intensity::lively ? 2.5f : 4.0f; // 1.1.5: was 2/4/6
     if (d.team == t.id) {
         score += stay; // continuity
         if (s.personality && d.loyalty >= 0)
-            score += (d.loyalty - 0.5f) * 6.0f; // a loyal driver is easy to keep
+            score += (d.loyalty - 0.5f) * 9.0f; // a loyal driver is easy to keep (1.1.5: 6, with a smaller continuity)
     }
     // 1.1.3, on track: a driver in a lot of incidents worries a team fighting at the front; a racer who passes a lot
     // impresses everyone a little
@@ -1015,6 +1060,11 @@ float seat_score(const State &st, const Settings &s, const Team &t, const Driver
         score -= static_cast<float>(age - 29) * 0.8f;
     if (rookie && top)
         score -= 5.0f; // top teams want proven drivers
+    // 1.1.5: a driver back from a season or three away (out of a seat, or in another series) is a known quantity for
+    // a team outside the top: Hülkenberg, Albon, Ricciardo, Bottas came back that way
+    if (d.team.empty() && d.seasons >= 2 && last_raced_of(st, d) > 0 && st.year + 1 - last_raced_of(st, d) <= 3 && age <= 36 && !top &&
+        d.kind != "legend")
+        score += (plan == "survival" ? 4.0f : 2.5f) + std::max(0.0f, v - 76.0f) * 0.35f;
     // the driver's side: a seat he wants is easier to land, one below his standing harder
     if (s.personality && d.ambition >= 0 && !rookie)
         score += clampf(interest(st, d, t, s), -12.0f, 8.0f) * 0.3f;
@@ -1161,7 +1211,7 @@ Plan plan_market(const State &st, const Settings &s, uint64_t seed)
                 if (!by_contract.count(id) || d.team.empty())
                     continue;
                 const Team *cur = st.team(d.team);
-                if (!cur || cur->id == t.id || t.attraction() - cur->attraction() < 10.0f || value(d) < 84.0f)
+                if (!cur || cur->id == t.id || t.attraction() - cur->attraction() < 8.0f || value(d) < 82.0f) // 1.1.5: 10, 84
                     continue;
                 poach = true;
             }
@@ -1541,9 +1591,9 @@ void market_round(State &st, const Settings &s, Rng &r, int round, double progre
                  [&](text::Lang l) { return text::h_talks(l, pick0, driver_name(st, deal.driver), team_name(st, deal.team)); },
                  [&](text::Lang l) { return std::string(text::talks(l, pick0, driver_name(st, deal.driver), team_name(st, deal.team))); }, false);
                 tag_news(st, deal.driver, deal.team); }
-        } else if (deal.stage == Stage::talks && progress >= 0.50 && r.chance(dl ? 0.6 : 0.30)) {
+        } else if (deal.stage == Stage::talks && progress >= 0.38 && r.chance(dl ? 0.6 : 0.30)) {
             deal.stage = Stage::agreed;
-        } else if (deal.stage == Stage::agreed && progress >= 0.60 && !st.observer) {
+        } else if (deal.stage == Stage::agreed && progress >= 0.45 && !st.observer) { // 1.1.5: the summer, as in F1
             // an observer career's deals stay agreed: the game's grid says whether they happen (observe_grid)
             // the domino: the seat's driver must be gone first
             deal.waits = blocker(st, plan, deal);
@@ -1562,7 +1612,7 @@ void market_round(State &st, const Settings &s, Rng &r, int round, double progre
     refusal_news(st, s, r, plan, round, progress);
 
     // renewals of the drivers the plan keeps, announced along the way
-    if (progress >= 0.55 && !st.observer)
+    if (progress >= 0.42 && !st.observer) // 1.1.5: from before the summer break
         for (const Move &m : plan.moves)
             if (m.kind == "renewal" && !find_deal(st, m.driver) && r.chance(dl ? 0.35 : 0.18)) {
                 Deal deal{m.driver, m.to, "renewal", st.year + 1, 0, Stage::official, false, round};
@@ -1724,25 +1774,117 @@ void draw_retirements(State &st, const Settings &s, Rng &r, int round)
                 continue;
             if (Deal *deal = find_deal(st, d->id); deal && !deal->fake && deal->stage >= Stage::agreed)
                 continue; // he has just signed for next season
-            double p = retire_chance(*d, st.year, d->contract > st.year, s.intensity);
+            double p = 0;
+            std::string why = retire_reason(st, *d, p, s.intensity);
+            // 1.1.5: with few free drivers the game can seat, only the oldest stop: the seat must be filled
+            if (seatable_free(st) <= kMinFreePool / 2 && d->age(st.year) < 40)
+                p *= 0.25;
             if (p > 0 && r.chance(p)) {
                 d->retiring = true;
+                d->exit_reason = why;
                 for (Deal &deal : st.deals)
                     if (deal.driver == d->id && deal.stage != Stage::official)
                         deal.stage = Stage::collapsed;
-                { int pick0 = r.range(0, 9);
+                { int pick0 = r.range(0, 9); int pick1 = r.range(0, 9);
+                std::string team = t.name;
                 add_news(st, round, "retirement",
                  [&](text::Lang l) { return text::h_retirement(l, pick0, d->name); },
-                 [&](text::Lang l) { return std::string(text::retirement(l, pick0, d->name, d->age(st.year), std::max(d->seasons, 1))); }, true); }
+                 [&](text::Lang l) {
+                     std::string body = text::retirement(l, pick0, d->name, d->age(st.year), std::max(d->seasons, 1));
+                     std::string why_text = text::retirement_reason(l, pick1, why, d->name, team);
+                     return why_text.empty() ? body : body + " " + why_text;
+                 }, true); }
             }
         }
+}
+
+// 1.1.5: the champion who stops at the very top (Rosberg in 2016), told after the last race: rare, never the player
+void top_retirement(State &st, const Settings &s, Rng &r)
+{
+    Driver *champ = nullptr;
+    for (Team &t : st.teams)
+        for (const std::string &who : t.seats)
+            if (Driver *d = st.driver(who))
+                if (!champ || d->points > champ->points)
+                    champ = d;
+    if (!champ || champ->id == st.player || champ->kind == "player" || champ->kind == "legend" || champ->retiring ||
+        champ->points <= 0 || champ->age(st.year) < 30 || st.shielded(champ->id))
+        return;
+    for (Team &t : st.teams)
+        for (int k = 0; k < 2; ++k)
+            if (t.seats[static_cast<size_t>(k)] == champ->id && st.locked(t, k, s))
+                return;
+    double p = s.intensity == Intensity::chaos ? 0.12 : s.intensity == Intensity::lively ? 0.08 : 0.05;
+    if (seatable_free(st) <= kMinFreePool / 2 || !r.chance(p))
+        return;
+    champ->retiring = true;
+    champ->exit_reason = "top";
+    for (Deal &deal : st.deals)
+        if (deal.driver == champ->id && deal.stage != Stage::official)
+            deal.stage = Stage::collapsed;
+    std::string team = team_name(st, champ->team);
+    int pick0 = r.range(0, 9), pick1 = r.range(0, 9);
+    add_news(st, st.round, "retirement", [&](text::Lang l) { return text::h_shock_retirement(l, champ->name); },
+             [&](text::Lang l) {
+                 return text::retirement(l, pick0, champ->name, champ->age(st.year), std::max(champ->seasons, 1)) + " " +
+                        text::retirement_reason(l, pick1, "top", champ->name, team);
+             }, true);
+    tag_news(st, champ->id, "", champ->team);
+}
+
+// 1.1.5: what a driver left without a seat does: "retire" (more likely the older he is), "away" (another series, for a
+// driver with a few seasons behind him) or "" (he stays on the market, and may come back)
+std::string exit_fate(State &st, const Settings &s, Rng &r, const std::string &id, const std::string &from)
+{
+    Driver *d = st.driver(id);
+    if (!d || d->id == st.player || d->kind == "player" || d->kind == "legend" || d->retiring || d->retired)
+        return {};
+    int age = d->age(st.year);
+    double retire = age >= 35 ? 0.55 : age >= 33 ? 0.25 : age >= 31 ? 0.08 : 0.0;
+    if (seatable_free(st) <= kMinFreePool / 2)
+        retire = 0; // the market needs him: he stays on it (next season's grid is full already: a small margin does)
+    std::string team = team_name(st, from);
+    if (retire > 0 && r.chance(retire)) {
+        d->retiring = true;
+        d->exit_reason = "no_seat";
+        int pick0 = r.range(0, 9), pick1 = r.range(0, 9);
+        add_news(st, st.round, "retirement", [&](text::Lang l) { return text::h_retirement(l, pick0, d->name); },
+                 [&](text::Lang l) {
+                     return text::retirement(l, pick0, d->name, age, std::max(d->seasons, 1)) + " " +
+                            text::retirement_reason(l, pick1, "no_seat", d->name, team);
+                 }, true);
+        tag_news(st, d->id, "", from);
+        // his farewell card, as farewells() gives the others (it has run for this season already)
+        CareerTotals c = career_totals(st, *d);
+        if (c.seasons > 0 || c.starts > 0) {
+            std::string name = d->name;
+            add_news(st, st.round, "farewell", [&](text::Lang l) { return text::h_farewell(l, name); },
+                     [&](text::Lang l) { return text::farewell(l, name, c.seasons, c.starts, c.wins, c.podiums, c.titles); }, true);
+            tag_news(st, d->id, "", from);
+        }
+        return "retire";
+    }
+    double away = d->seasons >= 2 && age >= 24 ? (s.intensity == Intensity::chaos ? 0.25 : 0.35) : 0.0;
+    if (away > 0 && r.chance(away)) {
+        static const char *const series[] = {"wec", "wec", "formula_e", "formula_e", "indycar"};
+        d->away = series[r.range(0, 4)];
+        int pick0 = r.range(0, 9);
+        std::string where = d->away;
+        add_news(st, st.round, "official", [&](text::Lang l) { return text::h_away(l, pick0, d->name, where); },
+                 [&](text::Lang l) { return text::away(l, pick0, d->name, where, team); }, true);
+        tag_news(st, d->id, "", from);
+        return "away";
+    }
+    return {};
 }
 
 void midseason(State &st, const Settings &s, Rng &r, int round)
 {
     if (st.midseason_moves >= midseason_cap(s.intensity))
         return;
-    double base = s.intensity == Intensity::chaos ? 0.45 : s.intensity == Intensity::lively ? 0.28 : 0.14;
+    // 1.1.5: calibrated against 2015-2025 (about one permanent change a season); a family with a second team or an
+    // academy is quicker to swap (Red Bull)
+    double base = s.intensity == Intensity::chaos ? 0.70 : s.intensity == Intensity::lively ? 0.58 : 0.47;
     for (Team &t : st.teams) {
         if (st.midseason_moves >= midseason_cap(s.intensity))
             break;
@@ -1757,13 +1899,19 @@ void midseason(State &st, const Settings &s, Rng &r, int round)
                                        [&](const State::Standin &sb) { return sb.team == t.id; });
             if (covered)
                 continue; // no sacking while a reserve covers a seat of this team
-            bool struggling = d->form <= -0.30f && value(*d) < value(*mate) - 4.0f;
+            bool struggling = d->form <= -0.20f && value(*d) < value(*mate) - 2.5f;
             // a title push has no patience; a rebuild or a youth team gives a driver time
             const std::string plan = s.strategies ? t.strategy : std::string("contend");
             double patience = plan == "title"                        ? t.patience * 0.6
                               : plan == "rebuild" || plan == "youth" ? std::min(1.0, t.patience + 0.25)
                                                                      : t.patience;
-            if (!struggling || !r.chance(base * (1.0 - patience)))
+            bool family = t.junior || std::any_of(st.teams.begin(), st.teams.end(), [&](const Team &x) {
+                return x.active && &x != &t && x.junior && x.family == t.family;
+            });
+            // a family swaps its drivers between its two teams first (sister_swap, from a third of the season)
+            if (family && s.living && round < st.rounds * 0.60)
+                continue;
+            if (!struggling || !r.chance(std::min(0.9, base * (1.0 - patience) * (family ? 1.5 : 1.0))))
                 continue;
             // the replacement: the team's own junior or reserve first, then the best free driver. Only a driver the
             // game takes for a race seat now: a reserve (a team, no seat) or a driver without a career row is refused
@@ -1771,6 +1919,10 @@ void midseason(State &st, const Settings &s, Rng &r, int round)
             float best = -1e9f;
             for (const auto &[id, c] : st.drivers) {
                 if (!c.team.empty() || c.retired || c.retiring || c.id == st.player || c.kind == "player" || st.shielded(c.id))
+                    continue;
+                // 1.1.5: not a driver another team has just sacked (with two changes a season, the game turning both
+                // down would put him back in his old seat with the other change's contract)
+                if (c.released)
                     continue;
                 if (c.kind == "legend" && !s.legends)
                     continue;
@@ -1961,7 +2113,8 @@ void maybe_standin(State &st, const Settings &s, Rng &r, int completed)
 {
     if (!s.standins || !st.standins.empty() || completed + 1 >= st.rounds)
         return;
-    double p = s.intensity == Intensity::chaos ? 0.10 : s.intensity == Intensity::lively ? 0.06 : 0.035;
+    // 1.1.5: about one and a half stand-ins a season in real F1 (2015-2025)
+    double p = s.intensity == Intensity::chaos ? 0.12 : s.intensity == Intensity::lively ? 0.085 : 0.065;
     if (!r.chance(p))
         return;
     std::vector<std::pair<Team *, int>> seats;
@@ -1978,7 +2131,7 @@ void maybe_standin(State &st, const Settings &s, Rng &r, int completed)
     float best = -1e9f;
     for (const auto &[id, c] : st.drivers) {
         if (!c.team.empty() || c.retired || c.retiring || c.kind == "legend" || c.kind == "player" || c.id == st.player ||
-            st.shielded(c.id) || !st.seatable(c.id))
+            st.shielded(c.id) || !st.seatable(c.id) || c.released) // 1.1.5: not a driver his team has just sacked
             continue;
         float sc;
         if (s.academies) {
@@ -2903,12 +3056,12 @@ void complete_round(State &st, const Settings &s, int round, int rounds)
             real_round(st, s, r, at, progress);
         } else {
             // an observer career (My Team): only the game changes seats, so the market retires, swaps and sacks nobody
-            if (!st.retirements_drawn && progress >= 0.60 && !st.observer)
+            if (!st.retirements_drawn && progress >= 0.50 && !st.observer) // 1.1.5: told around the summer break
                 draw_retirements(st, s, r, at);
             // a team with a sister team swaps drivers with it before it sacks one (Red Bull and Racing Bulls)
             if (s.living && !st.observer)
                 sister_swap(st, s, r, at, progress);
-            if (s.midseason && !st.midseason_done && progress >= 0.40 && !st.observer) {
+            if (s.midseason && !st.midseason_done && progress >= 0.25 && !st.observer) { // 1.1.5: from a quarter in
                 midseason(st, s, r, at);
                 if (progress >= 0.65)
                     st.midseason_done = true;
@@ -2973,6 +3126,7 @@ void finalise_season(State &st, const Settings &s)
         }
         if (!st.retirements_drawn)
             draw_retirements(st, s, r, st.round);
+        top_retirement(st, s, r); // 1.1.5: the champion who stops at the top, told after the last race
         farewells(st, st.round);
         f2_update(st, s, r, st.round, true);
         // exit clauses and feuds free drivers despite their contracts
@@ -2996,6 +3150,20 @@ void finalise_season(State &st, const Settings &s)
                  [&](text::Lang l) { return std::string(text::feud_exit(l, d->name, t.name)); }, true);
                 }
             }
+        // 1.1.5: a team ends a contract early when its driver is well short of his team-mate and of the car (Ricciardo
+        // at McLaren in 2022): his seat goes on the market, and he may still find another
+        for (Team &t : st.teams)
+            for (int k = 0; k < 2; ++k) {
+                Driver *d = st.driver(t.seats[static_cast<size_t>(k)]);
+                const Driver *mate = st.driver(t.seats[static_cast<size_t>(1 - k)]);
+                if (!d || !mate || st.locked(t, k, s) || d->contract <= st.year || d->retiring || d->kind == "legend" ||
+                    d->id == st.player)
+                    continue;
+                if (value(*d) < value(*mate) - 5.0f && value(*d) < team_floor(t) - 4.0f &&
+                    r.chance((s.intensity == Intensity::chaos ? 0.55 : s.intensity == Intensity::lively ? 0.45 : 0.35) *
+                             (1.0 - t.patience * 0.6)))
+                    d->contract = st.year; // out of contract at the season's end: the plan looks at his seat afresh
+            }
         Plan plan = plan_market(st, s, plan_seed(st, true));
         st.next_grid = plan.grid;
         std::string renewals;
@@ -3003,8 +3171,10 @@ void finalise_season(State &st, const Settings &s)
         std::vector<const Move *> todo;
         for (const Move &m : plan.moves) {
             if (m.kind == "left" || m.kind == "retirement") {
-                add_move(st, st.round, m.driver, m.from, "", m.kind);
-                if (m.kind == "left")
+                // 1.1.5: a driver left without a seat retires, goes racing elsewhere or waits for a chance
+                std::string fate = m.kind == "left" ? exit_fate(st, s, r, m.driver, m.from) : std::string();
+                add_move(st, st.round, m.driver, m.from, "", fate == "retire" ? "retirement" : m.kind);
+                if (m.kind == "left" && fate.empty())
                     add_news(st, st.round, "official",
                  [&](text::Lang l) { return text::h_left(l, driver_name(st, m.driver)); },
                  [&](text::Lang l) { return std::string(text::left_grid(l, driver_name(st, m.driver))); }, true);
@@ -3177,6 +3347,8 @@ std::vector<SeatChange> start_new_season(State &st, const Settings &s, std::vect
         d.s_track_rounds = 0;
         if (was_on && d.kind != "player")
             d.seasons += 1;
+        if (was_on)
+            d.last_raced = st.year; // 1.1.5: the season he last held a race seat
     }
     std::vector<std::string> newcomers;
     for (Team &t : st.teams) {
@@ -3192,6 +3364,7 @@ std::vector<SeatChange> start_new_season(State &st, const Settings &s, std::vect
             if (Driver *d = st.driver(who)) {
                 d->team = t.id;
                 d->seat = k;
+                d->away.clear(); // 1.1.5: back from another series
                 if (until.count(who)) {
                     d->contract = until[who];
                     d->clause_rank = clause[who];
@@ -3213,15 +3386,44 @@ std::vector<SeatChange> start_new_season(State &st, const Settings &s, std::vect
                 (m.kind == "transfer" || m.kind == "promotion" || m.kind == "comeback"))
                 if (const Team *t = st.team(m.to))
                     newcomers.push_back(driver_name(st, m.driver) + " (" + t->name + ")");
+    // 1.1.5: the market keeps a pool of free drivers the game can seat: below it, only the oldest retire quietly
+    int free_pool = seatable_free(st);
     for (auto &[id, d] : st.drivers) {
         if (!d.team.empty() || d.retired || st.shielded(d.id))
             continue;
         if (d.contract <= st.year + 1)
             d.contract = 0;
-        // a veteran without a seat calls it a day
+        // a veteran without a seat calls it a day. 1.1.5: not at once any more (he may come back, as Hülkenberg or
+        // Ricciardo did), but the market forgets nobody: a veteran a season or more out, anyone who raced and has missed
+        // three seasons, a driver two seasons into another series, and every driver from 38 retire quietly
         int age = d.age(st.year + 1);
-        if (!st.real && d.kind == "f1" && age >= 34 && r.chance(age >= 38 ? 0.9 : 0.6)) {
+        int last = last_raced_of(st, d);
+        int out = last > 0 ? st.year + 1 - last : 0; // seasons since his last in a race seat
+        bool raced = d.kind == "f1" || last > 0;
+        double quit = 0;
+        if (raced && d.kind != "legend" && d.kind != "player") {
+            if (age >= 38)
+                quit = 0.85;
+            else if (age >= 34 && out >= 2)
+                quit = 0.55;
+            else if (age >= 34)
+                quit = 0.25;
+            else if (out >= 4)
+                quit = 0.7;
+            if (!d.away.empty() && out >= 3)
+                quit = std::max(quit, 0.6);
+            if (out >= 4 && age < 28)
+                quit = 0; // a young driver keeps racing somewhere and may be back
+            if (free_pool <= kMinFreePool + 4 && age < 38)
+                quit = 0;
+            if (free_pool <= kMinFreePool / 2)
+                quit = 0;
+        }
+        if (!st.real && quit > 0 && r.chance(quit)) {
+            --free_pool;
             d.retired = true;
+            if (d.exit_reason.empty())
+                d.exit_reason = "quiet";
             add_move(st, 0, d.id, "", "", "retirement");
         }
         // juniors keep racing (F2, reserve duties) and get better, whatever the ratings option says
@@ -3634,6 +3836,9 @@ Value to_json(const State &st)
         put(o, "clause_rank", d.clause_rank);
         put(o, "wants_out", d.wants_out);
         put(o, "f2_pos", d.f2_pos);
+        put(o, "last_raced", d.last_raced);
+        put(o, "away", d.away);
+        put(o, "exit_reason", d.exit_reason);
         Value feuds = Value::array();
         for (const std::string &f : d.feuds)
             feuds.push_back(f);
@@ -3932,6 +4137,9 @@ bool from_json(State &st, const Value &v)
             d.clause_rank = static_cast<int>(o["clause_rank"].as_int());
             d.wants_out = o["wants_out"].as_bool();
             d.f2_pos = static_cast<int>(o["f2_pos"].as_int());
+            d.last_raced = static_cast<int>(o["last_raced"].as_int());
+            d.away = std::string(o["away"].as_string());
+            d.exit_reason = std::string(o["exit_reason"].as_string());
             if (const json::Array *feuds = o["feuds"].if_array())
                 for (const Value &f : *feuds)
                     d.feuds.emplace_back(f.as_string());

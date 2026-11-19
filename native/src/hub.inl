@@ -16,7 +16,7 @@ constexpr uint32_t kDanger = 0xFF453AFF, kDangerText = 0xFF6961FF;
 constexpr uint32_t kText = 0xF4F5F8FF, kText2 = 0xA9ACBAFF, kMuted = 0x6E7180FF;
 constexpr uint32_t kCard = 0x1A1C26FF, kCard2 = 0x14161EFF, kCardHi = 0x232633FF, kLine = 0xFFFFFF14;
 
-bool g_tex_shadow = false, g_tex_glow = false;
+bool g_tex_shadow = false, g_tex_glow = false, g_tex_hatch = false;
 // the "Panel effects" option off: no shadows, glows, weave or entrance animations (paint thread only)
 bool g_lite = false;
 
@@ -26,6 +26,8 @@ inline void load_textures()
     ov::Result b = ov::load_image("ss_glow", "data/ui/glow.png");
     g_tex_shadow = a == ov::Result::ok || a == ov::Result::late;
     g_tex_glow = b == ov::Result::ok || b == ov::Result::late;
+    ov::Result c = ov::load_image("ss_hatch", "data/ui/hatch.png"); // 1.1.4: the weave as a tile
+    g_tex_hatch = c == ov::Result::ok || c == ov::Result::late;
     swofty::log("[silly-season] overlay textures: shadow %s, glow %s", ov::name(a), ov::name(b));
 }
 
@@ -73,11 +75,13 @@ inline float ease_back(float t) // a small overshoot
     return 1 + c3 * (t - 1) * (t - 1) * (t - 1) + c1 * (t - 1) * (t - 1);
 }
 
+// 1.1.4: the panel's smallest text (12 px at 1080p), set while the F7 panel draws; 0 elsewhere
+inline float g_text_floor = 0;
 inline ov::TextStyle ts(float size, uint32_t rgba = kText, uint32_t align = ov::align::left | ov::align::top,
                         float tracking = 0, float max_width = 0)
 {
     ov::TextStyle s;
-    s.size = size;
+    s.size = std::max(size, g_text_floor);
     s.rgba = rgba;
     s.align = align;
     s.tracking = tracking;
@@ -96,22 +100,67 @@ inline ov::TextStyle lifted(ov::TextStyle s, float k, uint32_t shadow = 0x000000
 
 // text bounds, remembered: the same strings are measured every frame (the ticker, cut names, wrapped
 // cards), and a measure only depends on the style and the text. Paint thread only.
+// 1.1.4: keyed by a 64-bit hash of the style and the text (no string built per call), and kept in two generations:
+// when the new one fills up the old one goes, so a full cache never forgets everything in one frame (the News page
+// had a 16 ms frame when 6000 entries were cleared at once and every text was measured again)
+namespace measure_cache {
+struct Entry {
+    float w, h;
+};
+inline std::unordered_map<uint64_t, Entry> now, old;
+constexpr size_t kGeneration = 3000;
+
+inline uint64_t key(const ov::TextStyle &s, std::string_view t, float extra = 0)
+{
+    uint64_t h = std::hash<std::string_view>{}(t);
+    auto mix = [&](float f) {
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof bits);
+        h ^= bits + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    };
+    mix(s.size);
+    mix(s.tracking);
+    mix(s.max_width);
+    mix(s.line_height);
+    mix(extra);
+    return h;
+}
+
+inline bool find(uint64_t k, Entry &e)
+{
+    if (auto it = now.find(k); it != now.end()) {
+        e = it->second;
+        return true;
+    }
+    if (auto it = old.find(k); it != old.end()) {
+        e = it->second;
+        now.emplace(k, e); // still in use: it moves to the new generation
+        return true;
+    }
+    return false;
+}
+
+inline void put(uint64_t k, Entry e)
+{
+    if (now.size() >= kGeneration) {
+        old = std::move(now);
+        now.clear();
+    }
+    now.emplace(k, e);
+}
+} // namespace measure_cache
+
 inline void measured(ov::Paint *p, const ov::TextStyle &s, std::string_view t, float *w, float *h)
 {
-    static std::unordered_map<std::string, std::pair<float, float>> cache;
-    char head[64];
-    std::snprintf(head, sizeof head, "%.2f|%.2f|%.1f|%.2f|", s.size, s.tracking, s.max_width, s.line_height);
-    std::string key(head);
-    key.append(t);
-    if (auto it = cache.find(key); it != cache.end()) {
-        *w = it->second.first;
-        *h = it->second.second;
+    uint64_t k = measure_cache::key(s, t);
+    measure_cache::Entry e;
+    if (measure_cache::find(k, e)) {
+        *w = e.w;
+        *h = e.h;
         return;
     }
     ov::measure(p, s, t, w, h);
-    if (cache.size() > 6000)
-        cache.clear();
-    cache.emplace(std::move(key), std::make_pair(*w, *h));
+    measure_cache::put(k, {*w, *h});
 }
 
 inline float text_w(ov::Paint *p, const ov::TextStyle &s, std::string_view t)
@@ -127,17 +176,36 @@ inline float text_h(ov::Paint *p, const ov::TextStyle &s, std::string_view t)
     return h;
 }
 
-// text cut to a width with "..."
+// text cut to a width with "...". 1.1.4: the cut is found by halving (a long story cut to a short card was measured
+// once per letter, and every one of those measures went into the cache), and only the cut's length is remembered
 inline std::string fit(ov::Paint *p, const ov::TextStyle &s, std::string t, float max_w)
 {
     if (text_w(p, s, t) <= max_w)
         return t;
-    while (!t.empty() && text_w(p, s, t + "...") > max_w) {
-        t.pop_back();
-        while (!t.empty() && (static_cast<unsigned char>(t.back()) & 0xC0) == 0x80) // whole UTF-8 characters
-            t.pop_back();
+    static std::unordered_map<uint64_t, size_t> cuts; // the text's style, text and width -> how many bytes stay
+    uint64_t ck = measure_cache::key(s, t, max_w);
+    if (auto it = cuts.find(ck); it != cuts.end())
+        return t.substr(0, it->second) + "...";
+    // the character boundaries, then the longest start that fits with "..." after it
+    std::vector<size_t> ends;
+    for (size_t i = 1; i <= t.size(); ++i)
+        if (i == t.size() || (static_cast<unsigned char>(t[i]) & 0xC0) != 0x80)
+            ends.push_back(i);
+    size_t lo = 0, hi = ends.size(); // the answer: ends[lo - 1] bytes (0 when nothing fits)
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        float w = 0, h = 0;
+        ov::measure(p, s, t.substr(0, ends[mid - 1]) + "...", &w, &h); // not cached: the tries aren't drawn
+        if (w <= max_w)
+            lo = mid;
+        else
+            hi = mid - 1;
     }
-    return t + "...";
+    size_t keep = lo ? ends[lo - 1] : 0;
+    if (cuts.size() >= 4000)
+        cuts.clear(); // small entries, rare: a re-cut costs a dozen measures
+    cuts.emplace(ck, keep);
+    return t.substr(0, keep) + "...";
 }
 
 // ----- light and depth ----------------------------------------------------------------------------
@@ -187,6 +255,16 @@ inline void hatch(ov::Paint *p, float x, float y, float w, float h, float k, uin
 {
     if (g_lite || w <= 0 || h <= 0)
         return;
+    // 1.1.4: the tile (data/ui/hatch.png, a line every 16 of its 256 px), scaled so its lines keep this spacing: a few
+    // images instead of a line every step (the header's weave alone was ~150 draw calls a frame)
+    if (g_tex_hatch) {
+        float ts = 256 * step / 16;
+        ov::ClipScope clip(p, x, y, w, h);
+        for (float ty = y; ty < y + h; ty += ts)
+            for (float tx = x; tx < x + w; tx += ts)
+                ov::image(p, "ss_hatch", tx, ty, ts, ts, col);
+        return;
+    }
     // a line from (x + o, y + h) up to (x + o + h, y), cut to [x, x + w]: no clip needed
     for (float o = -h; o < w; o += step) {
         float t0 = std::max(0.0f, -o / h), t1 = std::min(1.0f, (w - o) / h);
@@ -198,14 +276,17 @@ inline void hatch(ov::Paint *p, float x, float y, float w, float h, float k, uin
 // a box outline made of dashes
 inline void dashed_rect(ov::Paint *p, float x, float y, float w, float h, float k, uint32_t col, float dash = 7, float gap = 5)
 {
-    float d = dash * k, g = gap * k, t = 1.2f * k;
-    for (float o = 0; o < w; o += d + g) {
-        float l = std::min(d, w - o);
+    // 1.1.4: at most 24 dashes a side: a long box's dashes grow with it (a page-wide note was ~270 draw calls)
+    float t = 1.2f * k, per = (dash + gap) * k;
+    float sx = std::max(1.0f, w / (24 * per)), sy = std::max(1.0f, h / (24 * per));
+    float dx = dash * k * sx, gx = gap * k * sx, dy = dash * k * sy, gy = gap * k * sy;
+    for (float o = 0; o < w; o += dx + gx) {
+        float l = std::min(dx, w - o);
         ov::rect(p, x + o, y, l, t, col);
         ov::rect(p, x + o, y + h - t, l, t, col);
     }
-    for (float o = 0; o < h; o += d + g) {
-        float l = std::min(d, h - o);
+    for (float o = 0; o < h; o += dy + gy) {
+        float l = std::min(dy, h - o);
         ov::rect(p, x, y + o, t, l, col);
         ov::rect(p, x + w - t, y + o, t, l, col);
     }
@@ -673,14 +754,45 @@ constexpr int kPageCount = static_cast<int>(sizeof kPages / sizeof kPages[0]);
 enum PageId { P_PADDOCK, P_NEWS, P_PRESS, P_FUTURE, P_RUMOURS, P_DEALS, P_TRANSFERS, P_GRID, P_STANDINGS, P_DRIVERS, P_CONTRACTS, P_STOCK, P_F2, P_SCOUT, P_STAFF, P_FREE, P_HISTORY };
 static_assert(P_HISTORY + 1 == static_cast<int>(sizeof kPages / sizeof kPages[0]), "kPages and PageId must match");
 
-// the side menu's groups: the first page of each
-struct MenuGroup {
-    int first;
+// 1.1.4: the panel's five sections, each a run of pages shown as tabs. kOrder lists every page once, section by
+// section: Q/E step through it, 1-5 (LT/RT) jump between the sections
+constexpr int kOrder[] = {P_PADDOCK, P_NEWS, P_RUMOURS, P_DEALS,     P_TRANSFERS, P_FUTURE, P_PRESS, P_GRID,   P_STANDINGS,
+                          P_DRIVERS, P_CONTRACTS, P_STOCK, P_F2, P_SCOUT, P_FREE, P_STAFF, P_HISTORY};
+static_assert(sizeof kOrder / sizeof kOrder[0] == sizeof kPages / sizeof kPages[0], "kOrder lists every page once");
+struct SectionDef {
+    ui::Icon icon;
     const char *es, *en;
+    int first, count; // where its pages are in kOrder
 };
-constexpr MenuGroup kGroups[] = {
-    {P_PADDOCK, "MERCADO", "MARKET"}, {P_GRID, "PARRILLA Y PILOTOS", "GRID & DRIVERS"}, {P_F2, "CANTERA", "TALENT"},
-    {P_HISTORY, "ARCHIVO", "ARCHIVE"}};
+constexpr SectionDef kSections[] = {{ui::Icon::paddock, "MERCADO", "MARKET", 0, 5},
+                                    {ui::Icon::future, "TÚ", "YOU", 5, 2},
+                                    {ui::Icon::grid, "PARRILLA", "GRID", 7, 5},
+                                    {ui::Icon::f2, "CANTERA", "TALENT", 12, 4},
+                                    {ui::Icon::history, "ARCHIVO", "ARCHIVE", 16, 1}};
+constexpr int kSectionCount = static_cast<int>(sizeof kSections / sizeof kSections[0]);
+
+inline int order_of(int page)
+{
+    for (int i = 0; i < static_cast<int>(std::size(kOrder)); ++i)
+        if (kOrder[i] == page)
+            return i;
+    return 0;
+}
+
+inline int section_of(int page)
+{
+    int o = order_of(page);
+    for (int s = 0; s < kSectionCount; ++s)
+        if (o >= kSections[s].first && o < kSections[s].first + kSections[s].count)
+            return s;
+    return 0;
+}
+
+namespace paint_state {
+// the page last open in each section: a jump to a section lands there
+std::array<int, 8> section_page{P_PADDOCK, P_FUTURE, P_GRID, P_F2, P_HISTORY};
+bool lt_was = false, rt_was = false; // the triggers are analog: a pull past 60% is a press
+} // namespace paint_state
 
 // what every page draw gets: where to draw, the input, the scale and how long the page has been open
 struct Ctx {
@@ -1114,36 +1226,88 @@ float page_transfers(const Ctx &c, float y0)
                      ui::fit(c.p, ui::ts(11.5f * k), std::string(c.T("espera a ", "waits for ")) + l.waits, 150 * k));
     };
     if (!d.chains.empty()) {
+        // 1.1.4: each chain as the dominoes fall, left to right: the seat the last move leaves open, then every move
+        // as an arrow into the seat it takes ([ALP] -Gasly-> [RBR] -Tsunoda-> [RB]). The drivers on the arrows are rows:
+        // Up/Down pick them, Enter or a click opens their card
         char note[48];
         std::snprintf(note, sizeof note, "%zu %s", d.chains.size(), d.chains.size() == 1 ? c.T("cadena", "chain") : c.T("cadenas", "chains"));
         y += section_title(c, c.area.x, y, c.T("EFECTO DOMINÓ", "THE DOMINOES"), note);
-        float h = 96 * k, gap = 54 * k;
-        int fit_line = std::max(1, static_cast<int>((c.area.w + gap) / (300 * k + gap)));
+        float node_w = 112 * k, node_h = 70 * k, edge_min = 210 * k, edge_max = 360 * k;
+        auto node = [&](float x, float ny, const std::string &code, const std::string &name, uint32_t col, int open) {
+            if (!c.visible(ny - 30 * k, node_h + 60 * k))
+                return;
+            bool free = code.empty();
+            uint32_t base = free ? 0x3A3D4A : col;
+            ov::rect_rounded(c.p, x, ny, node_w, node_h, 12 * k, ui::rgb(base, free ? 0x40 : 0x60));
+            ov::gradient(c.p, x, ny, node_w, node_h * 0.5f, 0xFFFFFF14, 0xFFFFFF00, false, 12 * k);
+            if (open == 1) // the seat this chain leaves open: dashed and lit
+                ui::dashed_rect(c.p, x - 4 * k, ny - 4 * k, node_w + 8 * k, node_h + 8 * k, k, ui::alpha(ui::kAmber, 0.6f + 0.4f * ui::pulse(1.6f)));
+            else
+                ov::rect_rounded_outline(c.p, x, ny, node_w, node_h, 12 * k, 1 * k, ui::rgb(base, 0xB0));
+            ov::text(c.p, x + node_w / 2, ny + node_h / 2 - 8 * k,
+                     ui::lifted(ui::ts(24 * k, free ? ui::kText2 : 0xFFFFFFFF, ov::align::center | ov::align::middle, 1.2f * k), k),
+                     free ? c.T("LIBRE", "FREE") : code);
+            ov::text(c.p, x + node_w / 2, ny + node_h - 14 * k, ui::ts(11.5f * k, 0xFFFFFFC0, ov::align::center | ov::align::middle),
+                     ui::fit(c.p, ui::ts(11.5f * k), free ? std::string(c.T("sin equipo", "no seat")) : name, node_w - 12 * k));
+            if (open == 1)
+                ov::text(c.p, x + node_w / 2, ny - 14 * k, ui::ts(11 * k, ui::kAmber, ov::align::center | ov::align::middle, 1.6f * k),
+                         c.T("ASIENTO LIBRE", "SEAT OPEN"));
+        };
+        auto edge = [&](float x, float ey, float w, const UiLink &l) {
+            float ry = ey - 6 * k, rh = node_h + 12 * k;
+            bool picked = pick_row(c, x, ry, w, rh, l.driver_id, ui4::K_DRIVER);
+            if (!c.visible(ry, rh))
+                return;
+            int sg = std::clamp(l.stage, 0, 3);
+            bool hov = c.hover(x, ry, w, rh);
+            if (hov || picked)
+                ov::rect_rounded(c.p, x + 4 * k, ry, w - 8 * k, rh, 10 * k, picked ? 0xE106001A : 0xFFFFFF08);
+            pick_mark(c, x + 4 * k, ry, w - 8 * k, rh, picked);
+            float cy = ey + node_h / 2;
+            ui::flow_arrow(c.p, x + 12 * k, cy, w - 24 * k, k, stage_col[sg], sg >= 2 ? 40.0f : 18.0f);
+            ov::text(c.p, x + w / 2, cy - 16 * k, ui::lifted(ui::ts(17 * k, ui::kText, ov::align::center | ov::align::bottom), k),
+                     ui::fit(c.p, ui::ts(17 * k), l.driver, w - 24 * k));
+            std::string st = c.T(stage_es[sg], stage_en[sg]);
+            if (sg < 3 && l.odds > 0)
+                st += "  ·  " + std::to_string(l.odds) + "%";
+            ov::text(c.p, x + w / 2, cy + 18 * k, ui::ts(11.5f * k, stage_col[sg], ov::align::center | ov::align::top, 1.2f * k), st);
+            if (!l.waits.empty())
+                ov::text(c.p, x + w / 2, cy + 36 * k, ui::ts(11.5f * k, ui::kAmber, ov::align::center | ov::align::top),
+                         ui::fit(c.p, ui::ts(11.5f * k), std::string(c.T("espera a ", "waits for ")) + l.waits, w - 16 * k));
+        };
         int n = 0;
         for (const std::vector<UiLink> &chain : d.chains) {
             ++n;
-            // 1.1.3: a short chain's cards share the width (they kept 300 px and left most of the page empty)
-            int per_line = std::clamp(static_cast<int>(chain.size()), 1, fit_line);
-            float w = std::min(470 * k, (c.area.w - gap * static_cast<float>(per_line - 1)) / static_cast<float>(per_line));
             if (c.visible(y, 24 * k)) {
                 char head[48];
-                std::snprintf(head, sizeof head, "%s %d  ·  %zu %s", c.T("CADENA", "CHAIN"), n, chain.size(), c.T("movimientos", "moves"));
+                std::snprintf(head, sizeof head, "%s %d  ·  %zu %s", c.T("CADENA", "CHAIN"), n, chain.size(),
+                              chain.size() == 1 ? c.T("movimiento", "move") : c.T("movimientos", "moves"));
                 ov::text(c.p, c.area.x, y + 10 * k, ui::ts(11.5f * k, ui::kMuted, ov::align::left | ov::align::middle, 1.6f * k), head);
             }
-            y += 26 * k;
-            for (size_t i = 0; i < chain.size(); ++i) {
-                int col = static_cast<int>(i) % per_line;
-                if (i > 0 && col == 0)
-                    y += h + 16 * k;
-                float x = c.area.x + col * (w + gap);
-                link_card(x, y, w, h, chain[i]);
-                // the domino falling into the next
-                if (i + 1 < chain.size() && col + 1 < per_line && c.visible(y, h)) {
-                    float ax = x + w + 8 * k, ay = y + h / 2;
-                    ui::flow_arrow(c.p, ax, ay, gap - 16 * k, k, ui::kRed, 30.0f);
+            y += 50 * k;
+            // the moves as they read left to right: the last one first
+            std::vector<const UiLink *> seq;
+            for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+                seq.push_back(&*it);
+            size_t per_line = std::max<size_t>(1, static_cast<size_t>((c.area.w - node_w) / (node_w + edge_min)));
+            for (size_t start = 0; start < seq.size(); start += per_line) {
+                size_t count = std::min(per_line, seq.size() - start);
+                float ew = std::clamp((c.area.w - node_w * static_cast<float>(count + 1)) / static_cast<float>(count), edge_min, edge_max);
+                float x = c.area.x;
+                // the first node: where the first move of this line comes from (on the first line, the seat left open)
+                const UiLink &first = *seq[start];
+                node(x, y, first.from_code, first.from, first.from_col, start == 0 && !first.from_code.empty() ? 1 : 0);
+                x += node_w;
+                for (size_t i = 0; i < count; ++i) {
+                    const UiLink &l = *seq[start + i];
+                    edge(x, y, ew, l);
+                    x += ew;
+                    node(x, y, l.to_code, l.to, l.to_col, 0);
+                    x += node_w;
                 }
+                y += node_h + 58 * k;
             }
-            y += h + 26 * k;
+            y += 6 * k;
         }
     }
     if (d.waiting.empty()) {
@@ -1322,34 +1486,85 @@ void ratings_radar(ov::Paint *p, float cx, float cy, float r, float k, const UiD
     }
 }
 
+// 1.1.4: a small line of values, race by race (defined with the Paddock's pieces)
+void sparkline(ov::Paint *p, float x, float y, float w, float h, const std::vector<float> &v, uint32_t col, float k, float grow = 1);
+
+// 1.1.4: the cards take the whole panel (the hub's own rect), with a taller livery head
+ov::Rect card_rect(float k, float W, float H)
+{
+    float w = std::min(W - 48 * k, 1800 * k), h = std::min(H - 40 * k, 1010 * k);
+    return {std::round((W - w) / 2), std::round((H - h) / 2), w, h};
+}
+constexpr float kCardHead = 176; // the livery head's height, at k = 1
+
 // the frame of a card: dims the hub, slides the card up; returns the card's rect
 ov::Rect card_frame(ov::Paint *p, float k, float W, float H, uint32_t col, float t)
 {
     float a = ui::g_lite ? 1.0f : ui::ease_out(t / 0.22f);
-    ov::rect(p, 0, 0, W, H, ui::alpha(0x000000C0, a));
-    float w = std::min(W - 80 * k, 1240 * k), h = std::min(H - 80 * k, 720 * k);
-    float x = std::round((W - w) / 2), y = std::round((H - h) / 2 + (1 - a) * 30 * k);
+    ov::rect(p, 0, 0, W, H, ui::alpha(0x000000C8, a));
+    ov::Rect r = card_rect(k, W, H);
+    float x = r.x, y = r.y + (1 - a) * 30 * k, w = r.w, h = r.h, hh = kCardHead * k;
     ui::shadow(p, x, y, w, h, k, 2.0f, 0x000000FF, 14);
-    ov::gradient(p, x, y, w, h, 0x171821FF, 0x0D0E13FF, false, 16 * k);
-    ov::rect_rounded_outline(p, x, y, w, h, 16 * k, 1 * k, 0xFFFFFF22);
+    ov::gradient(p, x, y, w, h, 0x171821FF, 0x0D0E13FF, false, 18 * k);
+    ov::rect_rounded_outline(p, x, y, w, h, 18 * k, 1 * k, 0xFFFFFF22);
     {
-        ov::ClipScope clip(p, x, y, w, 130 * k);
-        ov::gradient(p, x, y, w, 130 * k, ui::rgb(col, 0x88), ui::rgb(col, 0x10), true, 16 * k);
-        ui::livery(p, x, y, w, 130 * k, col, k, 1, 16 * k);
-        ov::gradient(p, x, y + 60 * k, w, 70 * k, 0x17182100, 0x171821E0, false);
+        ov::ClipScope clip(p, x, y, w, hh);
+        ov::gradient(p, x, y, w, hh, ui::rgb(col, 0x90), ui::rgb(col, 0x12), true, 18 * k);
+        for (int i = 0; i < 4; ++i)
+            ui::para(p, x + w * 0.58f + static_cast<float>(i) * 40 * k, y, 20 * k, hh, hh * 0.55f, 0xFFFFFF0C);
+        ov::gradient(p, x, y + hh * 0.45f, w, hh * 0.55f, 0x17182100, 0x171821F0, false);
     }
     return {x, y, w, h};
+}
+
+// a driver's initials for his monogram: the first letter of his first and last names ("MV"), UTF-8 safe
+std::string initials(const std::string &name)
+{
+    auto first_char = [](const std::string &s, size_t at) {
+        size_t n = 1;
+        unsigned char c = static_cast<unsigned char>(s[at]);
+        if (c >= 0xF0)
+            n = 4;
+        else if (c >= 0xE0)
+            n = 3;
+        else if (c >= 0xC0)
+            n = 2;
+        return s.substr(at, std::min(n, s.size() - at));
+    };
+    std::string out;
+    size_t a = name.find_first_not_of(' ');
+    if (a == std::string::npos)
+        return "?";
+    size_t sp = name.find_last_of(' ');
+    out = first_char(name, a);
+    if (sp != std::string::npos && sp + 1 < name.size() && sp > a)
+        out += first_char(name, sp + 1);
+    else if (name.size() > a + out.size())
+        out += first_char(name, a + out.size());
+    for (char &ch : out)
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    return out;
 }
 
 // returns false when the card asks to close
 void draw_driver_card(ov::Paint *p, const ov::Input &in, float k, float W, float H, const UiDriverCard &c, bool es, float t)
 {
     auto T = [&](const char *a, const char *b) { return es ? a : b; };
-    ov::Rect r = card_frame(p, k, W, H, c.col ? c.col : 0x3A3D4A, t);
-    float x = r.x, y = r.y, w = r.w, pad = 34 * k;
+    const OverlayData &d = g_ov;
+    uint32_t tcol = c.col ? c.col : 0x3A3D4A;
+    ov::Rect r = card_frame(p, k, W, H, tcol, t);
+    float x = r.x, y = r.y, w = r.w, pad = 36 * k;
     float grow = ui::g_lite ? 1.0f : ui::ease_out((t - 0.1f) / 0.6f);
-    // the head: name, where he's from, his team
-    ov::text(p, x + pad, y + 30 * k, ui::lifted(ui::ts(40 * k, 0xFFFFFFFF, ov::align::left | ov::align::top, 0.6f * k), k), c.name);
+
+    // the head: his monogram in the team's colour, his name, where he's from, his flags; his rating and his team
+    float mono = 116 * k, mx = x + pad, my = y + 30 * k;
+    ov::rect_rounded(p, mx, my, mono, mono, 18 * k, ui::rgb(tcol));
+    ov::rect_rounded(p, mx, my, mono, mono * 0.48f, 18 * k, 0xFFFFFF1C);
+    ov::rect_rounded_outline(p, mx, my, mono, mono, 18 * k, 1.5f * k, 0xFFFFFF40);
+    ov::text(p, mx + mono / 2, my + mono / 2 + 2 * k,
+             ui::lifted(ui::ts(50 * k, ui::ink_on(tcol), ov::align::center | ov::align::middle, 1.0f * k), k, 0x00000060), initials(c.name));
+    float nx = mx + mono + 28 * k;
+    ov::text(p, nx, y + 34 * k, ui::lifted(ui::ts(46 * k, 0xFFFFFFFF, ov::align::left | ov::align::top, 0.6f * k), k), c.name);
     std::string sub;
     if (!c.nat.empty()) {
         std::string nat = c.nat;
@@ -1365,186 +1580,246 @@ void draw_driver_card(ov::Paint *p, const ov::Input &in, float k, float W, float
         sub += "  ·  #" + std::to_string(c.number);
     if (c.seasons > 0)
         sub += "  ·  " + std::to_string(c.seasons) + T(" temporadas en F1", " F1 seasons");
-    ov::text(p, x + pad, y + 82 * k, ui::ts(16 * k, 0xFFFFFFD0), sub);
-    // the team chip opens the team's card
+    ov::text(p, nx, y + 94 * k, ui::ts(17 * k, 0xFFFFFFD0), sub);
+    {
+        // his flags: the exit clause, wanting out, pressure, a feud, sponsors, his role off the grid
+        float tx = nx, ty = y + 126 * k;
+        if (c.clause > 0) {
+            char b[48];
+            std::snprintf(b, sizeof b, "%s %d", T("CLÁUSULA: TOP", "EXIT CLAUSE: TOP"), c.clause);
+            tx += ui::tag(p, tx, ty, b, 0xFF375FFF, k, 12) + 6 * k;
+        }
+        if (c.wants_out)
+            tx += ui::tag(p, tx, ty, T("QUIERE SALIR", "WANTS OUT"), ui::kDanger, k, 12) + 6 * k;
+        if (c.pressure)
+            tx += ui::tag(p, tx, ty, T("BAJO PRESIÓN", "UNDER PRESSURE"), ui::kDanger, k, 12) + 6 * k;
+        if (c.feud)
+            tx += ui::tag(p, tx, ty, T("RIVALIDAD", "FEUD"), 0xBF5AF2FF, k, 12) + 6 * k;
+        if (c.backing >= 3) {
+            char b[48];
+            std::snprintf(b, sizeof b, "%s %.0f M", T("PATROCINIO", "SPONSORS"), c.backing);
+            tx += ui::tag(p, tx, ty, b, ui::kGreen, k, 12) + 6 * k;
+        }
+        if (!c.role.empty()) {
+            std::string role = (c.role == "reserve" ? std::string(T("RESERVA · ", "RESERVE · "))
+                                : c.role == "away"  ? std::string(T("FUERA DE LA F1 · ", "OUT OF F1 · "))
+                                                    : std::string(T("ACADEMIA · ", "ACADEMY · "))) +
+                               ui4::upper(c.role_team);
+            tx += ui::tag(p, tx, ty, role, c.role == "reserve" ? 0x40C8E0FF : c.role == "away" ? 0xFFB547FF : 0x32D74BFF, k, 12) + 6 * k;
+        }
+    }
     float rx = x + w - pad;
     if (!c.code.empty()) {
-        float cw = ui::team_chip(p, rx - 120 * k, y + 34 * k, c.code, c.col, k, 30);
-        (void)cw;
-        if (link_text(p, in, rx - 120 * k, y + 80 * k, ui::ts(15 * k, 0xFFFFFFD0, ov::align::left | ov::align::top), c.team, 120 * k) && !c.team_id.empty())
+        ui::team_chip(p, rx - 150 * k, y + 38 * k, c.code, c.col, k, 32);
+        if (link_text(p, in, rx - 150 * k, y + 84 * k, ui::ts(16 * k, 0xFFFFFFD8, ov::align::left | ov::align::top), c.team, 150 * k) &&
+            !c.team_id.empty())
             ui4::open_card(ui4::K_TEAM, c.team_id);
     } else {
-        ov::text(p, rx, y + 40 * k, ui::ts(16 * k, 0xFFFFFFC0, ov::align::right | ov::align::top),
+        ov::text(p, rx, y + 44 * k, ui::ts(17 * k, 0xFFFFFFC0, ov::align::right | ov::align::top),
                  c.kind == "f2" ? "F2" : c.kind == "legend" ? T("Leyenda", "Legend") : T("Sin equipo", "No seat"));
     }
-    // the game's rating (as its ratings screen shows it) when it was read, then the market's value and potential
-    char v[16], line[64];
-    if (c.game_rating > 0) {
-        std::snprintf(v, sizeof v, "%d", c.game_rating);
-        ov::text(p, rx - 160 * k, y + 22 * k, ui::lifted(ui::ts(52 * k, 0xFFFFFFFF, ov::align::right | ov::align::top), k), v);
-        std::snprintf(line, sizeof line, es ? "VALORACIÓN  ·  VALOR %.0f  ·  POT. %.0f" : "RATING  ·  MARKET VALUE %.0f  ·  POT. %.0f",
-                      c.value, c.potential);
-        ov::text(p, rx - 160 * k, y + 86 * k, ui::ts(14 * k, 0xFFFFFFB0, ov::align::right | ov::align::top, 1 * k), line);
-    } else {
-        std::snprintf(v, sizeof v, "%.0f", c.value);
-        ov::text(p, rx - 160 * k, y + 22 * k, ui::lifted(ui::ts(52 * k, 0xFFFFFFFF, ov::align::right | ov::align::top), k), v);
-        std::snprintf(line, sizeof line, es ? "VALOR  ·  POT. %.0f" : "MARKET VALUE  ·  POT. %.0f", c.potential);
-        ov::text(p, rx - 160 * k, y + 86 * k, ui::ts(14 * k, 0xFFFFFFB0, ov::align::right | ov::align::top, 1 * k), line);
+    {
+        // the game's rating (as its ratings screen shows it) when it was read, then the market's value and potential
+        char v[16], line[64];
+        bool game = c.game_rating > 0;
+        std::snprintf(v, sizeof v, "%d", game ? c.game_rating : static_cast<int>(std::lround(c.value)));
+        ov::text(p, rx - 190 * k, y + 22 * k, ui::lifted(ui::ts(66 * k, 0xFFFFFFFF, ov::align::right | ov::align::top), k), v);
+        if (game)
+            std::snprintf(line, sizeof line, es ? "VALORACIÓN  ·  VALOR %.0f  ·  POT. %.0f" : "RATING  ·  MARKET VALUE %.0f  ·  POT. %.0f", c.value,
+                          c.potential);
+        else
+            std::snprintf(line, sizeof line, es ? "VALOR  ·  POT. %.0f" : "MARKET VALUE  ·  POT. %.0f", c.potential);
+        ov::text(p, rx - 190 * k, y + 102 * k, ui::ts(13.5f * k, 0xFFFFFFB8, ov::align::right | ov::align::top, 1 * k), line);
     }
 
-    float top = y + 150 * k, lx = x + pad, lw = w * 0.42f, rx2 = x + pad + lw + 40 * k, rw = x + w - pad - rx2;
-    // left: the contract, the character, the season, the path
+    // the body: three columns
+    float top = y + (kCardHead + 22) * k, gap = 40 * k, inner = w - 2 * pad - 2 * gap;
+    float w1 = std::round(inner * 0.29f), w2 = std::round(inner * 0.40f), w3 = inner - w1 - w2;
+    float x1 = x + pad, x2 = x1 + w1 + gap, x3 = x2 + w2 + gap;
+    float bottom = y + r.h - 58 * k;
+
+    // 1: the contract, the character, the ratings
     float ly = top;
-    ly += card_head(p, lx, ly, lw, k, T("CONTRATO", "CONTRACT"));
+    ly += card_head(p, x1, ly, w1, k, T("CONTRATO", "CONTRACT"));
     {
         std::string line = c.contract > 0 ? std::string(T("Hasta ", "Until ")) + std::to_string(c.contract) : T("Sin contrato", "No contract");
         if (!c.salary.empty() && c.contract > 0)
             line += "  ·  " + c.salary + T(" / año", " a year");
-        ov::text(p, lx, ly, ui::ts(18 * k, ui::kText), line);
-        float tx = lx;
-        float ty = ly + 30 * k;
-        if (c.clause > 0) {
-            char b[48];
-            std::snprintf(b, sizeof b, "%s %d", T("CLÁUSULA: TOP", "EXIT CLAUSE: TOP"), c.clause);
-            tx += ui::tag(p, tx, ty, b, 0xFF375FFF, k, 11) + 6 * k;
+        ov::text(p, x1, ly, ui::ts(19 * k, ui::kText), ui::fit(p, ui::ts(19 * k), line, w1));
+        // the years ahead, the ones under contract lit
+        int y0 = d.year > 0 ? d.year : c.contract, span = 5;
+        float cell = (w1 - static_cast<float>(span - 1) * 6 * k) / static_cast<float>(span), cy = ly + 34 * k;
+        for (int i = 0; i < span; ++i) {
+            int yr = y0 + i;
+            bool on = c.contract >= yr;
+            float cx = x1 + static_cast<float>(i) * (cell + 6 * k);
+            ov::rect_rounded(p, cx, cy, cell, 8 * k, 4 * k, on ? ui::alpha(ui::rgb(tcol), 0.35f + 0.65f * grow) : 0xFFFFFF10);
+            ov::text(p, cx + cell / 2, cy + 22 * k, ui::ts(12 * k, on ? ui::kText2 : ui::kMuted, ov::align::center | ov::align::middle),
+                     std::to_string(yr));
         }
-        if (c.wants_out)
-            tx += ui::tag(p, tx, ty, T("QUIERE SALIR", "WANTS OUT"), ui::kDanger, k, 11) + 6 * k;
-        if (c.pressure)
-            tx += ui::tag(p, tx, ty, T("BAJO PRESIÓN", "UNDER PRESSURE"), ui::kDanger, k, 11) + 6 * k;
-        if (c.feud)
-            tx += ui::tag(p, tx, ty, T("RIVALIDAD", "FEUD"), 0xBF5AF2FF, k, 11) + 6 * k;
-        if (c.backing >= 3) {
-            char b[48];
-            std::snprintf(b, sizeof b, "%s %.0f M", T("PATROCINIO", "SPONSORS"), c.backing);
-            tx += ui::tag(p, tx, ty, b, ui::kGreen, k, 11) + 6 * k;
-        }
-        // 1.1.0 phase 6: his role off the grid
-        if (!c.role.empty() && tx < lx + lw - 120 * k) {
-            std::string role = (c.role == "reserve" ? std::string(T("RESERVA · ", "RESERVE · ")) : std::string(T("ACADEMIA · ", "ACADEMY · "))) +
-                               ui4::upper(c.role_team);
-            tx += ui::tag(p, tx, ty, role, c.role == "reserve" ? 0x40C8E0FF : 0x32D74BFF, k, 11) + 6 * k;
-        }
-        ly += (tx > lx ? 64 : 40) * k;
+        ly += 92 * k;
     }
-    ly += card_head(p, lx, ly, lw, k, T("CARÁCTER Y VALORACIONES", "CHARACTER & RATINGS"));
+    ly += card_head(p, x1, ly, w1, k, T("CARÁCTER", "CHARACTER"));
+    if (c.ambition >= 0) {
+        card_bar(p, x1, ly + 6 * k, w1, k, T("Ambición", "Ambition"), c.ambition * grow, ui::kAmber,
+                 std::to_string(static_cast<int>(std::lround(c.ambition * 100))));
+        card_bar(p, x1, ly + 40 * k, w1, k, T("Lealtad", "Loyalty"), c.loyalty * grow, ui::kBlue,
+                 std::to_string(static_cast<int>(std::lround(c.loyalty * 100))));
+        card_bar(p, x1, ly + 74 * k, w1, k, T("Dinero", "Money"), c.money * grow, ui::kGreen,
+                 std::to_string(static_cast<int>(std::lround(c.money * 100))));
+        ly += 112 * k;
+    } else {
+        ov::text(p, x1, ly + 6 * k, ui::ts(15 * k, ui::kMuted, ov::align::left | ov::align::top, 0, w1),
+                 T("Las personalidades están apagadas.", "Driver personalities are off."));
+        ly += 40 * k;
+    }
+    ly += card_head(p, x1, ly, w1, k, T("VALORACIONES", "RATINGS"));
     {
-        // the character on the left, the ratings radar on the right
-        float bw = lw * 0.58f, block = 128 * k;
-        if (c.ambition >= 0) {
-            card_bar(p, lx, ly + 6 * k, bw, k, T("Ambición", "Ambition"), c.ambition * grow, ui::kAmber, std::to_string(static_cast<int>(std::lround(c.ambition * 100))));
-            card_bar(p, lx, ly + 40 * k, bw, k, T("Lealtad", "Loyalty"), c.loyalty * grow, ui::kBlue, std::to_string(static_cast<int>(std::lround(c.loyalty * 100))));
-            card_bar(p, lx, ly + 74 * k, bw, k, T("Dinero", "Money"), c.money * grow, ui::kGreen, std::to_string(static_cast<int>(std::lround(c.money * 100))));
-        } else {
-            ov::text(p, lx, ly + 6 * k, ui::ts(15 * k, ui::kMuted, ov::align::left | ov::align::top, 0, bw),
-                     T("Las personalidades están apagadas.", "Driver personalities are off."));
-        }
-        ratings_radar(p, lx + bw + (lw - bw) / 2 - 10 * k, ly + block / 2 - 2 * k, std::min(46 * k, (lw - bw) / 2 - 40 * k), k, c, grow, es);
-        ly += block;
+        float room = bottom - ly;
+        float rr = std::clamp(std::min(w1 * 0.27f, (room - 70 * k) / 2), 40 * k, 96 * k);
+        ratings_radar(p, x1 + w1 / 2, ly + rr + 30 * k, rr, k, c, grow, es);
     }
-    ly += card_head(p, lx, ly, lw, k, T("ESTA TEMPORADA", "THIS SEASON"));
+
+    // 2: the value, this season, the team-mate duel
+    float my2 = top;
+    bool duel = !c.h2h_mate.empty() && c.h2h_ahead + c.h2h_behind > 0;
+    my2 += card_head(p, x2, my2, w2, k, T("VALOR, CARRERA A CARRERA", "VALUE, RACE BY RACE"));
+    float chart_h = std::clamp(bottom - my2 - (duel ? 290 : 230) * k, 180 * k, 330 * k);
+    value_chart(p, x2, my2, w2, chart_h, k, c, es, grow);
+    my2 += chart_h + 18 * k;
+    my2 += card_head(p, x2, my2, w2, k, T("ESTA TEMPORADA", "THIS SEASON"));
     {
         const char *labels_es[4] = {"PUNTOS", "VICTORIAS", "PODIOS", "CARRERAS"}, *labels_en[4] = {"POINTS", "WINS", "PODIUMS", "STARTS"};
         int vals[4] = {c.points, c.wins, c.podiums, c.starts};
-        float tw = (lw - 30 * k) / 4;
+        float tw = (w2 - 30 * k) / 4;
         for (int i = 0; i < 4; ++i) {
-            float tx = lx + i * (tw + 10 * k);
-            ov::rect_rounded(p, tx, ly, tw, 66 * k, 9 * k, 0xFFFFFF08);
-            ov::text(p, tx + tw / 2, ly + 26 * k, ui::ts(26 * k, ui::kText, ov::align::center | ov::align::middle),
+            float tx = x2 + static_cast<float>(i) * (tw + 10 * k);
+            ov::rect_rounded(p, tx, my2, tw, 72 * k, 10 * k, 0xFFFFFF08);
+            ov::text(p, tx + tw / 2, my2 + 28 * k, ui::ts(30 * k, ui::kText, ov::align::center | ov::align::middle),
                      std::to_string(static_cast<int>(std::lround(vals[i] * grow))));
-            ov::text(p, tx + tw / 2, ly + 52 * k, ui::ts(10.5f * k, ui::kMuted, ov::align::center | ov::align::middle, 1.2f * k), es ? labels_es[i] : labels_en[i]);
+            ov::text(p, tx + tw / 2, my2 + 56 * k, ui::ts(11 * k, ui::kMuted, ov::align::center | ov::align::middle, 1.2f * k),
+                     es ? labels_es[i] : labels_en[i]);
         }
-        ly += 80 * k;
+        my2 += 86 * k;
+        auto n = [&](int v, const char *one_es, const char *many_es, const char *one_en, const char *many_en) {
+            return std::to_string(v) + " " + (v == 1 ? T(one_es, one_en) : T(many_es, many_en));
+        };
         // 1.1.0 phase 5: his whole career in this market
         if (c.c_starts > 0 || c.c_titles > 0) {
-            auto n = [&](int v, const char *one_es, const char *many_es, const char *one_en, const char *many_en) {
-                return std::to_string(v) + " " + (v == 1 ? T(one_es, one_en) : T(many_es, many_en));
-            };
             std::string line = std::string(T("CARRERA:  ", "CAREER:  ")) + n(c.c_starts, "salida", "salidas", "start", "starts") + "  ·  " +
                                n(c.c_wins, "victoria", "victorias", "win", "wins") + "  ·  " +
                                n(c.c_podiums, "podio", "podios", "podium", "podiums") + "  ·  " +
                                n(c.c_titles, "título", "títulos", "title", "titles") + "  ·  " +
                                n(c.c_teams, "equipo", "equipos", "team", "teams");
-            ov::text(p, lx, ly + 4 * k, ui::ts(13.5f * k, ui::kText2, ov::align::left | ov::align::middle, 0.3f * k), ui::fit(p, ui::ts(13.5f * k), line, lw));
-            ly += 24 * k;
+            ov::text(p, x2, my2 + 4 * k, ui::ts(14 * k, ui::kText2, ov::align::left | ov::align::middle, 0.3f * k), ui::fit(p, ui::ts(14 * k), line, w2));
+            my2 += 26 * k;
         }
-        // 1.1.3: this season on track, from the game's telemetry
-        // a race with telemetry: the counts, zeros included; none yet: "no data", never a clean record it can't know
+        // 1.1.3: this season on track, from the game's telemetry: the counts (zeros included) or "no data", never a
+        // clean record it can't know
         if (c.t_on && c.t_rounds == 0 && !c.team.empty()) {
-            ov::text(p, lx, ly + 4 * k, ui::ts(13.5f * k, ui::kMuted, ov::align::left | ov::align::middle, 0.3f * k),
-                     ui::fit(p, ui::ts(13.5f * k),
+            ov::text(p, x2, my2 + 4 * k, ui::ts(14 * k, ui::kMuted, ov::align::left | ov::align::middle, 0.3f * k),
+                     ui::fit(p, ui::ts(14 * k),
                              T("EN PISTA:  aún sin datos de telemetría (activa la telemetría UDP del juego)",
                                "ON TRACK:  no telemetry data yet (turn on the game's UDP telemetry)"),
-                             lw));
-            ly += 24 * k;
+                             w2));
+            my2 += 26 * k;
         } else if (c.t_rounds > 0 || c.t_overtakes > 0 || c.t_incidents > 0 || c.t_failures > 0) {
-            auto n = [&](int v, const char *one_es, const char *many_es, const char *one_en, const char *many_en) {
-                return std::to_string(v) + " " + (v == 1 ? T(one_es, one_en) : T(many_es, many_en));
-            };
             std::string line = std::string(T("EN PISTA:  ", "ON TRACK:  ")) +
                                n(c.t_overtakes, "adelantamiento", "adelantamientos", "overtake", "overtakes") + "  ·  " +
                                n(c.t_incidents, "incidente", "incidentes", "incident", "incidents") + "  ·  " +
                                n(c.t_failures, "avería", "averías", "mechanical DNF", "mechanical DNFs");
-            ov::text(p, lx, ly + 4 * k, ui::ts(13.5f * k, ui::kText2, ov::align::left | ov::align::middle, 0.3f * k), ui::fit(p, ui::ts(13.5f * k), line, lw));
-            ly += 24 * k;
+            ov::text(p, x2, my2 + 4 * k, ui::ts(14 * k, ui::kText2, ov::align::left | ov::align::middle, 0.3f * k), ui::fit(p, ui::ts(14 * k), line, w2));
+            my2 += 26 * k;
         }
-        ly += 4 * k;
+        my2 += 8 * k;
     }
-    ly += card_head(p, lx, ly, lw, k, T("TRAYECTORIA", "CAREER PATH"));
-    if (c.path.empty()) {
-        ov::text(p, lx, ly, ui::ts(15 * k, ui::kMuted), c.team.empty() ? T("Todavía sin equipo en F1.", "No F1 team yet.") : (c.team + T(", desde antes de Silly Season.", ", since before Silly Season.")));
-    } else {
-        float px = lx;
-        for (size_t i = 0; i < c.path.size(); ++i) {
-            const auto &s = c.path[i];
-            if (px > lx + lw - 80 * k)
-                break;
-            float cw = ui::team_chip(p, px, ly, s.code, s.col, k, 24);
-            ov::text(p, px + cw / 2, ly + 36 * k, ui::ts(11.5f * k, ui::kText2, ov::align::center | ov::align::middle), std::to_string(s.year));
-            px += cw + 8 * k;
-            if (i + 1 < c.path.size()) {
-                ui::arrow_right(p, px, ly + 12 * k, 16 * k, k, 0xFFFFFF50);
-                px += 24 * k;
-            }
-        }
-    }
-    // right: the value chart, the stories, the honours
-    float ry = top;
-    bool duel = !c.h2h_mate.empty() && c.h2h_ahead + c.h2h_behind > 0;
-    ry += card_head(p, rx2, ry, rw, k, T("VALOR, CARRERA A CARRERA", "VALUE, RACE BY RACE"));
-    value_chart(p, rx2, ry, rw, duel ? 196 * k : 230 * k, k, c, es, grow);
-    ry += duel ? 212 * k : 248 * k;
     // 1.1.0 phase 5: this season against his team-mate, race by race
-    if (duel) {
-        ry += card_head(p, rx2, ry, rw, k, T("DUELO CON SU COMPAÑERO", "TEAM-MATE DUEL"));
-        int n = c.h2h_ahead + c.h2h_behind;
-        float f = static_cast<float>(c.h2h_ahead) / static_cast<float>(n);
-        ov::text(p, rx2, ry + 10 * k, ui::ts(15 * k, ui::kText, ov::align::left | ov::align::middle), std::to_string(c.h2h_ahead));
-        ov::text(p, rx2 + rw, ry + 10 * k, ui::ts(15 * k, ui::kText, ov::align::right | ov::align::middle), std::to_string(c.h2h_behind));
-        float bx = rx2 + 34 * k, bw = rw - 68 * k;
-        ov::rect_rounded(p, bx, ry + 6 * k, bw, 8 * k, 4 * k, 0xFFFFFF26);
-        ov::rect_rounded(p, bx, ry + 6 * k, std::max(8 * k, bw * f * grow), 8 * k, 4 * k, c.col ? ui::rgb(c.col) : ui::kRed);
-        ov::text(p, rx2 + rw, ry + 32 * k, ui::ts(12.5f * k, ui::kMuted, ov::align::right | ov::align::middle),
-                 ui::fit(p, ui::ts(12.5f * k), std::string(T("contra ", "vs ")) + c.h2h_mate + T(" (carreras por delante)", " (races ahead)"), rw));
-        ry += 50 * k;
+    if (duel && my2 + 60 * k < bottom) {
+        my2 += card_head(p, x2, my2, w2, k, T("DUELO CON SU COMPAÑERO", "TEAM-MATE DUEL"));
+        int nn = c.h2h_ahead + c.h2h_behind;
+        float f = static_cast<float>(c.h2h_ahead) / static_cast<float>(nn);
+        ov::text(p, x2, my2 + 10 * k, ui::ts(17 * k, ui::kText, ov::align::left | ov::align::middle), std::to_string(c.h2h_ahead));
+        ov::text(p, x2 + w2, my2 + 10 * k, ui::ts(17 * k, ui::kText, ov::align::right | ov::align::middle), std::to_string(c.h2h_behind));
+        float bx = x2 + 36 * k, bw = w2 - 72 * k;
+        ov::rect_rounded(p, bx, my2 + 6 * k, bw, 9 * k, 4.5f * k, 0xFFFFFF26);
+        ov::rect_rounded(p, bx, my2 + 6 * k, std::max(9 * k, bw * f * grow), 9 * k, 4.5f * k, c.col ? ui::rgb(c.col) : ui::kRed);
+        ov::text(p, x2 + w2, my2 + 34 * k, ui::ts(13 * k, ui::kMuted, ov::align::right | ov::align::middle),
+                 ui::fit(p, ui::ts(13 * k), std::string(T("contra ", "vs ")) + c.h2h_mate + T(" (carreras por delante)", " (races ahead)"), w2));
     }
-    size_t max_links = duel ? 3 : 4;
-    ry += card_head(p, rx2, ry, rw, k, T("EN LAS NOTICIAS", "IN THE NEWS"));
-    if (c.links.empty())
-        ov::text(p, rx2, ry, ui::ts(15 * k, ui::kMuted), T("Nadie habla de él ahora mismo.", "Nobody is talking about him right now."));
-    for (size_t i = 0; i < c.links.size() && i < max_links; ++i)
-        ov::text(p, rx2, ry + i * 26 * k, ui::ts(15 * k, ui::kText2), ui::fit(p, ui::ts(15 * k), "•  " + c.links[i], rw));
-    ry += std::max<size_t>(1, std::min<size_t>(max_links, c.links.size())) * 26 * k + 12 * k;
-    ry += card_head(p, rx2, ry, rw, k, T("PALMARÉS", "HONOURS"));
-    if (c.awards.empty())
-        ov::text(p, rx2, ry, ui::ts(15 * k, ui::kMuted), T("Todavía ninguno.", "None yet."));
-    float ax = rx2;
-    for (const std::string &a : c.awards) {
-        if (ax > rx2 + rw - 140 * k)
-            break;
-        ax += ui::tag(p, ax, ry - 2 * k, a, ui::kGold, k, 11, true) + 8 * k;
+
+    // 3: who he's linked with, the news, his path, his honours
+    float ry = top;
+    ry += card_head(p, x3, ry, w3, k, T("LE VINCULAN CON", "LINKED WITH"));
+    {
+        int shown = 0;
+        for (const UiRumour &u : d.rumours) {
+            if (u.driver_id != c.id || shown >= 4)
+                continue;
+            float rowy = ry + static_cast<float>(shown) * 34 * k;
+            float cxx = x3 + ui::team_chip(p, x3, rowy, u.to_code, u.to_col, k, 22) + 10 * k;
+            ov::text(p, cxx, rowy + 11 * k, ui::ts(15 * k, ui::kText, ov::align::left | ov::align::middle),
+                     ui::fit(p, ui::ts(15 * k), u.to, w3 - (cxx - x3) - 110 * k));
+            const char *stage = u.stage >= 1 ? T("NEGOCIACIÓN", "TALKS") : T("RUMOR", "RUMOUR");
+            uint32_t sc = u.stage >= 1 ? ui::kAmber : 0x8E9AAFFF;
+            ov::text(p, x3 + w3 - 44 * k, rowy + 11 * k, ui::ts(11 * k, sc, ov::align::right | ov::align::middle, 1.2f * k), stage);
+            if (u.odds > 0)
+                ov::text(p, x3 + w3, rowy + 11 * k, ui::ts(14 * k, ui::kText2, ov::align::right | ov::align::middle),
+                         std::to_string(u.odds) + "%");
+            ++shown;
+        }
+        if (!shown) {
+            ov::text(p, x3, ry + 4 * k, ui::ts(15 * k, ui::kMuted), T("Ningún equipo suena para él ahora.", "No team is linked with him right now."));
+            shown = 1;
+        }
+        ry += static_cast<float>(shown) * 34 * k + 12 * k;
     }
-    ov::text(p, x + w - pad, r.y + r.h - 22 * k, ui::ts(12.5f * k, ui::kMuted, ov::align::right | ov::align::middle, 0.6f * k),
+    ry += card_head(p, x3, ry, w3, k, T("EN LAS NOTICIAS", "IN THE NEWS"));
+    {
+        size_t max_links = 5;
+        if (c.links.empty())
+            ov::text(p, x3, ry, ui::ts(15 * k, ui::kMuted), T("Nadie habla de él ahora mismo.", "Nobody is talking about him right now."));
+        for (size_t i = 0; i < c.links.size() && i < max_links; ++i)
+            ov::text(p, x3, ry + static_cast<float>(i) * 27 * k, ui::ts(15 * k, ui::kText2), ui::fit(p, ui::ts(15 * k), "•  " + c.links[i], w3));
+        ry += static_cast<float>(std::max<size_t>(1, std::min<size_t>(max_links, c.links.size()))) * 27 * k + 14 * k;
+    }
+    ry += card_head(p, x3, ry, w3, k, T("TRAYECTORIA", "CAREER PATH"));
+    if (c.path.empty()) {
+        ov::text(p, x3, ry, ui::ts(15 * k, ui::kMuted, ov::align::left | ov::align::top, 0, w3),
+                 c.team.empty() ? T("Todavía sin equipo en F1.", "No F1 team yet.") : (c.team + T(", desde antes de Silly Season.", ", since before Silly Season.")));
+        ry += 34 * k;
+    } else {
+        // newest first, down the column: the year, the team's badge, its name
+        size_t room = static_cast<size_t>(std::max(1.0f, (bottom - ry - 90 * k) / (32 * k)));
+        size_t n = std::min(c.path.size(), std::min<size_t>(room, 6));
+        for (size_t i = 0; i < n; ++i) {
+            const auto &s = c.path[c.path.size() - 1 - i];
+            float rowy = ry + static_cast<float>(i) * 32 * k;
+            ov::text(p, x3, rowy + 11 * k, ui::ts(14 * k, ui::kText2, ov::align::left | ov::align::middle), std::to_string(s.year));
+            float tx = x3 + 54 * k;
+            tx += ui::team_chip(p, tx, rowy, s.code, s.col, k, 22) + 10 * k;
+            ov::text(p, tx, rowy + 11 * k, ui::ts(15 * k, ui::kText, ov::align::left | ov::align::middle), ui::fit(p, ui::ts(15 * k), s.team, x3 + w3 - tx));
+            if (i + 1 < n)
+                ov::rect(p, x3 + 20 * k, rowy + 24 * k, 1 * k, 8 * k, 0xFFFFFF20);
+        }
+        ry += static_cast<float>(n) * 32 * k + 10 * k;
+    }
+    if (ry + 40 * k < bottom) {
+        ry += card_head(p, x3, ry, w3, k, T("PALMARÉS", "HONOURS"));
+        if (c.awards.empty())
+            ov::text(p, x3, ry, ui::ts(15 * k, ui::kMuted), T("Todavía ninguno.", "None yet."));
+        float ax = x3, ay = ry - 2 * k;
+        for (const std::string &a : c.awards) {
+            float aw = ui::text_w(p, ui::ts(11 * k), a) + 30 * k;
+            if (ax + aw > x3 + w3) {
+                ax = x3;
+                ay += 28 * k;
+                if (ay + 24 * k > bottom)
+                    break;
+            }
+            ax += ui::tag(p, ax, ay, a, ui::kGold, k, 11, true) + 8 * k;
+        }
+    }
+    ov::text(p, x + w - pad, r.y + r.h - 24 * k, ui::ts(13 * k, ui::kMuted, ov::align::right | ov::align::middle, 0.6f * k),
              T("Esc / B  cerrar", "Esc / B  close"));
 }
 
@@ -1554,18 +1829,18 @@ void draw_team_card(ov::Paint *p, const ov::Input &in, float k, float W, float H
     ov::Rect r = card_frame(p, k, W, H, c.col, t);
     float x = r.x, y = r.y, w = r.w, pad = 34 * k;
     float grow = ui::g_lite ? 1.0f : ui::ease_out((t - 0.1f) / 0.6f);
-    ov::text(p, x + pad, y + 30 * k, ui::lifted(ui::ts(40 * k, 0xFFFFFFFF, ov::align::left | ov::align::top, 0.6f * k), k), c.name);
+    ov::text(p, x + w - pad, y + 18 * k, ui::ts(132 * k, 0xFFFFFF22, ov::align::right | ov::align::top, 4 * k), c.code);
+    ov::text(p, x + pad, y + 40 * k, ui::lifted(ui::ts(50 * k, 0xFFFFFFFF, ov::align::left | ov::align::top, 0.6f * k), k), c.name);
     float tx = x + pad;
     if (!c.strategy.empty()) {
         ui::Tag st = ui::strategy_tag(c.strategy);
-        tx += ui::tag(p, tx, y + 86 * k, T(st.es, st.en), st.col, k, 12, true) + 10 * k;
+        tx += ui::tag(p, tx, y + 110 * k, T(st.es, st.en), st.col, k, 13, true) + 12 * k;
     }
     char rank[48];
     std::snprintf(rank, sizeof rank, "P%d  ·  %d %s", c.rank, c.points, T("puntos", "points"));
-    ov::text(p, tx, y + 97 * k, ui::ts(15 * k, 0xFFFFFFD0, ov::align::left | ov::align::middle), rank);
-    ov::text(p, x + w - pad, y + 28 * k, ui::ts(64 * k, 0xFFFFFF30, ov::align::right | ov::align::top, 2 * k), c.code);
+    ov::text(p, tx, y + 122 * k, ui::ts(17 * k, 0xFFFFFFD8, ov::align::left | ov::align::middle), rank);
 
-    float top = y + 150 * k, lx = x + pad, lw = w * 0.44f, rx = x + pad + lw + 40 * k, rw = x + w - pad - rx;
+    float top = y + (kCardHead + 22) * k, lx = x + pad, lw = w * 0.44f, rx = x + pad + lw + 48 * k, rw = x + w - pad - rx;
     float ly = top;
     ly += card_head(p, lx, ly, lw, k, T("EL EQUIPO", "THE TEAM"));
     auto num = [](float f) { return std::to_string(static_cast<int>(std::lround(f))); };
@@ -1608,6 +1883,28 @@ void draw_team_card(ov::Paint *p, const ov::Input &in, float k, float W, float H
     };
     seats(T("ESTA TEMPORADA", "THIS SEASON"), c.now_id, c.now, nullptr);
     seats(T("LA PRÓXIMA", "NEXT SEASON"), c.next_id, c.next, c.next_new);
+    // 1.1.4: its drivers' value over the season, side by side (the card's foot was empty)
+    {
+        float bottom = r.y + r.h - 58 * k;
+        if (ly + 120 * k < bottom) {
+            ly += card_head(p, lx, ly, lw, k, T("SUS PILOTOS, CARRERA A CARRERA", "ITS DRIVERS, RACE BY RACE"));
+            float half = (lw - 20 * k) / 2;
+            for (int s = 0; s < 2; ++s) {
+                const UiDriverCard *dc = c.now_id[s].empty() ? nullptr : g_ov.card(c.now_id[s]);
+                if (!dc)
+                    continue;
+                float bx = lx + static_cast<float>(s) * (half + 20 * k), bh = std::min(130 * k, bottom - ly);
+                ov::rect_rounded(p, bx, ly, half, bh, 10 * k, 0xFFFFFF07);
+                ov::text(p, bx + 14 * k, ly + 18 * k, ui::ts(15 * k, ui::kText, ov::align::left | ov::align::middle),
+                         ui::fit(p, ui::ts(15 * k), dc->name, half - 80 * k));
+                char v[16];
+                std::snprintf(v, sizeof v, "%.0f", dc->value);
+                ov::text(p, bx + half - 14 * k, ly + 18 * k, ui::ts(20 * k, ui::kText, ov::align::right | ov::align::middle), v);
+                if (bh > 70 * k)
+                    sparkline(p, bx + 14 * k, ly + 40 * k, half - 28 * k, bh - 56 * k, dc->values, ui::vivid(c.col), k, grow);
+            }
+        }
+    }
 
     float ry = top;
     ry += card_head(p, rx, ry, rw, k, T("CANTERA Y RESERVAS", "ACADEMY & RESERVES"));
@@ -1634,15 +1931,15 @@ void draw_team_card(ov::Paint *p, const ov::Input &in, float k, float W, float H
     ry += card_head(p, rx, ry, rw, k, T("EN EL MERCADO", "ON THE MARKET"));
     if (c.links.empty())
         ov::text(p, rx, ry, ui::ts(15 * k, ui::kMuted), T("Nada se mueve ahora mismo.", "Nothing moving right now."));
-    for (size_t i = 0; i < c.links.size() && i < 4; ++i)
-        ov::text(p, rx, ry + i * 26 * k, ui::ts(15 * k, ui::kText2), ui::fit(p, ui::ts(15 * k), "•  " + c.links[i], rw));
-    ry += std::max<size_t>(1, std::min<size_t>(4, c.links.size())) * 26 * k + 12 * k;
+    for (size_t i = 0; i < c.links.size() && i < 6; ++i)
+        ov::text(p, rx, ry + i * 27 * k, ui::ts(15 * k, ui::kText2), ui::fit(p, ui::ts(15 * k), "•  " + c.links[i], rw));
+    ry += std::max<size_t>(1, std::min<size_t>(6, c.links.size())) * 27 * k + 14 * k;
     ry += card_head(p, rx, ry, rw, k, T("ÚLTIMOS MOVIMIENTOS", "RECENT MOVES"));
     if (c.moves.empty())
         ov::text(p, rx, ry, ui::ts(15 * k, ui::kMuted), T("Ninguno todavía.", "None yet."));
-    for (size_t i = 0; i < c.moves.size() && i < 5; ++i)
-        ov::text(p, rx, ry + i * 24 * k, ui::ts(14 * k, ui::kText2), ui::fit(p, ui::ts(14 * k), c.moves[i], rw));
-    ry += std::max<size_t>(1, std::min<size_t>(5, c.moves.size())) * 24 * k + 12 * k;
+    for (size_t i = 0; i < c.moves.size() && i < 8; ++i)
+        ov::text(p, rx, ry + i * 26 * k, ui::ts(15 * k, ui::kText2), ui::fit(p, ui::ts(15 * k), c.moves[i], rw));
+    ry += std::max<size_t>(1, std::min<size_t>(8, c.moves.size())) * 26 * k + 14 * k;
     ry += card_head(p, rx, ry, rw, k, T("PALMARÉS", "HONOURS"));
     if (c.awards.empty())
         ov::text(p, rx, ry, ui::ts(15 * k, ui::kMuted), T("Todavía ninguno.", "None yet."));
@@ -1680,6 +1977,7 @@ void draw_search(ov::Paint *p, const ov::Input &in, float k, float W, float H, b
             continue;
         std::string sub = !c.team.empty() ? c.team
                           : c.role == "reserve" ? std::string(T("Reserva de ", "Reserve, ")) + c.role_team
+                          : c.role == "away"    ? std::string(T("Corre en ", "Racing in ")) + c.role_team
                           : c.kind == "f2"       ? std::string("F2")
                                                  : std::string(T("Agente libre", "Free agent"));
         // a name that starts with the search, or a surname that does, comes first
@@ -1773,8 +2071,8 @@ void draw_card(ov::Paint *p, const ov::Input &in, float k, float W, float H, boo
     }
     // a card opened from a list: its place in it, and arrows to step through
     if (int bi = browse_index(); bi >= 0 && modal == before) {
-        float w = std::min(W - 80 * k, 1240 * k), h = std::min(H - 80 * k, 720 * k);
-        float cx = (W - w) / 2 + 34 * k, cy = (H - h) / 2 + h - 24 * k;
+        ov::Rect cr = card_rect(k, W, H);
+        float cx = cr.x + 36 * k, cy = cr.y + cr.h - 24 * k;
         char pos[32];
         std::snprintf(pos, sizeof pos, "%d / %zu", bi + 1, browse.size());
         bool hl = in.inside(cx - 8 * k, cy - 14 * k, 28 * k, 28 * k), hr = in.inside(cx + 92 * k, cy - 14 * k, 28 * k, 28 * k);
@@ -1795,8 +2093,8 @@ void draw_card(ov::Paint *p, const ov::Input &in, float k, float W, float H, boo
     }
     // a click outside the card closes it (unless a link inside just opened another)
     if (modal == before && modal_id == before_id && in.clicked() && t > 0.2f) {
-        float w = std::min(W - 80 * k, 1240 * k), h = std::min(H - 80 * k, 720 * k);
-        if (!in.inside((W - w) / 2, (H - h) / 2, w, h))
+        ov::Rect cr = card_rect(k, W, H);
+        if (!in.inside(cr.x, cr.y, cr.w, cr.h))
             close_card();
     }
 }
@@ -1887,6 +2185,21 @@ void news_pick(const Ctx &c, float x, float y, float w, float h, const UiNews &n
         pick_mark(c, x, y, w, h, picked);
 }
 
+// 1.1.4: the News page's filter (F / Y): every story, the official ones, rumours and talks, the press
+namespace news_filter {
+inline int on = 0;
+constexpr int kCount = 4;
+inline bool keep(const std::string &kind)
+{
+    switch (on) {
+    case 1: return kind == "official" || kind == "swap" || kind == "domino";
+    case 2: return kind == "rumour" || kind == "talks";
+    case 3: return kind == "press" || kind == "press_reply" || kind == "media";
+    default: return true;
+    }
+}
+} // namespace news_filter
+
 float page_news(const Ctx &c, float y0)
 {
     const OverlayData &d = g_ov;
@@ -1895,11 +2208,40 @@ float page_news(const Ctx &c, float y0)
                            c.T("El paddock empieza a hablar después de las primeras carreras.",
                                "The paddock starts talking after the first races."));
     float k = c.k, y = y0;
+    // 1.1.4: the filter chips, each with how many stories it holds
+    {
+        const char *names_es[4] = {"TODAS", "OFICIALES", "RUMORES", "PRENSA"}, *names_en[4] = {"ALL", "OFFICIAL", "RUMOURS", "PRESS"};
+        const uint32_t cols[4] = {ui::kText2, ui::kGreen, 0x8E9AAFFF, ui::kAmber};
+        float x = c.area.x;
+        int saved = news_filter::on;
+        for (int i = 0; i < news_filter::kCount; ++i) {
+            news_filter::on = i;
+            int count = static_cast<int>(std::count_if(d.news.begin(), d.news.end(), [](const UiNews &n) { return news_filter::keep(n.kind); }));
+            news_filter::on = saved;
+            std::string label = std::string(c.T(names_es[i], names_en[i])) + "  " + std::to_string(count);
+            ov::TextStyle ls = ui::ts(12.5f * k, i == saved ? ui::kText : ui::kText2, ov::align::left | ov::align::middle, 1.2f * k);
+            float w = ui::text_w(c.p, ls, label) + 28 * k, h = 32 * k;
+            if (c.visible(y, h)) {
+                bool hov = c.hover(x, y, w, h);
+                if (hov && c.in.clicked())
+                    news_filter::on = i;
+                ov::rect_rounded(c.p, x, y, w, h, 9 * k, i == saved ? ui::alpha(cols[i], 0.22f) : hov ? 0xFFFFFF0C : 0xFFFFFF06);
+                ov::rect_rounded_outline(c.p, x, y, w, h, 9 * k, 1 * k, i == saved ? ui::alpha(cols[i], 0.8f) : 0xFFFFFF14);
+                ov::text(c.p, x + 14 * k, y + h / 2, ls, label);
+            }
+            x += w + 8 * k;
+        }
+        if (c.visible(y, 32 * k))
+            ui::keycap(c.p, x + 6 * k, y + 5 * k, ui4::pad_mode ? "Y" : "F", k);
+        y += 46 * k;
+    }
     // a timeline: one node per race, the cards hanging off it
     float lx = c.area.x + 14 * k, cx = c.area.x + 44 * k, cw = c.area.w - 44 * k;
     int last_round = -1, last_year = -1;
     float line_top = y0 + 14 * k;
     for (const UiNews &n : d.news) {
+        if (!news_filter::keep(n.kind))
+            continue;
         if (n.round != last_round || n.year != last_year) {
             char head[64];
             if (n.round == 0)
@@ -1960,35 +2302,167 @@ float kpi(const Ctx &c, float x, float y, float w, float h, int value, const cha
     return h;
 }
 
+// 1.1.4: a team's colour from its id (the story's team, for the front page's livery); 0 when it isn't on the grid
+uint32_t team_colour(const OverlayData &d, const std::string &id)
+{
+    if (id.empty())
+        return 0;
+    for (const UiTeam &t : d.teams)
+        if (t.id == id)
+            return t.col;
+    for (const UiTeam &t : d.grid)
+        if (t.id == id)
+            return t.col;
+    return 0;
+}
+
+// 1.1.4: a small line of a driver's value, race by race (the movers, the inspector)
+void sparkline(ov::Paint *p, float x, float y, float w, float h, const std::vector<float> &v, uint32_t col, float k, float grow)
+{
+    if (v.size() < 2)
+        return;
+    float lo = *std::min_element(v.begin(), v.end()), hi = *std::max_element(v.begin(), v.end());
+    if (hi - lo < 1.0f) {
+        float mid = (hi + lo) / 2;
+        lo = mid - 0.5f;
+        hi = mid + 0.5f;
+    }
+    size_t n = std::max<size_t>(2, static_cast<size_t>(std::ceil(static_cast<float>(v.size()) * std::clamp(grow, 0.0f, 1.0f))));
+    n = std::min(n, v.size());
+    std::vector<float> xy;
+    xy.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        xy.push_back(x + w * static_cast<float>(i) / static_cast<float>(v.size() - 1));
+        xy.push_back(y + h - h * (v[i] - lo) / (hi - lo));
+    }
+    ov::polyline(p, xy.data(), static_cast<uint32_t>(n), 1.6f * k, col);
+    ov::circle(p, xy[xy.size() - 2], xy.back(), 2.5f * k, col);
+}
+
+// 1.1.4: the front page's lead: the newest big story across the top, in its team's livery
+float hero_story(const Ctx &c, float x, float y, float w, float h, const UiNews &n)
+{
+    const OverlayData &d = g_ov;
+    float k = c.k;
+    if (!c.visible(y, h))
+        return h;
+    Reveal r(c);
+    ui::Tag tag = ui::news_tag(n.kind);
+    uint32_t tc = team_colour(d, n.team_id);
+    uint32_t base = tc ? tc : (tag.col >> 8);
+    bool hov = c.hover(x, y, w, h);
+    ui::card(c.p, x, y, w, h, k, hov);
+    {
+        ov::ClipScope clip(c.p, x, y, w, h);
+        // the team's colour rises towards the right, behind the text it stays dark enough to read
+        ov::gradient(c.p, x, y, w, h, ui::rgb(base, 0x14), ui::rgb(base, 0x70), true, 12 * k);
+        for (int i = 0; i < 4; ++i)
+            ui::para(c.p, x + w * 0.72f + static_cast<float>(i) * 34 * k, y, 18 * k, h, h * 0.55f, ui::alpha(0xFFFFFFFF, 0.06f));
+        ov::gradient(c.p, x, y + h * 0.5f, w, h * 0.5f, 0x00000000, 0x00000050);
+    }
+    ov::rect_rounded(c.p, x, y + 14 * k, 4 * k, h - 28 * k, 2 * k, tag.col);
+    float tx = x + 30 * k, ty = y + 24 * k;
+    tx += ui::tag(c.p, tx, ty, c.T("PORTADA", "FRONT PAGE"), ui::kRed, k, 12, true) + 8 * k;
+    tx += ui::tag(c.p, tx, ty, c.T(tag.es, tag.en), tag.col, k, 12) + 12 * k;
+    char when[48];
+    std::snprintf(when, sizeof when, "%s %d  ·  %d", c.T("CARRERA", "ROUND"), n.round, n.year);
+    ov::text(c.p, tx, ty + 11 * k, ui::ts(12 * k, ui::kText2, ov::align::left | ov::align::middle, 1.6f * k), when);
+    if (n.unread)
+        ov::text(c.p, x + w - 26 * k, ty + 11 * k, ui::ts(12 * k, ui::kRed, ov::align::right | ov::align::middle, 1.8f * k),
+                 c.T("NUEVA", "NEW"));
+    ov::TextStyle hs = ui::lifted(ui::ts(34 * k, ui::kText, ov::align::left | ov::align::top, 0.3f * k, w - 60 * k), k);
+    hs.line_height = 1.08f;
+    ov::text(c.p, x + 30 * k, ty + 38 * k, hs, n.title);
+    float th = ui::text_h(c.p, hs, n.title);
+    std::string body = n.body.substr(0, n.body.find('\n'));
+    ov::TextStyle bs = ui::ts(16 * k, 0xD8DAE2FF, ov::align::left | ov::align::top, 0, w - 60 * k);
+    bs.line_height = 1.35f;
+    float room = y + h - 46 * k - (ty + 50 * k + th);
+    if (room > 18 * k) {
+        if (ui::text_h(c.p, bs, body) > room) // the first sentence when the whole won't fit
+            body = body.substr(0, body.find(". ") == std::string::npos ? body.size() : body.find(". ") + 1);
+        ov::text(c.p, x + 30 * k, ty + 50 * k + th, bs, body);
+    }
+    ui::hint(c.p, x + 30 * k, y + h - 24 * k, ui4::pad_mode ? "A" : "Enter", c.T("leer", "read"), k);
+    news_pick(c, x, y, w, h, n);
+    return h;
+}
+
+// 1.1.4: the market's pulse beside the lead: the window (with the races left before the grid closes) and the three
+// numbers that move it, as filling bars
+float market_pulse(const Ctx &c, float x, float y, float w, float h)
+{
+    const OverlayData &d = g_ov;
+    float k = c.k;
+    if (!c.visible(y, h))
+        return h;
+    Reveal r(c);
+    ui::card(c.p, x, y, w, h, k);
+    float px = x + 24 * k, pw = w - 48 * k;
+    int left = std::max(0, d.rounds - d.round);
+    bool dl = d.deadline && !d.finalised;
+    uint32_t wc = d.finalised ? ui::kGold : dl ? ui::kRed : ui::kGreen;
+    ov::text(c.p, px, y + 22 * k, ui::ts(12 * k, ui::kMuted, ov::align::left | ov::align::top, 2.0f * k),
+             c.T("EL MERCADO", "THE MARKET"));
+    const char *state = d.finalised ? (d.real ? c.T("Parrilla cerrada", "Grid confirmed") : c.T("Parrilla prevista", "Projected grid"))
+                        : dl        ? "Deadline day"
+                        : d.real    ? c.T("La temporada real", "The real season")
+                                    : c.T("Ventana abierta", "Window open");
+    if (d.finalised)
+        ov::circle(c.p, px + 6 * k, y + 56 * k, 5 * k, wc);
+    else
+        ui::live_dot(c.p, px + 6 * k, y + 56 * k, 5 * k, wc);
+    ov::text(c.p, px + 20 * k, y + 56 * k, ui::ts(22 * k, ui::kText, ov::align::left | ov::align::middle), state);
+    // the races left, big, on the right
+    if (!d.finalised) {
+        ov::text(c.p, x + w - 24 * k, y + 20 * k, ui::lifted(ui::ts(44 * k, dl ? ui::kRed : ui::kText, ov::align::right | ov::align::top), k),
+                 std::to_string(left));
+        ov::text(c.p, x + w - 24 * k, y + 70 * k, ui::ts(11 * k, ui::kMuted, ov::align::right | ov::align::top, 1.6f * k),
+                 left == 1 ? c.T("CARRERA QUEDA", "RACE LEFT") : c.T("CARRERAS QUEDAN", "RACES LEFT"));
+    }
+    struct Row {
+        const char *label;
+        int v, full;
+        uint32_t col;
+    };
+    Row rows[] = {{c.T("Asientos en juego", "Seats in play"), d.seats_in_play, 10, ui::kRed},
+                  {c.T("Rumores y charlas", "Rumours & talks"), d.open_talks, 12, ui::kAmber},
+                  {c.T("Fichajes cerrados", "Done deals"), d.done_deals, 8, ui::kGreen}};
+    float ry = y + 100 * k, step = std::max(32 * k, (y + h - 18 * k - ry) / 3);
+    for (const Row &row : rows) {
+        ov::text(c.p, px, ry + 8 * k, ui::ts(15 * k, ui::kText2, ov::align::left | ov::align::middle), row.label);
+        ov::text(c.p, x + w - 24 * k, ry + 8 * k, ui::ts(17 * k, ui::kText, ov::align::right | ov::align::middle), std::to_string(row.v));
+        float f = std::clamp(static_cast<float>(row.v) / static_cast<float>(row.full), row.v > 0 ? 0.04f : 0.0f, 1.0f);
+        ov::rect_rounded(c.p, px, ry + 20 * k, pw, 5 * k, 2.5f * k, 0xFFFFFF0C);
+        if (f > 0)
+            ov::gradient(c.p, px, ry + 20 * k, std::max(5 * k, pw * f * c.grow()), 5 * k, ui::alpha(row.col, 0.35f), row.col, true, 2.5f * k);
+        ry += step;
+    }
+    return h;
+}
+
 float page_paddock(const Ctx &c, float y0)
 {
     const OverlayData &d = g_ov;
     float k = c.k, gap = 16 * k, y = y0;
-    // the numbers of the market
-    float kw = (c.area.w - 3 * gap) / 4, kh = 124 * k;
-    if (c.visible(y, kh)) {
-        auto lit = [](int v, int full) { return std::clamp(v * 8 / std::max(1, full), v > 0 ? 1 : 0, 8); };
-        kpi(c, c.area.x, y, kw, kh, d.seats_in_play, c.T("ASIENTOS EN JUEGO", "SEATS IN PLAY"),
-            c.T("pilotos sin contrato para el año que viene", "drivers out of contract next year"), ui::kRed, ui::Icon::grid,
-            lit(d.seats_in_play, 10));
-        kpi(c, c.area.x + (kw + gap), y, kw, kh, d.open_talks, c.T("RUMORES Y CHARLAS", "RUMOURS & TALKS"),
-            c.T("historias abiertas ahora mismo", "stories open right now"), ui::kAmber, ui::Icon::rumours, lit(d.open_talks, 12));
-        kpi(c, c.area.x + 2 * (kw + gap), y, kw, kh, d.done_deals, c.T("FICHAJES CERRADOS", "DONE DEALS"),
-            c.T("contratos firmados para el año que viene", "contracts signed for next year"), ui::kGreen, ui::Icon::deals,
-            lit(d.done_deals, 8));
-        kpi(c, c.area.x + 3 * (kw + gap), y, kw, kh, d.unread, c.T("SIN LEER", "UNREAD"),
-            c.T("noticias desde tu última visita", "stories since your last visit"), ui::kBlue, ui::Icon::news, lit(d.unread, 10));
-    }
-    y += kh + 26 * k;
+    // the front page: the lead story and the market's pulse beside it
+    float hero_h = 230 * k;
+    float pulse_w = std::clamp(c.area.w * 0.3f, 300 * k, 440 * k), hero_w = c.area.w - pulse_w - gap;
+    if (!d.news.empty())
+        hero_story(c, c.area.x, y, hero_w, hero_h, d.news.front());
+    else
+        empty_note(c, c.area.x, y + 20 * k, hero_w, ui::Icon::news,
+                   c.T("Sin titulares todavía: vuelve después de la próxima carrera.", "No headlines yet: come back after the next race."));
+    market_pulse(c, c.area.x + hero_w + gap, y, pulse_w, hero_h);
+    y += hero_h + 26 * k;
 
-    // left: the top stories; right: the player's corner and the movers
-    float lw = std::round(c.area.w * 0.6f), rw = c.area.w - lw - gap, rx = c.area.x + lw + gap;
-    float ly = y + section_title(c, c.area.x, y, c.T("TITULARES", "TOP STORIES"), {}, lw);
-    if (d.news.empty())
-        ly += empty_state(c, ly, ui::Icon::news, c.T("Sin titulares", "No headlines"),
-                          c.T("Vuelve después de la próxima carrera.", "Come back after the next race."));
-    for (size_t i = 0; i < d.news.size() && i < 3; ++i) {
-        float h = news_card(c, c.area.x, ly, lw, d.news[i], true, i == 0);
+    // left: the next stories; right: the player's corner, the movers and the championship
+    float lw = std::round(c.area.w * 0.58f), rw = c.area.w - lw - gap, rx = c.area.x + lw + gap;
+    float ly = y + section_title(c, c.area.x, y, c.T("TAMBIÉN HOY", "ALSO TODAY"), {}, lw);
+    if (d.news.size() <= 1)
+        ly += empty_note(c, c.area.x, ly, lw, ui::Icon::news, c.T("Nada más por ahora.", "Nothing else for now."));
+    for (size_t i = 1; i < d.news.size() && i < 4; ++i) {
+        float h = news_card(c, c.area.x, ly, lw, d.news[i], true, false);
         news_pick(c, c.area.x, ly, lw, h, d.news[i]);
         ly += h + 12 * k;
     }
@@ -2105,8 +2579,13 @@ float page_paddock(const Ctx &c, float y0)
             }
             ui::triangle(c.p, rx + 26 * k, my + 22 * k, 6 * k, up, col);
             ui::team_chip(c.p, rx + 44 * k, my + 10 * k, u->code, u->col, k);
+            bool spark = rw >= 440 * k;
             ov::text(c.p, rx + 112 * k, my + 22 * k, ui::ts(17 * k, ui::kText, ov::align::left | ov::align::middle),
-                     ui::fit(c.p, ui::ts(17 * k), u->name, rw - 290 * k));
+                     ui::fit(c.p, ui::ts(17 * k), u->name, rw - (spark ? 390 : 290) * k));
+            // 1.1.4: his value race by race beside the move
+            if (spark)
+                if (const UiDriverCard *cd = d.card(u->id))
+                    sparkline(c.p, rx + rw - 270 * k, my + 10 * k, 90 * k, 24 * k, cd->values, ui::alpha(col, 0.85f), k, c.grow());
             float bw = 90 * k * std::fabs(u->trend) / maxv * c.grow();
             ov::rect_rounded(c.p, rx + rw - 160 * k, my + 19 * k, 90 * k, 6 * k, 3 * k, 0xFFFFFF0C);
             ov::gradient(c.p, rx + rw - 160 * k, my + 19 * k, std::max(6 * k, bw), 6 * k, ui::alpha(col, 0.3f), col, true, 3 * k);
@@ -2551,6 +3030,20 @@ float page_grid(const Ctx &c, float y0)
                 ui::glow(c.p, x + w - 50 * k, sy + 14 * k, 40 * k, 0x30D15840);
                 ui::tag(c.p, x + w - 80 * k, sy + 3 * k, c.T("NUEVO", "NEW"), ui::kGreen, k, 11, true);
             }
+            // 1.1.4: the seat in the game, once written: waiting for the game to show it, or confirmed there
+            if (seat.game >= 0) {
+                bool ok = seat.game >= 2;
+                const char *gs = ok ? c.T("EN EL JUEGO", "IN THE GAME") : c.T("PENDIENTE", "PENDING");
+                uint32_t gc = ok ? ui::kGreen : ui::kAmber;
+                float gx = x + w - (seat.player || seat.fresh ? 100 : 18) * k;
+                ov::TextStyle gts = ui::ts(11 * k, gc, ov::align::right | ov::align::middle, 1.2f * k);
+                ov::text(c.p, gx, sy + 14 * k, gts, gs);
+                float dx = gx - ui::text_w(c.p, gts, gs) - 10 * k;
+                if (ok)
+                    ov::circle(c.p, dx, sy + 14 * k, 3.5f * k, gc);
+                else
+                    ui::live_dot(c.p, dx, sy + 14 * k, 3.5f * k, gc);
+            }
         }
     }
     y += ((d.grid.size() + 1) / 2) * (h + gap);
@@ -2706,7 +3199,10 @@ float page_drivers(const Ctx &c, float y0, bool free_agents)
             else
                 std::snprintf(v, sizeof v, "%.0f", u.value);
             ov::text(c.p, cx_val + vw + 12 * k, my, ui::ts(15 * k, ui::kText, ov::align::left | ov::align::middle), v);
-            if (free_agents && !u.role.empty()) {
+            if (free_agents && u.role == "away") {
+                // 1.1.5: racing in another series for now
+                ui::tag(c.p, cx_trend, my - 10 * k, u.role_code, 0xFFB547FF, k, 10, true);
+            } else if (free_agents && !u.role.empty()) {
                 bool reserve = u.role == "reserve";
                 float tw = ui::tag(c.p, cx_trend, my - 10 * k, reserve ? c.T("RESERVA", "RESERVE") : c.T("ACADEMIA", "ACADEMY"),
                                    reserve ? 0x40C8E0FF : 0x32D74BFF, k, 10, reserve);
@@ -3193,6 +3689,12 @@ float page_future(const Ctx &c, float y0)
             ov::text(c.p, nx, y + 88 * k, ui::ts(11 * k, ui::kMuted, ov::align::right | ov::align::top, 1.4f * k), c.T(nums[i].es, nums[i].en));
             nx -= std::max(ui::text_w(c.p, vs, nums[i].v), 120 * k) + 36 * k;
         }
+        // 1.1.4: the season so far, between your name and your numbers
+        float sx0 = c.area.x + std::max(c.area.w * 0.30f, 360 * k), sx1 = nx + 16 * k;
+        if (f.values.size() >= 2 && sx1 - sx0 >= 160 * k) {
+            ov::text(c.p, sx0, y + 30 * k, ui::ts(11 * k, ui::kMuted, ov::align::left | ov::align::top, 1.4f * k), c.T("TU TEMPORADA", "YOUR SEASON"));
+            sparkline(c.p, sx0, y + 54 * k, sx1 - sx0, 56 * k, f.values, f.col ? ui::vivid(f.col) : ui::kRed, k, c.grow());
+        }
         y += h + 24 * k;
     }
     // left: who wants you; right: your value race by race and, in My Team, your team against the rest
@@ -3258,17 +3760,16 @@ float page_future(const Ctx &c, float y0)
         }
         ry += h + 16 * k;
     }
-    y = std::max(ly, ry) + 16 * k;
-    // what the paddock says about you
-    y += section_title(c, c.area.x, y, c.T("LO QUE SE DICE DE TI", "WHAT THEY SAY ABOUT YOU"));
-    if (f.stories.empty()) {
-        if (c.visible(y, 40 * k))
-            ov::text(c.p, c.area.x, y + 6 * k, ui::ts(16 * k, ui::kText2), c.T("Silencio en el paddock, por ahora.", "Silence in the paddock, for now."));
-        y += 40 * k;
+    // 1.1.4: what the paddock says about you, under your value (the column was empty there)
+    ry += section_title(c, rx, ry, c.T("LO QUE SE DICE DE TI", "WHAT THEY SAY ABOUT YOU"), {}, rw);
+    if (f.stories.empty())
+        ry += empty_note(c, rx, ry, rw, ui::Icon::news, c.T("Silencio en el paddock, por ahora.", "Silence in the paddock, for now."));
+    for (const UiNews &n : f.stories) {
+        float h = news_card(c, rx, ry, rw, n, true);
+        news_pick(c, rx, ry, rw, h, n);
+        ry += h + 10 * k;
     }
-    for (const UiNews &n : f.stories)
-        y += news_card(c, c.area.x, y, c.area.w, n, true) + 10 * k;
-    return y - y0;
+    return std::max(ly, ry) - y0;
 }
 
 float page_standings(const Ctx &c, float y0)
@@ -3439,9 +3940,10 @@ float page_history(const Ctx &c, float y0)
     ah += awards_block(c, y0 + ah);
     y0 += ah;
     float y = y0;
-    if (d.history.empty())
-        return ah + empty_state(c, y0, ui::Icon::history, c.T("La historia está por escribir", "History is yet to be written"),
-                           c.T("Cada fichaje, retirada y despido queda aquí.", "Every signing, retirement and sacking lands here."));
+    if (d.history.empty()) // 1.1.4: a line, not a page-high box
+        return ah + empty_note(c, c.area.x, y0, c.area.w, ui::Icon::history,
+                               c.T("La historia está por escribir: cada fichaje, retirada y despido quedará aquí.",
+                                   "History is yet to be written: every signing, retirement and sacking will land here."));
     float lx = c.area.x + 50 * k, rx = c.area.x + 84 * k, rw = c.area.w - 84 * k;
     float top = y0 + 30 * k;
     int year = -1;
@@ -3528,7 +4030,7 @@ void draw_season_bar(ov::Paint *p, const OverlayData &d, float x, float y, float
 // 1.1.3: the header when space is short (720p and smaller, or the "Large" panel size): one line instead of two, with
 // the year, the round and the window's status still in sight, and the season as a thin bar along its bottom. The
 // rows below get the height it gives back.
-void draw_header_compact(ov::Paint *p, const OverlayData &d, float px, float py, float pw, float hh, float k)
+float draw_header_compact(ov::Paint *p, const OverlayData &d, float px, float py, float pw, float hh, float k, bool round_too = true)
 {
     auto T = [&](const char *es, const char *en) { return d.es ? es : en; };
     {
@@ -3552,14 +4054,15 @@ void draw_header_compact(ov::Paint *p, const OverlayData &d, float px, float py,
     ov::text(p, rx, py + hh / 2 - 2 * k, ys, season);
     float x = rx - std::max(ui::text_w(p, ys, season), 64 * k) - 18 * k;
     int R = std::max(1, d.rounds), done = std::clamp(d.round, 0, R);
-    if (!d.waiting_year) {
+    if (!d.waiting_year && round_too) { // 1.1.4: not when the season bar beside it says it
         char round[40];
         std::snprintf(round, sizeof round, "%s %d / %d", T("CARRERA", "ROUND"), done, R);
         ov::TextStyle rs = ui::ts(12 * k, ui::kText2, ov::align::right | ov::align::middle, 1.8f * k);
         ov::text(p, x, py + hh / 2 - 2 * k, rs, round);
         x -= ui::text_w(p, rs, round) + 20 * k;
     }
-    ov::rect(p, x, py + 16 * k, 1 * k, hh - 32 * k, 0xFFFFFF18);
+    if (round_too)
+        ov::rect(p, x, py + 16 * k, 1 * k, hh - 32 * k, 0xFFFFFF18);
     // the window's status, as a chip
     // 1.1.3 (15 Nov): "confirmed" only once the game confirms it: the market's closed grid is a projection until its
     // seats are written, and the written ones the game hasn't shown yet are pending
@@ -3594,6 +4097,7 @@ void draw_header_compact(ov::Paint *p, const OverlayData &d, float px, float py,
         if (done > 0)
             ov::gradient(p, px, by, at(static_cast<float>(done)) - px, 3 * k, 0xE1060060, ui::kRed, true);
     }
+    return cx; // 1.1.4: where the window's chip starts (the season bar fits left of it)
 }
 
 // the headline ticker under the header: the latest stories scroll past like a broadcast crawl
@@ -3671,6 +4175,166 @@ void draw_ticker(ov::Paint *p, const OverlayData &d, float x, float y, float w, 
     ov::gradient(p, cx + cw - 60 * k, y, 60 * k, h, 0x0F101700, 0x0F1017FF, true);
 }
 
+// what a page's tab carries: unread news, a waiting question, open rumours, the teams keen on you, your place in the
+// championship. Grey ones only inform; the others call you there (and light up the section on the rail)
+struct Badge {
+    std::string text;
+    uint32_t col = ui::kRed;
+};
+constexpr uint32_t kBadgeGrey = 0x3A3D4AFF;
+
+Badge page_badge(const OverlayData &d, int page)
+{
+    Badge b;
+    if (d.waiting_year)
+        return b; // 1.1.3: no market numbers while the real year is read
+    if (page == P_NEWS && d.unread > 0)
+        b.text = std::to_string(std::min(d.unread, 99));
+    if (page == P_PRESS && d.press_pending) {
+        b.text = "!";
+        b.col = ui::kAmber;
+    }
+    if (page == P_RUMOURS && !d.rumours.empty()) {
+        b.text = std::to_string(d.rumours.size());
+        b.col = kBadgeGrey;
+    }
+    if (page == P_FUTURE) {
+        int keen = static_cast<int>(
+            std::count_if(d.future.suitors.begin(), d.future.suitors.end(), [](const UiSuitor &s) { return s.status == "keen"; }));
+        if (keen > 0) {
+            b.text = std::to_string(keen);
+            b.col = 0x1F9D45FF;
+        }
+    }
+    if (page == P_STANDINGS)
+        for (size_t r = 0; r < d.standings.size(); ++r)
+            if (d.standings[r].player) {
+                b.text = "P" + std::to_string(r + 1);
+                b.col = kBadgeGrey;
+                break;
+            }
+    return b;
+}
+
+Badge section_badge(const OverlayData &d, int section)
+{
+    const SectionDef &S = kSections[section];
+    Badge first;
+    for (int j = 0; j < S.count; ++j) {
+        Badge b = page_badge(d, kOrder[S.first + j]);
+        if (b.text.empty() || b.col == kBadgeGrey)
+            continue;
+        if (b.col == ui::kAmber)
+            return b; // a question waits: that first
+        if (first.text.empty())
+            first = b;
+    }
+    return first;
+}
+
+// 1.1.4: the table pages with a driver per row show the picked (or pointed at) driver in an inspector at their right
+inline bool inspector_page(int page)
+{
+    return page == P_DRIVERS || page == P_FREE || page == P_CONTRACTS || page == P_STOCK || page == P_F2 || page == P_SCOUT;
+}
+
+// the inspector: who he is, what he's worth and where it's going, his deal and what's said about him, without opening
+// his card (Enter / A opens it)
+void draw_inspector(ov::Paint *p, float x, float y, float w, float h, float k, const std::string &id, bool es, float t)
+{
+    auto T = [&](const char *a, const char *b) { return es ? a : b; };
+    const OverlayData &d = g_ov;
+    ui::card(p, x, y, w, h, k);
+    const UiDriverCard *c = id.empty() ? nullptr : d.card(id);
+    if (!c) {
+        ui::icon(p, ui::Icon::drivers, x + w / 2, y + 90 * k, 34 * k, ui::kMuted, k);
+        ov::text(p, x + w / 2, y + 130 * k, ui::ts(15 * k, ui::kMuted, ov::align::center | ov::align::top, 0, w - 40 * k),
+                 T("Elige un piloto con Arriba / Abajo o el ratón.", "Pick a driver with Up / Down or the mouse."));
+        return;
+    }
+    float grow = ui::g_lite ? 1.0f : ui::ease_out(std::fmod(t, 1000.0f) / 0.5f);
+    uint32_t col = c->col ? c->col : 0x3A3D4A;
+    float pad = 22 * k, band = 92 * k;
+    {
+        ov::ClipScope clip(p, x, y, w, band);
+        ov::gradient(p, x, y, w, band, ui::rgb(col, 0x88), ui::rgb(col, 0x14), true, 12 * k);
+        for (int i = 0; i < 3; ++i)
+            ui::para(p, x + w * 0.62f + static_cast<float>(i) * 26 * k, y, 13 * k, band, band * 0.55f, 0xFFFFFF0C);
+        ov::gradient(p, x, y + band * 0.5f, w, band * 0.5f, 0x00000000, 0x00000040);
+    }
+    float mono = 56 * k;
+    ov::rect_rounded(p, x + pad, y + 18 * k, mono, mono, 12 * k, ui::rgb(col));
+    ov::rect_rounded_outline(p, x + pad, y + 18 * k, mono, mono, 12 * k, 1 * k, 0xFFFFFF40);
+    ov::text(p, x + pad + mono / 2, y + 18 * k + mono / 2 + 1 * k, ui::ts(24 * k, ui::ink_on(col), ov::align::center | ov::align::middle, 0.5f * k),
+             initials(c->name));
+    float nx = x + pad + mono + 14 * k, nw = x + w - pad - nx;
+    ov::text(p, nx, y + 30 * k, ui::lifted(ui::ts(21 * k, 0xFFFFFFFF, ov::align::left | ov::align::middle), k),
+             ui::fit(p, ui::ts(21 * k), c->name, nw));
+    std::string sub = c->team.empty() ? std::string(c->kind == "f2" ? "F2" : T("Sin equipo", "No seat")) : c->team;
+    sub += "  ·  " + std::to_string(c->age) + T(" años", " y/o");
+    ov::text(p, nx, y + 58 * k, ui::ts(14 * k, 0xFFFFFFD0, ov::align::left | ov::align::middle), ui::fit(p, ui::ts(14 * k), sub, nw));
+
+    float yy = y + band + 18 * k;
+    // the numbers: his value (the game's rating when read), his potential, his trend
+    auto big = [&](float bx, const char *label, const std::string &v, uint32_t vc) {
+        ov::text(p, bx, yy, ui::ts(11 * k, ui::kMuted, ov::align::left | ov::align::top, 1.6f * k), label);
+        ov::text(p, bx, yy + 18 * k, ui::ts(32 * k, vc, ov::align::left | ov::align::top), v);
+    };
+    float third = (w - 2 * pad) / 3;
+    char b[24];
+    std::snprintf(b, sizeof b, "%.0f", c->game_rating > 0 ? static_cast<float>(c->game_rating) : c->value);
+    big(x + pad, c->game_rating > 0 ? T("VALORACIÓN", "RATING") : T("VALOR", "VALUE"), b, ui::kText);
+    std::snprintf(b, sizeof b, "%.0f", c->potential);
+    big(x + pad + third, T("POTENCIAL", "POTENTIAL"), b, ui::kText2);
+    std::snprintf(b, sizeof b, "%+.1f", c->trend);
+    big(x + pad + 2 * third, T("TENDENCIA", "TREND"), b, c->trend > 0.04f ? ui::kGreen : c->trend < -0.04f ? ui::kDangerText : ui::kText2);
+    yy += 70 * k;
+    // his value race by race
+    if (c->values.size() >= 2) {
+        ov::rect_rounded(p, x + pad, yy, w - 2 * pad, 64 * k, 8 * k, 0xFFFFFF06);
+        sparkline(p, x + pad + 10 * k, yy + 10 * k, w - 2 * pad - 20 * k, 44 * k, c->values, ui::vivid(col == 0x3A3D4A ? 0xE10600 : col), k, grow);
+        yy += 78 * k;
+    }
+    // his deal
+    auto row = [&](const char *label, const std::string &v) {
+        ov::text(p, x + pad, yy + 9 * k, ui::ts(13.5f * k, ui::kText2, ov::align::left | ov::align::middle), label);
+        ov::text(p, x + w - pad, yy + 9 * k, ui::ts(15 * k, ui::kText, ov::align::right | ov::align::middle), ui::fit(p, ui::ts(15 * k), v, w * 0.55f));
+        yy += 28 * k;
+    };
+    row(T("Contrato", "Contract"), c->contract > 0 ? std::string(T("hasta ", "until ")) + std::to_string(c->contract) : std::string(T("sin contrato", "none")));
+    if (!c->salary.empty() && c->contract > 0)
+        row(T("Sueldo", "Salary"), c->salary + T(" / año", " a year"));
+    if (c->starts > 0) {
+        char s[48];
+        std::snprintf(s, sizeof s, "%d pts  ·  %d %s", c->points, c->podiums, T("podios", "podiums"));
+        row(T("Esta temporada", "This season"), s);
+    }
+    // what's said about him: the rumours first, then the news
+    yy += 10 * k;
+    ov::rect(p, x + pad, yy, w - 2 * pad, 1 * k, 0xFFFFFF10);
+    yy += 14 * k;
+    int linked = 0;
+    for (const UiRumour &u : d.rumours) {
+        if (u.driver_id != c->id || linked >= 2 || yy + 30 * k > y + h - 50 * k)
+            continue;
+        float cx = x + pad + ui::team_chip(p, x + pad, yy, u.to_code, u.to_col, k, 20) + 8 * k;
+        ov::text(p, cx, yy + 10 * k, ui::ts(14 * k, ui::kText, ov::align::left | ov::align::middle), ui::fit(p, ui::ts(14 * k), u.to, x + w - pad - 50 * k - cx));
+        if (u.odds > 0)
+            ov::text(p, x + w - pad, yy + 10 * k, ui::ts(14 * k, ui::kAmber, ov::align::right | ov::align::middle), std::to_string(u.odds) + "%");
+        yy += 30 * k;
+        ++linked;
+    }
+    for (size_t i = 0; i < c->links.size() && i < 3 && yy + 26 * k < y + h - 50 * k; ++i) {
+        ov::text(p, x + pad, yy + 9 * k, ui::ts(13.5f * k, ui::kText2, ov::align::left | ov::align::middle),
+                 ui::fit(p, ui::ts(13.5f * k), "•  " + c->links[i], w - 2 * pad));
+        yy += 26 * k;
+    }
+    if (!linked && c->links.empty() && yy + 26 * k < y + h - 50 * k)
+        ov::text(p, x + pad, yy + 9 * k, ui::ts(13.5f * k, ui::kMuted, ov::align::left | ov::align::middle),
+                 T("Nadie habla de él ahora mismo.", "Nobody is talking about him right now."));
+    ui::hint(p, x + pad, y + h - 26 * k, ui4::pad_mode ? "A" : "Enter", T("ficha completa", "full card"), k);
+}
+
 void draw_board(ov::Paint *p, const ov::Input &in, float dt)
 {
     using namespace paint_state;
@@ -3678,6 +4342,10 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
     float W = 0, H = 0;
     ov::size(p, &W, &H);
     float k = ov::ui_scale(p) * std::clamp(d.scale, 0.8f, 1.25f); // the "Panel size" option
+    struct Floor {
+        explicit Floor(float f) { ui::g_text_floor = f; }
+        ~Floor() { ui::g_text_floor = 0; }
+    } floor_(12 * k);
     auto T = [&](const char *es_text, const char *en_text) { return d.es ? es_text : en_text; };
 
     // a card or the search box takes the keys first
@@ -3697,8 +4365,8 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
     // the global search: / (Y on a pad) on any page without a table of its own
     bool table_page = tab == P_DRIVERS || tab == P_FREE || tab == P_CONTRACTS || tab == P_SCOUT || tab == P_RUMOURS;
     if (!card_open && !ui4::typing && !table_page &&
-        (in.key_pressed(VK_OEM_2) || in.key_pressed(VK_DIVIDE) || (in.pad_hit(ov::pad::y) && !in.pad_held(ov::pad::back)))) {
-        ui4::open_search();
+        (in.key_pressed(VK_OEM_2) || in.key_pressed(VK_DIVIDE) || (in.pad_hit(ov::pad::y) && !in.pad_held(ov::pad::back) && tab != P_NEWS))) {
+        ui4::open_search(); // 1.1.4: on News, Y is the filter
         card_open = true;
     }
     if (ui4::typing) {
@@ -3733,25 +4401,45 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
         if (in.key_pressed('F') || (in.pad_hit(ov::pad::y) && !in.pad_held(ov::pad::back)))
             ui4::filter_next = true;
     }
+    // 1.1.4: F / Y cycles the News page's filter
+    if (keys_free && tab == P_NEWS && (in.key_pressed('F') || (in.pad_hit(ov::pad::y) && !in.pad_held(ov::pad::back)))) {
+        news_filter::on = (news_filter::on + 1) % news_filter::kCount;
+        scroll = scroll_target = 0;
+    }
     if (keys_free && tab == P_GRID && d.finalised && d.grid_reveal && in.key_pressed('R')) {
         ui4::reveal_on = true; // paint() closes the hub and shows the grid
         ui4::reveal_manual = true;
         ui4::reveal_at = Clock::now();
     }
 
-    // tabs: Q/E, Left/Right, Tab, LB/RB
+    // pages: Q/E, Left/Right, Tab, LB/RB step through them in the sections' order (round the ends). 1.1.4: sections:
+    // 1-5 or LT/RT, to the page last open in that section (the press keeps 1-3 for its answers)
     int old_tab = tab;
+    auto step_page = [&](int dir) { tab = kOrder[(order_of(tab) + dir + kPageCount) % kPageCount]; };
     if (keys_free && (in.key_pressed(VK_RIGHT) || in.key_pressed('E') || in.pad_hit(ov::pad::rb) || in.pad_hit(ov::pad::right) ||
                       (in.key_pressed(VK_TAB) && !in.key_down(VK_SHIFT))))
-        tab = (tab + 1) % kPageCount;
+        step_page(1);
     if (keys_free && (in.key_pressed(VK_LEFT) || in.key_pressed('Q') || in.pad_hit(ov::pad::lb) || in.pad_hit(ov::pad::left) ||
                       (in.key_pressed(VK_TAB) && in.key_down(VK_SHIFT))))
-        tab = (tab + kPageCount - 1) % kPageCount;
-
-    if (tab != old_tab) {
-        // the new page slides in from the side it lies on (Q/E wrap round the ends)
-        int fwd = (tab - old_tab + kPageCount) % kPageCount;
-        tab_dir = fwd <= kPageCount / 2 ? 1 : -1;
+        step_page(-1);
+    {
+        bool lt = in.pad_connected && in.pad_lt > 0.6f, rt = in.pad_connected && in.pad_rt > 0.6f;
+        bool lt_hit = lt && !lt_was, rt_hit = rt && !rt_was;
+        lt_was = lt;
+        rt_was = rt;
+        int sec = section_of(tab), want = -1;
+        if (keys_free && !(tab == P_PRESS && d.press_pending))
+            for (int i = 0; i < kSectionCount; ++i)
+                if (in.key_pressed('1' + i) || in.key_pressed(VK_NUMPAD1 + i))
+                    want = i;
+        if (keys_free && rt_hit)
+            want = (sec + 1) % kSectionCount;
+        if (keys_free && lt_hit)
+            want = (sec + kSectionCount - 1) % kSectionCount;
+        if (want >= 0 && want != sec)
+            tab = section_page[static_cast<size_t>(want)];
+        if (lt_hit || rt_hit)
+            ui4::pad_mode = true;
     }
 
     float t_open = std::chrono::duration<float>(Clock::now() - opened_at).count();
@@ -3774,248 +4462,136 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
     ov::rect_rounded_outline(p, px, py, pw, ph, 18 * k, 1 * k, 0xFFFFFF1C);
     ov::gradient(p, px + 18 * k, py, pw * 0.45f, 2 * k, ui::kRed, 0xE1060000, true);
 
-    // header: the mark and the wordmark, the window's status and the season. 1.1.3: compact when space is short (720p
-    // and smaller, or the "Large" panel size): one line, a thinner ticker and footer and a narrower menu
+    // 1.1.4: the frame. One line of header (the mark, the window and the season), the five sections on a rail at the
+    // left, the open section's pages as tabs, the page's title and its content; at the foot the headline ticker and the
+    // controls. The content gets the width the old side menu took. Compact (720p and smaller, or the "Large" panel
+    // size): everything a little tighter.
     bool compact = H < 900 || d.scale > 1.05f;
-    float hh = compact ? 62 * k : 100 * k;
-    if (compact)
-        draw_header_compact(p, d, px, py, pw, hh, k);
-    else {
-    {
-        ov::ClipScope clip(p, px, py, pw, hh);
-        ui::hatch(p, px + pw * 0.3f, py, pw * 0.7f, hh, k, 0xFFFFFF06, 9 * k);
-        ov::gradient(p, px + pw * 0.3f, py, 320 * k, hh, 0x13141CFF, 0x13141C00, true);
-        ui::glow(p, px + 120 * k, py + hh / 2, 260 * k, 0xE1060030);
-        // speed stripes behind the wordmark
-        for (int i = 0; i < 6; ++i) {
-            float sx = px + 470 * k + i * 64 * k;
-            ui::para(p, sx, py, 14 * k, hh, 40 * k, ui::alpha(0xE1060000 | 0x1C, 1.0f - i * 0.15f));
-        }
-        // a light sweep across the wordmark every few seconds
-        float st = std::fmod(ui::clock_s(), 6.0f);
-        if (st < 1.1f && !ui::g_lite) {
-            float sx = px - 200 * k + (pw * 0.5f + 200 * k) * ui::ease_out(st / 1.1f);
-            ui::para(p, sx, py, 60 * k, hh, 50 * k, 0xFFFFFF0C);
-            ui::para(p, sx + 70 * k, py, 18 * k, hh, 50 * k, 0xFFFFFF08);
-        }
+    float hh = compact ? 54 * k : 66 * k;
+    float chip_x = draw_header_compact(p, d, px, py, pw, hh, k, compact);
+    // the season, race by race, between the wordmark and the window when there's room
+    if (!compact && !d.waiting_year) {
+        float sbx = px + 380 * k, sbw = std::min(chip_x - 48 * k - sbx, 720 * k);
+        if (sbw >= 260 * k)
+            draw_season_bar(p, d, sbx + (chip_x - 48 * k - sbx - sbw) / 2, py + 10 * k, sbw, k);
     }
-    ui::logo(p, px + 30 * k, py + 26 * k, 48 * k, k);
-    ov::text(p, px + 118 * k, py + 20 * k, ui::lifted(ui::ts(38 * k, ui::kText, ov::align::left | ov::align::top, 2.4f * k), k, 0xE1060070),
-             "SILLY SEASON");
-    ov::text(p, px + 120 * k, py + 66 * k, ui::ts(12.5f * k, ui::kText2, ov::align::left | ov::align::top, 3.4f * k), T("MERCADO DE PILOTOS", "DRIVER MARKET"));
-    {
-        // the season, on the right
-        float rx = px + pw - 32 * k;
-        char season[16];
-        // 1.1.3: while Progressive's real year is unknown, no year, no window and no season bar: just the wait
-        if (d.waiting_year)
-            std::snprintf(season, sizeof season, "%s", "\xE2\x80\x94"); // an em dash: no year yet
-        else
-            std::snprintf(season, sizeof season, "%d", d.year);
-        ov::TextStyle ys = ui::lifted(ui::ts(40 * k, ui::kText, ov::align::right | ov::align::top, 1.5f * k), k);
-        ov::text(p, rx, py + 34 * k, ys, season);
-        float yw = ui::text_w(p, ys, season);
-        ov::text(p, rx, py + 18 * k, ui::ts(11.5f * k, ui::kMuted, ov::align::right | ov::align::top, 2.6f * k), T("TEMPORADA", "SEASON"));
-        float lx = rx - std::max(yw, 90 * k) - 26 * k;
-        ov::rect(p, lx, py + 24 * k, 1 * k, 52 * k, 0xFFFFFF18);
-        // the transfer window: open while the season runs, closed once the grid is final
-        const char *status = d.waiting_year     ? T("LEYENDO LA TEMPORADA REAL", "READING THE REAL SEASON")
-                             : d.open_seats > 0 ? T("PENDIENTE DE CONFIRMAR", "PENDING CONFIRMATION")
-                             : d.finalised      ? (d.real ? T("PARRILLA CERRADA", "GRID CONFIRMED") : T("PARRILLA PREVISTA", "PROJECTED GRID"))
-                             : d.real           ? T("TEMPORADA REAL", "THE REAL SEASON")
-                             : d.deadline   ? "DEADLINE DAY"
-                                            : T("MERCADO ABIERTO", "TRANSFER WINDOW OPEN");
-        char sub[48];
-        if (d.waiting_year)
-            std::snprintf(sub, sizeof sub, "%s", T("EL MERCADO ABRE EN TEAM HQ", "THE MARKET OPENS AT TEAM HQ"));
-        else if (d.deadline && !d.finalised)
-            std::snprintf(sub, sizeof sub, "%s", d.deadline == 1 ? T("ÚLTIMA CARRERA", "LAST RACE") : T("QUEDAN 2 CARRERAS", "2 RACES LEFT"));
-        else
-            std::snprintf(sub, sizeof sub, "%s %d", d.real ? T("LA HISTORIA HACIA", "THE STORY TO") : T("FICHAJES PARA", "MOVES FOR"),
-                          d.year + 1);
-        ov::TextStyle ss_ = ui::ts(13.5f * k, ui::kText, ov::align::right | ov::align::top, 1.8f * k);
-        float sw_ = std::max(ui::text_w(p, ss_, status), 150 * k);
-        float bx = lx - 26 * k - sw_ - 40 * k, bw = sw_ + 40 * k + 14 * k;
-        ov::rect_rounded(p, bx, py + 24 * k, bw, 52 * k, 10 * k, 0xFFFFFF08);
-        ov::rect_rounded_outline(p, bx, py + 24 * k, bw, 52 * k, 10 * k, 1 * k, 0xFFFFFF14);
-        uint32_t scol = d.waiting_year ? ui::kAmber : d.finalised ? ui::kGold : d.deadline ? ui::kRed : ui::kGreen;
-        if (d.deadline && !d.finalised && !d.waiting_year) {
-            // deadline day: the chip burns red and pulses
-            ov::rect_rounded(p, bx, py + 24 * k, bw, 52 * k, 10 * k, ui::alpha(0xE1060000 | 0x30, 0.5f + 0.5f * ui::pulse(1.1f)));
-            ov::rect_rounded_outline(p, bx, py + 24 * k, bw, 52 * k, 10 * k, 1.2f * k, 0xE10600C0);
-            ui::glow(p, bx + bw / 2, py + 50 * k, bw * 0.7f, ui::alpha(0xE1060060, 0.6f + 0.4f * ui::pulse(1.1f)));
-        }
-        if (d.finalised)
-            ov::circle(p, bx + 22 * k, py + 50 * k, 5 * k, scol);
-        else
-            ui::live_dot(p, bx + 22 * k, py + 50 * k, 5 * k, scol);
-        ov::text(p, bx + bw - 14 * k, py + 33 * k, ss_, status);
-        ov::text(p, bx + bw - 14 * k, py + 55 * k, ui::ts(11.5f * k, ui::kMuted, ov::align::right | ov::align::top, 1.8f * k), sub);
-        // the season bar, between the wordmark and the window's status, when there's room for it
-        float sbx = px + 560 * k, sbw = bx - 40 * k - sbx;
-        if (sbw >= 260 * k && !d.waiting_year)
-            draw_season_bar(p, d, sbx, py + 30 * k, std::min(sbw, 700 * k), k);
-    }
-    }
-    float tk_h = compact ? 28 * k : 40 * k, body_top = py + hh + tk_h;
-    draw_ticker(p, d, px, py + hh, pw, tk_h, k);
+    float rw = compact ? 74 * k : 94 * k;      // the rail
+    float tab_h = compact ? 42 * k : 50 * k;   // the tabs
+    float fh = compact ? 34 * k : 46 * k, fy = py + ph - fh;
+    float tk_h = compact ? 26 * k : 34 * k, tk_y = fy - tk_h;
+    float body_top = py + hh;
 
-    // the footer: the controls and where you are
-    float fh = compact ? 36 * k : 50 * k, fy = py + ph - fh;
+    // the rail: the sections, the open one lit, and what waits in each (unread news, a question, a team keen on you)
+    int sec = section_of(tab);
+    ov::rect(p, px, body_top, rw, fy - body_top, 0x00000026);
+    ov::rect(p, px + rw, body_top, 1 * k, fy - body_top, 0xFFFFFF10);
+    float item_h = compact ? 64 * k : 80 * k, rail_top = body_top + (compact ? 8 * k : 14 * k);
     {
-        ov::ClipScope clip(p, px, fy, pw, fh);
-        ov::rect_rounded(p, px, fy - 20 * k, pw, fh + 20 * k, 18 * k, 0x00000036);
-        ov::rect(p, px, fy, pw, 1 * k, 0xFFFFFF10);
-        ov::TextStyle hs = ui::ts(13 * k, ui::kText2, ov::align::left | ov::align::middle, 0.4f * k);
-        float x = px + 28 * k, cy = fy + fh / 2 - 12 * k;
-        if (compact)
-            cy = fy + fh / 2 - 11 * k;
-        // 1.1.3: the keys of the device in use only (a pad's buttons once a pad was used, the keyboard's otherwise)
-        bool pad = ui4::pad_mode;
-        auto hint = [&](std::initializer_list<const char *> keys, std::initializer_list<const char *> buttons, const char *what) {
-            for (const char *key : pad ? buttons : keys)
-                x += ui::keycap(p, x, cy, key, k) + 4 * k;
-            x += 6 * k;
-            ov::text(p, x, cy + 12 * k, hs, what);
-            x += ui::text_w(p, hs, what) + (compact ? 20 * k : 28 * k);
-        };
-        hint({"Q", "E"}, {"LB", "RB"}, T("cambiar de página", "change page"));
-        hint({T("Arriba", "Up"), T("Abajo", "Down")}, {T("Arriba", "Up"), T("Abajo", "Down")},
-             ui4::rows_last > 0 ? T("elegir", "pick") : T("desplazar", "scroll"));
-        if (tab == P_PRESS && d.press_pending)
-            hint({"1", "2", "3"}, {"A"}, T("responder", "answer"));
-        if (table_page)
-            hint({"/", "S", "F"}, {"X", "Y"}, pad ? T("ordenar, filtrar", "sort, filter") : T("buscar, ordenar, filtrar", "search, sort, filter"));
-        else
-            hint({"/"}, {"Y"}, T("buscar a cualquiera", "find anyone"));
-        hint({"Enter"}, {"A"}, T("ficha", "details"));
-        hint({panel_key_label(), "Esc"}, {"B"}, T("cerrar", "close"));
-        // page dots
-        float dx = px + pw - 30 * k;
-        for (int i = kPageCount - 1; i >= 0; --i) {
-            bool on = i == tab;
-            float dw = on ? 26 * k : 7 * k;
-            dx -= dw;
-            ov::rect_rounded(p, dx, fy + fh / 2 - 3.5f * k, dw, 7 * k, 3.5f * k, on ? ui::kRed : 0xFFFFFF26);
-            if (on)
-                ui::glow(p, dx + dw / 2, fy + fh / 2, 24 * k, 0xE1060070);
-            dx -= 6 * k;
-        }
+        float target = rail_top + static_cast<float>(sec) * item_h;
+        if (menu_y < 0 || t_open < 0.05f)
+            menu_y = target;
+        menu_y += (target - menu_y) * std::min(1.0f, dt * 16);
+        if (std::fabs(target - menu_y) < 0.5f)
+            menu_y = target;
+        ov::gradient(p, px + 8 * k, menu_y + 4 * k, rw - 16 * k, item_h - 8 * k, 0xE1060038, 0xE1060006, false, 12 * k);
+        ov::rect_rounded(p, px + 2 * k, menu_y + 16 * k, 4 * k, item_h - 32 * k, 2 * k, ui::kRed);
     }
-
-    // the side menu, in groups, with a highlight that slides to the open page
-    float sw = compact ? 228 * k : 292 * k, menu_top = body_top + (compact ? 10 * k : 16 * k);
-    ov::rect(p, px, body_top, sw, fy - body_top, 0x0000001E);
-    ov::rect(p, px + sw, body_top, 1 * k, fy - body_top, 0xFFFFFF10);
-    float item_y[kPageCount];
-    // the items' spacing: 44 px, closer together when the pages don't fit the panel's height (17 pages at 1080p)
-    constexpr int kGroupCount = static_cast<int>(std::size(kGroups));
-    float heads = kGroupCount * 22 * k + (kGroupCount - 1) * 10 * k;
-    float step = std::clamp((fy - 12 * k - menu_top - heads) / kPageCount, compact ? 26 * k : 30 * k, compact ? 36 * k : 44 * k);
-    {
-        float y = menu_top;
-        int g = 0;
-        for (int i = 0; i < kPageCount; ++i) {
-            if (g < kGroupCount && kGroups[g].first == i) {
-                y += (g ? 10 * k : 0);
-                ov::text(p, px + 30 * k, y + 8 * k, ui::ts(11 * k, ui::kMuted, ov::align::left | ov::align::middle, 2.4f * k),
-                         T(kGroups[g].es, kGroups[g].en));
-                y += 22 * k;
-                ++g;
-            }
-            item_y[i] = y;
-            y += step;
-        }
-    }
-    float ix = px + 14 * k, iw = sw - 28 * k, ih = step - 4 * k;
-    float target = item_y[tab];
-    if (menu_y < 0 || t_open < 0.05f)
-        menu_y = target;
-    menu_y += (target - menu_y) * std::min(1.0f, dt * 16);
-    if (std::fabs(target - menu_y) < 0.5f)
-        menu_y = target;
-    ov::gradient(p, ix, menu_y, iw, ih, 0xE1060048, 0xE1060006, true, 9 * k);
-    ov::rect_rounded_outline(p, ix, menu_y, iw, ih, 9 * k, 1 * k, 0xE1060040);
-    ov::rect_rounded(p, ix - 2 * k, menu_y + 9 * k, 4 * k, ih - 18 * k, 2 * k, ui::kRed);
-    ui::glow(p, ix, menu_y + ih / 2, 34 * k, 0xE1060090);
-    for (int i = 0; i < kPageCount; ++i) {
-        float iy = item_y[i];
-        bool hov = in.inside(ix, iy, iw, ih) && !card_open;
-        if (hov && in.clicked())
-            tab = i;
-        bool on = i == tab;
+    for (int s = 0; s < kSectionCount; ++s) {
+        float iy = rail_top + static_cast<float>(s) * item_h;
+        bool hov = !card_open && in.inside(px, iy, rw, item_h);
+        if (hov && in.clicked() && s != sec)
+            tab = section_page[static_cast<size_t>(s)];
+        bool on = s == sec;
         if (hov && !on)
-            ov::rect_rounded(p, ix, iy, iw, ih, 9 * k, 0xFFFFFF0A);
+            ov::rect_rounded(p, px + 8 * k, iy + 4 * k, rw - 16 * k, item_h - 8 * k, 12 * k, 0xFFFFFF0A);
+        float box = compact ? 32 * k : 40 * k, bx = std::round(px + (rw - box) / 2), by = iy + (compact ? 9 : 11) * k;
+        ov::rect_rounded(p, bx, by, box, box, 11 * k, on ? ui::kRed : hov ? 0xFFFFFF16 : 0xFFFFFF0A);
+        if (on)
+            ov::rect_rounded(p, bx, by, box, box * 0.47f, 11 * k, 0xFFFFFF1A);
         uint32_t col = on ? ui::kText : hov ? 0xD8DAE2FF : ui::kText2;
-        float box = compact ? 24 * k : 30 * k; // 1.1.3: compact: a smaller icon box and label
-        float tx = ix + 12 * k, ty = iy + ih / 2 - box / 2;
-        if (on) {
-            ov::rect_rounded(p, tx, ty, box, box, 8 * k, ui::kRed);
-            ov::rect_rounded(p, tx, ty, box, box * 0.47f, 8 * k, 0xFFFFFF1A);
-        } else {
-            ov::rect_rounded(p, tx, ty, box, box, 8 * k, hov ? 0xFFFFFF16 : 0xFFFFFF09);
-        }
-        ui::icon(p, kPages[i].icon, tx + box / 2, ty + box / 2, box * 0.53f, on ? 0xFFFFFFFF : col, k * 0.9f);
-        ov::text(p, tx + box + 14 * k, iy + ih / 2, ui::ts(compact ? 14 * k : 16.5f * k, col, ov::align::left | ov::align::middle, 0.2f * k),
-                 T(kPages[i].es, kPages[i].en));
-        // badges: unread news, a waiting question, open rumours
-        std::string badge;
-        uint32_t bcol = ui::kRed;
-        if (i == P_NEWS && d.unread > 0)
-            badge = std::to_string(std::min(d.unread, 99));
-        if (i == P_PRESS && d.press_pending) {
-            badge = "!";
-            bcol = ui::kAmber;
-        }
-        if (i == P_RUMOURS && !d.rumours.empty())
-            badge = std::to_string(d.rumours.size()), bcol = 0x3A3D4AFF;
-        if (i == P_FUTURE) { // the teams keen on the player
-            int keen = static_cast<int>(std::count_if(d.future.suitors.begin(), d.future.suitors.end(),
-                                                      [](const UiSuitor &s) { return s.status == "keen"; }));
-            if (keen > 0)
-                badge = std::to_string(keen), bcol = 0x1F9D45FF;
-        }
-        if (i == P_STANDINGS) // the player's place in the championship
-            for (size_t r = 0; r < d.standings.size(); ++r)
-                if (d.standings[r].player) {
-                    badge = "P" + std::to_string(r + 1), bcol = 0x3A3D4AFF;
-                    break;
-                }
-        if (d.waiting_year)
-            badge.clear(); // 1.1.3: no market numbers while the real year is read
-        if (!badge.empty()) {
-            ov::TextStyle bs = ui::ts(12 * k, bcol == ui::kAmber ? 0x111111FF : ui::kText, ov::align::center | ov::align::middle);
-            float bw = std::max(22 * k, ui::text_w(p, bs, badge) + 12 * k);
-            float bx = ix + iw - bw - 8 * k;
-            if (bcol != 0x3A3D4AFF)
-                ui::glow(p, bx + bw / 2, iy + ih / 2, 22 * k, ui::alpha(bcol, 0.4f + 0.3f * ui::pulse(1.6f)));
-            ov::rect_rounded(p, bx, iy + ih / 2 - 10 * k, bw, 20 * k, 10 * k, bcol);
-            ov::text(p, bx + bw / 2, iy + ih / 2, bs, badge);
+        ui::icon(p, kSections[s].icon, bx + box / 2, by + box / 2, box * 0.5f, on ? 0xFFFFFFFF : col, k * 0.9f);
+        ov::text(p, px + rw / 2, by + box + 7 * k,
+                 ui::ts((compact ? 10 : 11.5f) * k, col, ov::align::center | ov::align::top, 1.3f * k), T(kSections[s].es, kSections[s].en));
+        Badge b = section_badge(d, s);
+        if (!b.text.empty()) {
+            ov::TextStyle bs = ui::ts(11 * k, b.col == ui::kAmber ? 0x111111FF : ui::kText, ov::align::center | ov::align::middle);
+            float bw = std::max(18 * k, ui::text_w(p, bs, b.text) + 10 * k);
+            float bxx = bx + box - bw / 2 + 2 * k, byy = by - 6 * k;
+            ov::rect_rounded(p, bxx, byy, bw, 18 * k, 9 * k, b.col);
+            ov::rect_rounded_outline(p, bxx, byy, bw, 18 * k, 9 * k, 1.5f * k, 0x0B0C12FF);
+            ov::text(p, bxx + bw / 2, byy + 9 * k, bs, b.text);
         }
     }
-    // your team, at the foot of the menu
+    // your team at the rail's foot: its badge and your contract
     if (d.has_player) {
-        float ch = 92 * k, cx = px + 16 * k, cw = sw - 32 * k, cy = fy - ch - 16 * k;
-        if (cy > item_y[kPageCount - 1] + ih + 12 * k) {
-            ui::card(p, cx, cy, cw, ch, k);
-            {
-                ov::ClipScope clip(p, cx, cy, cw, ch);
-                ov::gradient(p, cx, cy, cw, ch, ui::rgb(d.player_col, 0x55), ui::rgb(d.player_col, 0x08), true, 12 * k);
-                for (int i = 0; i < 3; ++i)
-                    ui::para(p, cx + cw - 80 * k + i * 22 * k, cy, 11 * k, ch, ch * 0.5f, 0xFFFFFF0A);
-            }
-            ov::text(p, cx + 16 * k, cy + 14 * k, ui::ts(10.5f * k, ui::kText2, ov::align::left | ov::align::top, 2.2f * k), T("TU EQUIPO", "YOUR TEAM"));
-            ui::team_chip(p, cx + 16 * k, cy + 36 * k, d.player_code, d.player_col, k, 22);
-            ov::text(p, cx + 84 * k, cy + 47 * k, ui::ts(16 * k, ui::kText, ov::align::left | ov::align::middle),
-                     ui::fit(p, ui::ts(16 * k), d.player_team, cw - 100 * k));
-            char con[48];
-            std::snprintf(con, sizeof con, "%s %d", T("Contrato hasta", "Contract until"), d.player_contract);
-            ov::text(p, cx + 16 * k, cy + 72 * k, ui::ts(12.5f * k, ui::kText2), d.player_contract > 0 ? con : T("Sin contrato", "No contract"));
+        float cy0 = tk_y - (compact ? 58 : 70) * k;
+        if (cy0 > rail_top + kSectionCount * item_h + 8 * k) {
+            float chip_w = 46 * k;
+            ui::team_chip(p, px + (rw - chip_w) / 2, cy0, d.player_code, d.player_col, k, 22);
+            char con[24];
+            std::snprintf(con, sizeof con, "%d", d.player_contract);
+            ov::text(p, px + rw / 2, cy0 + 30 * k, ui::ts(10 * k, ui::kMuted, ov::align::center | ov::align::top, 1.4f * k),
+                     T("CONTRATO", "CONTRACT"));
+            ov::text(p, px + rw / 2, cy0 + 44 * k, ui::ts(14 * k, ui::kText, ov::align::center | ov::align::top),
+                     d.player_contract > 0 ? con : "-");
         }
+    }
+
+    // the section's pages as tabs, and where to find anyone at their right
+    float cx = px + rw + 34 * k, cw = px + pw - 34 * k - cx;
+    float tby = body_top + (compact ? 4 : 8) * k;
+    ov::rect(p, px + rw + 1 * k, tby + tab_h + 2 * k, pw - rw - 1 * k, 1 * k, 0xFFFFFF10);
+    {
+        const SectionDef &S = kSections[sec];
+        ov::TextStyle ls = ui::ts((compact ? 14 : 16) * k, ui::kText2, ov::align::left | ov::align::middle, 0.2f * k);
+        ov::TextStyle bs = ui::ts(11 * k, ui::kText, ov::align::center | ov::align::middle);
+        float tx = cx - 14 * k;
+        for (int j = 0; j < S.count; ++j) {
+            int pi = kOrder[S.first + j];
+            bool on = pi == tab;
+            const char *label = T(kPages[pi].es, kPages[pi].en);
+            Badge b = page_badge(d, pi);
+            float lw = ui::text_w(p, ls, label);
+            float bw = b.text.empty() ? 0 : std::max(20 * k, ui::text_w(p, bs, b.text) + 10 * k);
+            float w = lw + (bw > 0 ? bw + 8 * k : 0) + 28 * k;
+            bool hov = !card_open && in.inside(tx, tby, w, tab_h);
+            if (hov && in.clicked())
+                tab = pi;
+            if (on) {
+                ov::rect_rounded(p, tx, tby + 6 * k, w, tab_h - 12 * k, 10 * k, 0xFFFFFF0D);
+                ov::rect_rounded(p, tx + 12 * k, tby + tab_h - 1 * k, w - 24 * k, 3 * k, 1.5f * k, kPages[pi].accent);
+            } else if (hov) {
+                ov::rect_rounded(p, tx, tby + 6 * k, w, tab_h - 12 * k, 10 * k, 0xFFFFFF07);
+            }
+            ov::TextStyle lc = ls;
+            lc.rgba = on ? ui::kText : hov ? 0xD8DAE2FF : ui::kText2;
+            ov::text(p, tx + 14 * k, tby + tab_h / 2, lc, label);
+            if (bw > 0) {
+                float bx = tx + 14 * k + lw + 8 * k;
+                ov::rect_rounded(p, bx, tby + tab_h / 2 - 9 * k, bw, 18 * k, 9 * k, b.col);
+                ov::TextStyle bc = bs;
+                if (b.col == ui::kAmber)
+                    bc.rgba = 0x111111FF;
+                ov::text(p, bx + bw / 2, tby + tab_h / 2, bc, b.text);
+            }
+            tx += w + 4 * k;
+        }
+        // the search, at the far right: the table's own on a table page, everyone elsewhere
+        ov::TextStyle hs = ui::ts(13 * k, ui::kMuted, ov::align::right | ov::align::middle, 0.3f * k);
+        const char *what = table_page ? T("buscar en la tabla", "search the table") : T("buscar a cualquiera", "find anyone");
+        float rx = cx + cw;
+        ov::text(p, rx, tby + tab_h / 2, hs, what);
+        float kx = rx - ui::text_w(p, hs, what) - 8 * k;
+        const char *key = ui4::pad_mode ? (tab == P_NEWS ? "" : "Y") : "/";
+        float kw = std::max(22 * k, ui::text_w(p, ui::ts(12 * k), key) + 12 * k);
+        if (*key && kx - kw > tx + 20 * k)
+            ui::keycap(p, kx - kw, tby + tab_h / 2 - 11 * k, key, k);
     }
 
     if (tab != old_tab) {
-        // each page keeps where it was scrolled to
+        // the new page slides in from the side it lies on; each page keeps where it was scrolled to
+        int fwd = (order_of(tab) - order_of(old_tab) + kPageCount) % kPageCount;
+        tab_dir = fwd <= kPageCount / 2 ? 1 : -1;
         if (old_tab >= 0 && old_tab < static_cast<int>(page_scroll.size()))
             page_scroll[static_cast<size_t>(old_tab)] = scroll_target;
         scroll = scroll_target = page_scroll[static_cast<size_t>(tab)];
@@ -4024,31 +4600,70 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
         dragging = false;
         ui4::reset_page();
     }
+    section_page[static_cast<size_t>(section_of(tab))] = tab;
 
-    // the page: breadcrumb, title and what it shows, then its content in a scrolled, clipped area
-    float cx = px + sw + 40 * k, cw = px + pw - 40 * k - cx, cy = body_top + 22 * k;
+    // the page: its title and what it shows on one line, then its content in a scrolled, clipped area
+    float cy = tby + tab_h + (compact ? 14 : 20) * k;
     float t_tab = std::chrono::duration<float>(Clock::now() - tab_at).count(), ta = ui::ease_out(t_tab / 0.25f);
     const PageDef &pg = kPages[tab];
     {
-        float wx = cx + cw - 70 * k, wy = cy + 44 * k;
-        ui::glow(p, wx, wy, 170 * k, ui::alpha(pg.accent, 0.12f * ta));
-        ui::icon(p, pg.icon, wx, wy, 78 * k, ui::alpha(pg.accent, 0.11f * ta), k * 2.6f);
-        int g = 0;
-        for (int i = 0; i < static_cast<int>(std::size(kGroups)); ++i)
-            if (kGroups[i].first <= tab)
-                g = i;
-        char crumb[96];
-        std::snprintf(crumb, sizeof crumb, "SILLY SEASON   /   %s", T(kGroups[g].es, kGroups[g].en));
-        ov::text(p, cx, cy, ui::ts(11.5f * k, ui::kMuted, ov::align::left | ov::align::top, 2.4f * k), crumb);
         ov::OpacityScope tf(p, ta);
         float slide = (1 - ta) * 18 * k;
-        ov::text(p, cx - slide, cy + 15 * k, ui::lifted(ui::ts(34 * k, ui::kText, ov::align::left | ov::align::top, 0.6f * k), k),
-                 T(pg.es, pg.en));
-        ov::text(p, cx - slide * 0.5f, cy + 55 * k, ui::ts(15 * k, ui::kText2), T(pg.desc_es, pg.desc_en));
-        ov::gradient(p, cx, cy + 80 * k, 280 * k * ta, 2 * k, pg.accent, ui::alpha(pg.accent, 0), true);
+        float ts_ = (compact ? 22 : 28) * k;
+        ov::TextStyle tst = ui::lifted(ui::ts(ts_, ui::kText, ov::align::left | ov::align::middle, 0.5f * k), k);
+        const char *title = T(pg.es, pg.en);
+        ov::text(p, cx - slide, cy + ts_ / 2, tst, title);
+        float tw = ui::text_w(p, tst, title);
+        ov::TextStyle dst = ui::ts((compact ? 13 : 15) * k, ui::kText2, ov::align::left | ov::align::middle);
+        ov::text(p, cx + tw + 18 * k - slide * 0.5f, cy + ts_ / 2 + 2 * k, dst,
+                 ui::fit(p, dst, T(pg.desc_es, pg.desc_en), std::max(60 * k, cw - tw - 18 * k)));
+        ov::gradient(p, cx, cy + ts_ + 8 * k, 240 * k * ta, 2 * k, pg.accent, ui::alpha(pg.accent, 0), true);
+        cy += ts_ + (compact ? 18 : 24) * k;
     }
-    cy += 96 * k;
-    ov::Rect area{cx, cy, cw, fy - 14 * k - cy};
+    ov::Rect area{cx, cy, cw, tk_y - 10 * k - cy};
+
+    // the headline ticker and the footer: the controls of the device in use, and where you are in the section
+    draw_ticker(p, d, px + rw + 1 * k, tk_y, pw - rw - 1 * k, tk_h, k);
+    {
+        ov::ClipScope clip(p, px, fy, pw, fh);
+        ov::rect_rounded(p, px, fy - 20 * k, pw, fh + 20 * k, 18 * k, 0x00000036);
+        ov::rect(p, px, fy, pw, 1 * k, 0xFFFFFF10);
+        ov::TextStyle hs = ui::ts(13 * k, ui::kText2, ov::align::left | ov::align::middle, 0.4f * k);
+        float x = px + 28 * k, cyk = fy + fh / 2 - (compact ? 11 : 12) * k;
+        bool pad = ui4::pad_mode;
+        auto hint = [&](std::initializer_list<const char *> keys, std::initializer_list<const char *> buttons, const char *what) {
+            for (const char *key : pad ? buttons : keys)
+                x += ui::keycap(p, x, cyk, key, k) + 4 * k;
+            x += 6 * k;
+            ov::text(p, x, cyk + 12 * k, hs, what);
+            x += ui::text_w(p, hs, what) + (compact ? 18 * k : 26 * k);
+        };
+        hint({"Q", "E"}, {"LB", "RB"}, T("página", "page"));
+        hint({"1-5"}, {"LT", "RT"}, T("sección", "section"));
+        hint({T("Arriba", "Up"), T("Abajo", "Down")}, {T("Arriba", "Up"), T("Abajo", "Down")},
+             ui4::rows_last > 0 && !d.waiting_year ? T("elegir", "pick") : T("desplazar", "scroll"));
+        if (tab == P_PRESS && d.press_pending)
+            hint({"1", "2", "3"}, {"A"}, T("responder", "answer"));
+        if (table_page)
+            hint({"S", "F"}, {"X", "Y"}, T("ordenar, filtrar", "sort, filter"));
+        else if (tab == P_NEWS)
+            hint({"F"}, {"Y"}, T("filtrar", "filter"));
+        hint({"Enter"}, {"A"}, T("ficha", "details"));
+        hint({panel_key_label(), "Esc"}, {"B"}, T("cerrar", "close"));
+        // where you are: the section and the page's place in it
+        const SectionDef &S = kSections[sec];
+        int at = order_of(tab) - S.first;
+        float dx = px + pw - 30 * k;
+        for (int j = S.count - 1; j >= 0; --j) {
+            bool on = j == at;
+            float dw = on ? 22 * k : 7 * k;
+            dx -= dw;
+            ov::rect_rounded(p, dx, fy + fh / 2 - 3.5f * k, dw, 7 * k, 3.5f * k, on ? ui::kRed : 0xFFFFFF26);
+            dx -= 6 * k;
+        }
+        ov::text(p, dx - 8 * k, fy + fh / 2, ui::ts(11 * k, ui::kMuted, ov::align::right | ov::align::middle, 2.0f * k),
+                 T(S.es, S.en));
+    }
 
     bool pressing = tab == P_PRESS && d.press_pending;
     bool picking = keys_free && ui4::rows_last > 0; // Up/Down pick a row on a page that has them
@@ -4106,11 +4721,17 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
     if (std::fabs(scroll_target - scroll) < 0.5f)
         scroll = scroll_target;
 
+    // 1.1.4: a driver table gives its right side to the inspector when the panel is wide enough
+    bool inspect = inspector_page(tab) && !d.waiting_year && area.w >= 1450 * k;
+    float ins_w = inspect ? std::clamp(area.w * 0.23f, 330 * k, 400 * k) : 0;
+    ov::Rect page_area = area;
+    if (inspect)
+        page_area.w -= ins_w + 24 * k;
     {
         // a little room around the area so shadows and glows aren't cut flat at the sides
-        ov::ClipScope clip(p, area.x - 12 * k, area.y, area.w + 24 * k, area.h);
+        ov::ClipScope clip(p, page_area.x - 12 * k, page_area.y, page_area.w + 24 * k, page_area.h);
         static const ov::Input no_input; // the page under an open card doesn't react
-        Ctx c{p, card_open ? no_input : in, area, k, d.es, t_tab};
+        Ctx c{p, card_open ? no_input : in, page_area, k, d.es, t_tab};
         float y0 = area.y - scroll;
         float h = 0;
         ui4::rows.clear();
@@ -4165,12 +4786,32 @@ void draw_board(ov::Paint *p, const ov::Input &in, float dt)
         ui4::sel_moved = false;
         ui4::sel_open = false;
     }
+    if (inspect) {
+        // the picked row, else the one under the pointer, else the first
+        std::string focus;
+        if (ui4::sel >= 0 && ui4::sel < static_cast<int>(ui4::rows.size()))
+            focus = ui4::rows[static_cast<size_t>(ui4::sel)].id;
+        if (focus.empty() && !card_open)
+            for (const ui4::Row &row : ui4::rows)
+                if (row.kind == ui4::K_DRIVER && in.inside(page_area.x, row.y, page_area.w, row.h) &&
+                    in.inside(page_area.x, page_area.y, page_area.w, page_area.h)) {
+                    focus = row.id;
+                    break;
+                }
+        if (focus.empty())
+            for (const ui4::Row &row : ui4::rows)
+                if (row.kind == ui4::K_DRIVER && !row.id.empty()) {
+                    focus = row.id;
+                    break;
+                }
+        draw_inspector(p, page_area.x + page_area.w + 24 * k, area.y, ins_w, area.h - 4 * k, k, focus, d.es, t_tab);
+    }
     // fade the content's edges and draw a scroll bar when it overflows
     if (content_h > area.h + 1) {
         if (scroll > 1)
-            ov::gradient(p, area.x - 12 * k, area.y, area.w + 24 * k, 26 * k, 0x101118FF, 0x10111800);
+            ov::gradient(p, page_area.x - 12 * k, area.y, page_area.w + 24 * k, 26 * k, 0x101118FF, 0x10111800);
         if (scroll < content_h - area.h - 1)
-            ov::gradient(p, area.x - 12 * k, area.y + area.h - 34 * k, area.w + 24 * k, 34 * k, 0x0C0D1200, 0x0C0D12FF);
+            ov::gradient(p, page_area.x - 12 * k, area.y + area.h - 34 * k, page_area.w + 24 * k, 34 * k, 0x0C0D1200, 0x0C0D12FF);
         float track_x = px + pw - 18 * k, frac = area.h / content_h;
         float th = std::max(40 * k, area.h * frac), ty = area.y + (area.h - th) * (scroll / (content_h - area.h));
         ov::rect_rounded(p, track_x, area.y, 4 * k, area.h, 2 * k, 0xFFFFFF0A);

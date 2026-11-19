@@ -40,6 +40,8 @@ const std::map<std::string, ss::RealPerson> &real_people()
         {"sw14_bianchi", {"Jules Bianchi", "france", 1989}},           {"sw14_chilton", {"Max Chilton", "britain", 1991}},
         {"sw14_kobayashi", {"Kamui Kobayashi", "japan", 1986}},        {"sw14_sutil", {"Adrian Sutil", "germany", 1983}},
         {"sw14_vergne", {"Jean-Éric Vergne", "france", 1990}},
+        // 2012 and 2013 (Progressive's data starts in 2012 since 20 Nov)
+        {"sw13_pic", {"Charles Pic", "france", 1990}},                 {"sw13_webber", {"Mark Webber", "australia", 1976}},
     };
     return people;
 }

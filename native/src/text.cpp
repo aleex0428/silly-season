@@ -377,6 +377,71 @@ std::string left_grid(Lang l, const std::string &driver)
                driver);
 }
 
+std::string retirement_reason(Lang l, int pick, const std::string &reason, const std::string &driver,
+                              const std::string &team)
+{
+    if (reason == "top") {
+        static const char *const es[] = {"Se va en lo más alto, con todo ganado y nada que demostrar.",
+                                         "Nadie lo esperaba: deja la Fórmula 1 en su mejor momento."};
+        static const char *const en[] = {"He goes out at the very top, with nothing left to prove.",
+                                         "Nobody saw it coming: he walks away from Formula 1 at his peak."};
+        return fmt(l.es ? choose(es, pick) : choose(en, pick), driver, team);
+    }
+    if (reason == "no_car") {
+        static const char *const es[] = {"Sin un coche para ganar a la vista, prefiere parar aquí.",
+                                         "Cansado de pelear lejos de las victorias en %2, pone punto final."};
+        static const char *const en[] = {"With no winning car in sight, he would rather stop here.",
+                                         "Tired of fighting far from the wins at %2, he calls time."};
+        return fmt(l.es ? choose(es, pick) : choose(en, pick), driver, team);
+    }
+    if (reason == "no_seat") {
+        static const char *const es[] = {"Sin un asiento para el año que viene, decide no buscar más.",
+                                         "Se queda sin volante y elige despedirse antes que esperar una oportunidad."};
+        static const char *const en[] = {"Without a seat for next year, he decides not to look any further.",
+                                         "Left without a drive, he chooses to say goodbye rather than wait for a chance."};
+        return fmt(l.es ? choose(es, pick) : choose(en, pick), driver, team);
+    }
+    return {}; // age: the story says it already
+}
+
+std::string h_shock_retirement(Lang l, const std::string &driver)
+{
+    return fmt(l.es ? "BOMBAZO: %1 SE RETIRA" : "SHOCK: %1 RETIRES", who(driver));
+}
+
+std::string series_name(Lang l, const std::string &series)
+{
+    if (series == "wec")
+        return l.es ? "el Mundial de Resistencia" : "the World Endurance Championship";
+    if (series == "indycar")
+        return "IndyCar";
+    if (series == "formula_e")
+        return l.es ? "la Fórmula E" : "Formula E";
+    return l.es ? "otra categoría" : "another series";
+}
+
+std::string h_away(Lang l, int pick, const std::string &driver, const std::string &series)
+{
+    std::string short_name = series == "wec" ? "WEC" : series == "indycar" ? "INDYCAR" : series == "formula_e" ?
+                             (l.es ? "FÓRMULA E" : "FORMULA E") : (l.es ? "OTRA CATEGORÍA" : "ANOTHER SERIES");
+    static const char *const es[] = {"%1 SE VA A %2", "%1 CAMBIA LA F1 POR %2"};
+    static const char *const en[] = {"%1 HEADS TO %2", "%1 SWAPS F1 FOR %2"};
+    return fmt(l.es ? choose(es, pick) : choose(en, pick), who(driver), short_name);
+}
+
+std::string away(Lang l, int pick, const std::string &driver, const std::string &series, const std::string &team)
+{
+    static const char *const es[] = {
+        "Sin asiento en la Fórmula 1, %1 deja %3 y correrá en %2. No cierra la puerta a volver.",
+        "%1 sigue compitiendo, pero lejos de la F1: tras su etapa en %3, su próximo reto es %2.",
+    };
+    static const char *const en[] = {
+        "With no Formula 1 seat, %1 leaves %3 to race in %2. He isn't ruling out a return.",
+        "%1 keeps racing, just not in F1: after his time at %3, his next challenge is %2.",
+    };
+    return fmt(l.es ? choose(es, pick) : choose(en, pick), driver, series_name(l, series), team);
+}
+
 const char *outlet_name(int i)
 {
     static const char *const names[kOutlets] = {"Grid Gossip", "Box Box Daily", "Full Throttle", "Paddock Confidential",

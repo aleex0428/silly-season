@@ -63,6 +63,14 @@ std::string retirement(Lang l, int pick, const std::string &driver, int age, int
 std::string sacking(Lang l, int pick, const std::string &driver, const std::string &team, const std::string &in);
 std::string season_start(Lang l, int year, int newcomers, const std::string &list);
 std::string left_grid(Lang l, const std::string &driver);
+// 1.1.5, realistic exits: why a driver retires (a sentence after the retirement story), a retirement nobody saw
+// coming, and a driver who leaves F1 for another series ("wec", "indycar", "formula_e")
+std::string retirement_reason(Lang l, int pick, const std::string &reason, const std::string &driver,
+                              const std::string &team);
+std::string h_shock_retirement(Lang l, const std::string &driver);
+std::string series_name(Lang l, const std::string &series);
+std::string h_away(Lang l, int pick, const std::string &driver, const std::string &series);
+std::string away(Lang l, int pick, const std::string &driver, const std::string &series, const std::string &team);
 
 // early-season and player items
 std::string t_pressure(Lang l);

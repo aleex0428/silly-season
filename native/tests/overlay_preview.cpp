@@ -193,10 +193,22 @@ void measure(const SwoftyPaint *p, float px, const char *t, float *w, float *h)
 int load_image(const char *id, const char *)
 {
     std::string_view i = id;
-    return i == "ss_glow" || i == "ss_shadow" ? SWOFTY_ASSET_OK : SWOFTY_ASSET_INVALID;
+    return i == "ss_glow" || i == "ss_shadow" || i == "ss_hatch" ? SWOFTY_ASSET_OK : SWOFTY_ASSET_INVALID;
 }
 int image(SwoftyPaint *, const char *id, float x, float y, float w, float h, uint32_t c)
 {
+    if (std::string_view(id) == "ss_hatch") { // 1.1.4: the weave tile, as an SVG pattern of the same lines
+        int n = next_id++;
+        float step = w / 16;
+        char b[700];
+        std::snprintf(b, sizeof b,
+                      "<defs><pattern id=\"h%d\" patternUnits=\"userSpaceOnUse\" x=\"%.1f\" y=\"%.1f\" width=\"%.2f\" height=\"%.2f\">"
+                      "<line x1=\"0\" y1=\"%.2f\" x2=\"%.2f\" y2=\"0\" stroke=\"#%06X\" stroke-opacity=\"%.3f\" stroke-width=\"1\"/></pattern></defs>"
+                      "<rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" fill=\"url(#h%d)\"/>\n",
+                      n, x, y, step, step, step, step, c >> 8, (c & 0xFF) / 255.0, x, y, w, h, n);
+        out += b;
+        return SWOFTY_ASSET_OK;
+    }
     if (std::string_view(id) != "ss_glow")
         return SWOFTY_ASSET_INVALID;
     int n = next_id++;
@@ -346,6 +358,41 @@ const SwoftyOverlay table = {available, on_paint, remove_, size, rect, rect_outl
                              text_styled, measure_styled, image_uv, image_nine, image_size, push_clip, pop_clip, push_transform,
                              pop_transform, push_opacity, pop_opacity, safe_area, ui_scale, input, focus};
 
+// 1.1.4: the paint bench ("overlay_preview <baseline> bench"): the same layout code with draw calls that only count,
+// so what is timed is the addon's own work (layout, measuring, colours), not writing SVG
+namespace bench {
+long calls = 0, texts = 0;
+void c() { ++calls; }
+} // namespace bench
+const SwoftyOverlay bench_table = {
+    available, on_paint, remove_, size,
+    [](SwoftyPaint *, float, float, float, float, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, float, float, float, float, float, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, float, float, float, float, float, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, float, float, float, uint32_t, const char *) { bench::c(); ++bench::texts; },
+    measure, load_image,
+    [](SwoftyPaint *, const char *, float, float, float, float, uint32_t) { bench::c(); return int(SWOFTY_ASSET_OK); },
+    [](SwoftyPaint *, float, float, float, float, float, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, float, float, float, float, float, float, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, float, float, float, float, float, uint32_t, uint32_t, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, float, float, float, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, float, float, float, float, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, float, float, float, float, float, float, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, const float *, uint32_t, float, uint32_t, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, const float *, uint32_t, uint32_t) { bench::c(); },
+    [](SwoftyPaint *, float, float, const SwoftyTextStyle *, const char *) { bench::c(); ++bench::texts; },
+    measure_styled,
+    [](SwoftyPaint *, const char *, float, float, float, float, float, float, float, float, uint32_t) { bench::c(); return int(SWOFTY_ASSET_OK); },
+    [](SwoftyPaint *, const char *, float, float, float, float, float, float, float, float, float, uint32_t) { bench::c(); return int(SWOFTY_ASSET_OK); },
+    image_size,
+    [](SwoftyPaint *, float, float, float, float) { bench::c(); },
+    [](SwoftyPaint *) {},
+    [](SwoftyPaint *, const float *) {},
+    [](SwoftyPaint *) {},
+    [](SwoftyPaint *, float) {},
+    [](SwoftyPaint *) {},
+    safe_area, ui_scale, input, focus};
+
 void log_(const char *fmt, ...)
 {
     va_list a;
@@ -395,6 +442,66 @@ static void race(ss::State &st, uint64_t &seed)
     std::sort(order.begin(), order.end(), [](auto &a, auto &b) { return a.first > b.first; });
     for (size_t i = 0; i < order.size(); ++i)
         ss::record_result(st, order[i].second, static_cast<int>(i + 1));
+}
+
+// 1.1.4: every F7 page and the driver's card, drawn again and again at 1080p, 720p and 4K: the addon's time per frame
+// and the draw calls it makes (the game's own cost per call isn't in it)
+static int run_bench(SwoftyApi &api)
+{
+    using namespace paint_state;
+    api.overlay = &preview::bench_table;
+    auto past = Clock::now() - std::chrono::seconds(2);
+    ov::Input in;
+    auto frame_ms = [&] {
+        auto t0 = std::chrono::steady_clock::now();
+        draw_board(reinterpret_cast<ov::Paint *>(1), in, 0.016f);
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    struct Size {
+        float w, h;
+        const char *name;
+    };
+    double all_sum = 0, all_worst = 0;
+    int all_n = 0;
+    for (Size sz : {Size{1920, 1080, "1080p"}, Size{1280, 720, "720p"}, Size{3840, 2160, "4K"}}) {
+        preview::W = sz.w;
+        preview::H = sz.h;
+        std::printf("\n%s: page                 mean ms   worst ms   calls  texts\n", sz.name);
+        auto measure_page = [&](const char *label) {
+            for (int w = 0; w < 30; ++w) // warm: the measure cache and the layout settle
+                frame_ms();
+            double sum = 0, worst = 0;
+            const int n = 300;
+            preview::bench::calls = preview::bench::texts = 0;
+            for (int f = 0; f < n; ++f) {
+                double t = frame_ms();
+                sum += t;
+                worst = std::max(worst, t);
+            }
+            std::printf("  %-26s %7.3f  %9.3f  %6ld %6ld\n", label, sum / n, worst, preview::bench::calls / n, preview::bench::texts / n);
+            all_sum += sum;
+            all_n += n;
+            all_worst = std::max(all_worst, worst);
+        };
+        for (int i = 0; i < kPageCount; ++i) {
+            tab = i;
+            menu_y = -1;
+            scroll = scroll_target = 0;
+            opened_at = tab_at = past;
+            ui4::modal = 0;
+            measure_page(kPages[i].en);
+        }
+        if (!g_ov.drivers.empty()) {
+            tab = P_DRIVERS;
+            ui4::open_from_list(ui4::K_DRIVER, g_ov.drivers.front().id);
+            ui4::modal_at = past;
+            measure_page("driver card");
+            ui4::modal = 0;
+            ui4::modal_back.clear();
+        }
+    }
+    std::printf("\nall pages: mean %.3f ms, worst %.3f ms over %d frames\n", all_n ? all_sum / all_n : 0, all_worst, all_n);
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -464,6 +571,14 @@ int main(int argc, char **argv)
         ss::complete_round(g_state, s, r, 24);
     }
     g_state.seen_news = g_state.next_news_id - 4; // a few unread
+    // 1.1.5: a free agent who left F1 for another series (only a season's turn makes one: the preview has none)
+    std::string away_id;
+    for (auto &[id, d] : g_state.drivers)
+        if (d.team.empty() && !d.retired && !d.regen && d.kind == "f1" && d.home.empty() && d.seasons > 0 && id != "player") {
+            d.away = "wec";
+            away_id = id;
+            break;
+        }
     // a save round trip, then the chosen language: what the plugin does after loading a career
     ss::from_json(g_state, ss::to_json(g_state));
     g_state.player_name = lang == "en" ? "You" : "Tú";
@@ -472,6 +587,8 @@ int main(int argc, char **argv)
     std::printf("news %zu, rumours %zu, deals %zu, press %s\n", g_ov.news.size(), g_ov.rumours.size(), g_ov.deals.size(),
                 g_ov.press_pending ? "yes" : "no");
 
+    if (std::string(argv[2]) == "bench")
+        return run_bench(api);
     std::filesystem::path dir = argv[2];
     std::filesystem::create_directories(dir);
     // every text the player can read, for a language check
@@ -539,6 +656,8 @@ int main(int argc, char **argv)
             card(ui4::K_DRIVER, g_ov.drivers.front().id, P_DRIVERS, "card_driver.svg");
         if (!g_ov.grid.empty())
             card(ui4::K_TEAM, g_ov.grid.front().id, P_GRID, "card_team.svg");
+        if (!away_id.empty() && g_ov.card(away_id))
+            card(ui4::K_DRIVER, away_id, P_FREE, "card_away.svg"); // 1.1.5: OUT OF F1 · WEC
         // the global search, a few letters typed
         preview::begin();
         tab = P_PADDOCK;

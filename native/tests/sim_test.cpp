@@ -59,6 +59,13 @@ static void check_grid(const State &st, const std::string &where)
                   who.c_str(), d->team.c_str(), d->seat, t.id.c_str(), k);
             CHECK(d->contract >= st.year, "%s: %s races with a contract ending %d in %d", where.c_str(), who.c_str(),
                   d->contract, st.year);
+            if (d->contract < st.year && where.find("round") != std::string::npos) {
+                static int told = 0; // the first few: what moved him this season
+                if (told++ < 2)
+                    for (const Move &m : st.history)
+                        if (m.year == st.year && m.driver == who)
+                            std::printf("      move r%d %s %s -> %s\n", m.round, m.kind.c_str(), m.from.c_str(), m.to.c_str());
+            }
         }
     for (const auto &[id, d] : st.drivers)
         if (!d.team.empty())
@@ -728,6 +735,104 @@ static std::vector<GridCar> cars_of(const std::map<std::string, std::array<std::
     return cars;
 }
 
+// 1.1.5 (the poll's "more realistic transfers and retirements"): over many careers, drivers leave in every way real F1
+// drivers do (retired, with a reason; to another series; off the grid and back), the mid-season changes happen, the
+// market forgets nobody (no old driver lingers out of a seat for ever) and the new fields survive a save. The rates
+// themselves are checked against the real 2012-2025 seasons by tools/balance_lab.py --real.
+static void realism_test(const Value &baseline)
+{
+    int retired = 0, with_reason = 0, away = 0, comebacks = 0, sackings = 0, lingering = 0, careers = 8;
+    std::map<std::string, int> reasons;
+    for (int c = 0; c < careers; ++c) {
+        Settings s;
+        State st;
+        CHECK(init(st, baseline, c % 2 ? "f1_career_2025" : "f1_career_2026", 9100 + static_cast<uint64_t>(c), nullptr),
+              "init failed");
+        std::vector<GridCar> cars;
+        for (const Team &t : st.teams)
+            for (const std::string &who : t.seats)
+                cars.push_back({who, t.id, false});
+        sync_grid(st, cars);
+        season_preview(st, s);
+        Lcg rng{static_cast<uint64_t>(c) * 31 + 5};
+        std::set<std::string> raced, away_once;
+        for (int season = 0; season < 6; ++season) {
+            for (const Team &t : st.teams)
+                for (const std::string &who : t.seats)
+                    if (!who.empty()) {
+                        if (season > 0 && !raced.count(who) && st.driver(who) && st.driver(who)->seasons > 0)
+                            ++comebacks; // a driver back on the grid after time out of it
+                        raced.insert(who);
+                    }
+            play_season(st, s, rng);
+            for (const NewsItem &n : st.news)
+                sackings += n.kind == "sacking" && n.year == st.year;
+            start_new_season(st, s);
+            for (const auto &[id, d] : st.drivers)
+                if (!d.away.empty())
+                    away_once.insert(id);
+            // seated last season and gone: next season's market may bring him back, but not for ever
+            std::set<std::string> now;
+            for (const Team &t : st.teams)
+                for (const std::string &who : t.seats)
+                    now.insert(who);
+            for (const std::string &who : std::set<std::string>(raced))
+                if (!now.count(who))
+                    raced.erase(who);
+        }
+        away += static_cast<int>(away_once.size());
+        for (const auto &[id, d] : st.drivers) {
+            if (d.retired && d.last_raced > 0) {
+                ++retired;
+                if (!d.exit_reason.empty()) {
+                    ++with_reason;
+                    ++reasons[d.exit_reason];
+                }
+            }
+            // a driver of 40 or more who raced and has been out of a seat for three seasons is retired by now
+            if (!d.retired && d.team.empty() && d.last_raced > 0 && st.year - d.last_raced >= 3 && d.age(st.year) >= 40 &&
+                d.kind != "legend" && d.kind != "player")
+                ++lingering;
+        }
+        if (c == 0) {
+            // the 1.1.5 fields come back from a save; a save without them (before 1.1.5) fills the last season raced
+            Value v = to_json(st);
+            State back;
+            CHECK(from_json(back, v), "the save doesn't load");
+            bool same = true;
+            for (const auto &[id, d] : st.drivers)
+                if (const Driver *b = back.driver(id))
+                    same = same && b->last_raced == d.last_raced && b->away == d.away && b->exit_reason == d.exit_reason;
+            CHECK(same, "last_raced, away or exit_reason don't come back from the save");
+            if (swofty::json::Object *drivers = v["drivers"].if_object())
+                for (auto &[id, o] : *drivers)
+                    if (swofty::json::Object *obj = o.if_object()) {
+                        obj->erase("last_raced");
+                        obj->erase("away");
+                        obj->erase("exit_reason");
+                    }
+            State legacy;
+            CHECK(from_json(legacy, v), "a save from before 1.1.5 doesn't load");
+            CHECK(dump_save(to_json(legacy)) == dump_save(v), "a save from before 1.1.5 doesn't read back as it was");
+            // and its career goes on: a season and its turn, with a full grid
+            Lcg more{77};
+            play_season(legacy, s, more);
+            start_new_season(legacy, s);
+            check_grid(legacy, "a save from before 1.1.5, a season on");
+        }
+    }
+    CHECK(retired > 0 && with_reason == retired, "retirements without a reason: %d of %d", retired - with_reason, retired);
+    CHECK(reasons["no_seat"] > 0 && reasons["age"] + reasons["no_car"] > 0, "every way to retire happens: no_seat %d, age %d, "
+          "no_car %d, top %d, quiet %d", reasons["no_seat"], reasons["age"], reasons["no_car"], reasons["top"], reasons["quiet"]);
+    CHECK(away > 0, "nobody left F1 for another series in %d careers", careers);
+    CHECK(comebacks > 0, "nobody came back to the grid in %d careers", careers);
+    CHECK(sackings > 0, "no mid-season sacking in %d careers", careers);
+    CHECK(lingering == 0, "%d old drivers still wait for a seat after three seasons out", lingering);
+    std::printf("realism: %d careers x 6 seasons: %d retirements (no_seat %d, age %d, no_car %d, top %d, quiet %d), %d to "
+                "another series, %d comebacks, %d mid-season sackings\n", careers, retired, reasons["no_seat"], reasons["age"],
+                reasons["no_car"], reasons["top"], reasons["quiet"], away, comebacks, sackings);
+}
+
 // 1.1.0 (a 1.0.1 report): the game refuses every seat of the new grid. The market takes the game's grid back; the
 // signings it told go (never seen) or turn into "deal off" stories (seen), and no move of them stays in the history.
 static void season_refusal_test(const Value &baseline, bool seen)
@@ -1172,6 +1277,7 @@ int main(int argc, char **argv)
     game_ratings_test(baseline);
     track_events_test(baseline);
     save_format_test(baseline);
+    realism_test(baseline);
     // the phase 3 blocks turned off
     for (uint64_t seed = 1; seed <= 4; ++seed)
         run(baseline, seasons, seed % 2 ? Intensity::chaos : Intensity::lively, false, true, true, seed * 71, "f1_career_2026", false, true);

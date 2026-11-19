@@ -86,6 +86,12 @@ struct Driver {
     float s_overtakes = 0, s_overtaken = 0, s_incidents = 0, s_failures = 0;
     int failed_round = 0;
     int s_track_rounds = 0; // 1.1.3: races he ran this season that came with the game's telemetry (0: no data yet)
+    // 1.1.5, realistic exits: the last season he held a race seat (0: never, or unknown in an older save), where he
+    // races now off the F1 grid ("wec", "indycar", "formula_e"; empty: nowhere), and why he retired ("age", "top",
+    // "no_car", "no_seat", "quiet"; empty: not retired, or before 1.1.5)
+    int last_raced = 0;
+    std::string away;
+    std::string exit_reason;
 
     // career state
     std::string team;     // team label while on the grid, else empty
