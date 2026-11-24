@@ -81,9 +81,79 @@ int read_round(uintptr_t round, Round &out, std::string &why)
     return 1;
 }
 
+// 1.1.52: the same rounds from the launcher's own standings call (career::standings(), career ops 8, launcher 1.10.0),
+// the Addon Browser's rule being the launcher's APIs first. Each round's race is the results session with the most
+// classified drivers, the last of equals in the game's order (qualifying, when the round lists one, has as many), as
+// read_round() does. 1: read, 0: the call isn't there (an older core, an unproven build, off the flow thread), -1: bad
+int read_results_api(std::vector<Round> &rounds, std::string &why)
+{
+    rounds.clear();
+    std::optional<career::Standings> s = career::standings();
+    if (!s)
+        return 0;
+    for (int r = 0; r < s->rounds; ++r) {
+        // the round's results sessions in the order the drivers list them, and each one's finishes
+        std::vector<uint32_t> order;
+        std::map<uint32_t, Round> by_session;
+        for (const career::StandingsDriver &d : s->drivers) {
+            if (r >= int(d.rounds.size()))
+                continue;
+            for (const career::StandingsFinish &f : d.rounds[size_t(r)].finishes) {
+                if (!by_session.count(f.session))
+                    order.push_back(f.session);
+                by_session[f.session].push_back({d.driver_stat, f.position, f.status});
+            }
+        }
+        const Round *best = nullptr;
+        uint32_t best_session = 0;
+        for (uint32_t session : order)
+            if (!best || by_session[session].size() >= best->size()) {
+                best = &by_session[session];
+                best_session = session;
+            }
+        // 1.1.52: each round's results sessions once in the log (number x cars): a sprint weekend's tell which
+        // number the sprint has, for sprints to count in a later version
+        static std::set<std::string> said;
+        if (order.size() > 1) {
+            std::string line = "season " + std::to_string(s->season_index) + " round " + std::to_string(r + 1) + ":";
+            for (uint32_t session : order)
+                line += " " + std::to_string(session) + "x" + std::to_string(by_session[session].size());
+            if (said.insert(line).second)
+                swofty::log("[silly-season] results: %s; the race taken: session %u", line.c_str(), best_session);
+        }
+        if (!best || best->empty())
+            break; // the first round not run yet: the season so far ends here
+        if (best->size() < 10 || best->size() > 30) {
+            why = "round " + std::to_string(r + 1) + ": " + std::to_string(best->size()) + " classified cars";
+            rounds.clear();
+            return -1;
+        }
+        std::set<int> seen;
+        for (const Finish &f : *best)
+            if (f.position < 1 || f.position > 30 || !seen.insert(f.position).second) {
+                why = "round " + std::to_string(r + 1) + ": positions that don't add up";
+                rounds.clear();
+                return -1;
+            }
+        Round round = *best;
+        std::sort(round.begin(), round.end(), [](const Finish &a, const Finish &b) { return a.position < b.position; });
+        rounds.push_back(std::move(round));
+    }
+    return 1;
+}
+
+inline const char *g_results_route = "none"; // which way the last read went, for the log
+
 // every round the season has run so far; false when the standings can't be read or don't look right
 bool read_results(std::vector<Round> &rounds, std::string &why)
 {
+    // 1.1.52: the launcher's call first; the game's own layout only on a core without it
+    int api = read_results_api(rounds, why);
+    if (api != 0) {
+        g_results_route = "the launcher's standings";
+        return api > 0;
+    }
+    g_results_route = "the game's standings (an older launcher)";
     rounds.clear();
     uintptr_t season = current_season();
     if (!season) {

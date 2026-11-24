@@ -4,7 +4,7 @@ A living driver market for F1 25's **Career mode**. Through the season rumours a
 signings, others are denied. Veterans announce their retirement, impatient teams sack underperforming drivers and the
 academies promote their F2 youngsters. When a new season starts, the game's grid really changes.
 
-- **Addon:** `alexs.silly-season` 1.1.51
+- **Addon:** `alexs.silly-season` 1.1.52
 - **Requires:** Swofty Launcher 1.8.36 or later and F1 25 on Steam (tested on the Steam copy)
 - **Careers:** Driver Career and My Team (where the game makes the moves: see Known limits) for 2026 (`f1_career_2026`) and 2025 (`f1_career_2025`), and Progressive
   Career on the Swofty Seasons (`swofty.swofty-seasons-progressive`) in history mode. Careers from other addons keep
@@ -18,9 +18,11 @@ The biggest update so far. In short (every change is in [CHANGELOG.md](CHANGELOG
   own driver ratings.
 - **A deeper market:** driver personalities, team plans, the domino effect, deadline day, outlets that keep score,
   season awards, academies and reserve drivers, sister-team swaps, sponsors and team principals.
-- **History mode** for Progressive Career on the Swofty Seasons (2015 to 2026).
+- **History mode** for Progressive Career on the Swofty Seasons (2010 to 2026).
 - **A new F7 hub** with 17 pages, driver and team cards, search, and new overlays.
 - **Other addons:** their drivers join the market, My Team's own team is the twelfth team, and F2 Revamp is supported.
+  Checked on 24 Nov with Progressive Career 0.8.4, F2 Revamp 0.9.2, the Swofty Seasons 2010 to 2024 and Swofty
+  Launcher 1.10.35.
 - **Fixes from your reports:** sackings and signings the game refuses are taken back, My Team no longer announces moves
   that never happen, and driver progression no longer overwrites the game's ratings.
 
@@ -117,7 +119,7 @@ The news comes to you without opening any menu:
 
 ### History mode: Progressive Career on the Swofty Seasons
 
-Progressive Career moves through the real seasons from 2015 to 2026 and puts each year's real line-up on the grid.
+Progressive Career moves through the real seasons from 2010 to 2026 and puts each year's real line-up on the grid.
 In its careers Silly Season tells that story instead of writing its own:
 
 - Next year's real moves come out through the season: rumours from the outlets, talks, then the official signing,
@@ -126,7 +128,8 @@ In its careers Silly Season tells that story instead of writing its own:
 - The real mid-season stand-ins and swaps are announced before their race, scaled to your calendar.
 - The tabloids still print stories that won't happen, and deny them later.
 - Team names, car pace and driver ratings are each year's real ones (from Progressive's data). The season addons'
-  drivers (Vettel, Räikkönen, Kubica, Schumacher, Mazepin...) are part of the market.
+  drivers (Schumacher, Barrichello, Kovalainen, Vettel, Räikkönen, Kubica...) are part of the market, with their
+  real nationality and age.
 - Silly Season never writes a seat while the real years last: Progressive does. Stand-ins, new talents and sackings
   of its own stay off.
 - From 2026 on, Progressive leaves the grid free and Silly Season's own market takes over.

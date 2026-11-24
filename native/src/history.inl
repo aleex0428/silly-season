@@ -2,7 +2,7 @@
 // Its careers keep their own data group; every season the addon puts the real line-up on the grid. Silly Season
 // reads the addon's data/years.json (the addon copies data/ to the game folder for its plugin), tells the real
 // moves to next season's grid through the season, and never writes a seat while the real years last. The years
-// are the data's own (2015 to 2026 with the Swofty Seasons 2015-2018): from the last one on, Progressive leaves
+// are the data's own (2010 to 2026 since Progressive 0.8.0): from the last one on, Progressive leaves
 // the grid free and Silly Season's own market takes over.
 // Included by plugin.cpp inside its anonymous namespace, after the real-grid reader.
 
@@ -25,7 +25,7 @@ const std::map<std::string, ss::RealPerson> &real_people()
         {"guanyu_zhou", {"Guanyu Zhou", "china", 1999}},              {"sw23_devries", {"Nyck de Vries", "netherlands", 1995}},
         {"logan_sargeant", {"Logan Sargeant", "usa", 2000}},          {"jack_doohan", {"Jack Doohan", "australia", 2003}},
         {"valtteri_bottas", {"Valtteri Bottas", "finland", 1989}},    {"sergio_perez", {"Sergio Pérez", "mexico", 1990}},
-        {"arvid_lindblad", {"Arvid Lindblad", "britain", 2007}},
+        {"arvid_lindblad", {"Arvid Lindblad", "britain", 2007}},        {"yuki_tsunoda", {"Yuki Tsunoda", "japan", 2000}},
         // 2016 to 2018 (the Swofty Seasons 2016, 2017 and 2018)
         {"sw16_rosberg", {"Nico Rosberg", "germany", 1985}},          {"sw16_gutierrez", {"Esteban Gutiérrez", "mexico", 1991}},
         {"sw16_haryanto", {"Rio Haryanto", "indonesia", 1993}},       {"sw16_nasr", {"Felipe Nasr", "brazil", 1992}},
@@ -42,6 +42,15 @@ const std::map<std::string, ss::RealPerson> &real_people()
         {"sw14_vergne", {"Jean-Éric Vergne", "france", 1990}},
         // 2012 and 2013 (Progressive's data starts in 2012 since 20 Nov)
         {"sw13_pic", {"Charles Pic", "france", 1990}},                 {"sw13_webber", {"Mark Webber", "australia", 1976}},
+        {"sw13_di_resta", {"Paul di Resta", "scotland", 1986}},       {"sw13_van_der_garde", {"Giedo van der Garde", "netherlands", 1985}},
+        {"sw12_bruno_senna", {"Bruno Senna", "brazil", 1983}},         {"sw12_heikki_kovalainen", {"Heikki Kovalainen", "finland", 1981}},
+        {"sw12_vitaly_petrov", {"Vitaly Petrov", "russia", 1984}},     {"sw12_timo_glock", {"Timo Glock", "germany", 1982}},
+        {"sw12_pedro_de_la_rosa", {"Pedro de la Rosa", "spain", 1971}}, {"michael_schumacher", {"Michael Schumacher", "germany", 1969}},
+        // 2010 and 2011 (Progressive 0.8.0 and the Swofty Seasons 2010 and 2011, 24 Nov)
+        {"sw11_rubens_barrichello", {"Rubens Barrichello", "brazil", 1972}}, {"sw11_nick_heidfeld", {"Nick Heidfeld", "germany", 1977}},
+        {"sw11_jarno_trulli", {"Jarno Trulli", "italy", 1974}},       {"sw11_vitantonio_liuzzi", {"Vitantonio Liuzzi", "italy", 1981}},
+        {"sw11_sebastien_buemi", {"Sébastien Buemi", "switzerland", 1988}}, {"sw11_jaime_alguersuari", {"Jaime Alguersuari", "spain", 1990}},
+        {"sw11_jerome_dambrosio", {"Jérôme d'Ambrosio", "belgium", 1985}}, {"sw10_lucas_di_grassi", {"Lucas di Grassi", "brazil", 1984}},
     };
     return people;
 }

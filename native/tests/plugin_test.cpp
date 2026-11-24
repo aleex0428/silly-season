@@ -1982,6 +1982,80 @@ void older_save(::fake::Game &g, const json::Value &baseline)
 
 // 1.1.51: a career loaded with Continue (no save slot picked) is named by the career tracker's key ("dc-..."), which
 // every career of that driver shares: the market is kept under the save slot's id, found in the core's career index
+// 1.1.52 (players' reports, 24 Nov): every session typed as practice, the game's round not moved on yet and no standings
+// read: the race still counts its round once its lights went out (it sat a round behind before)
+void lights_out_counts_the_round(::fake::Game &g, const json::Value &baseline)
+{
+    begin("1.1.52: a race the core calls practice counts its round by its lights out");
+    Career c(g, baseline, "f1_career_2026", "f1_career_2026.driver_career:{lights}", "oscar_piastri");
+    c.load();
+    c.enter_hub();
+    g.frames(2.5);
+    int before = g_state.round;
+    int game_round = g.round;
+    c.session_start(); // practice, as the core gives it
+    c.session_end();
+    c.session_start();
+    c.lights_out();
+    c.session_end();   // the race, still typed practice; the calendar and the standings haven't moved
+    c.enter_hub();
+    g.frames(2.5);
+    check(g.round == game_round && g_state.round == game_round,
+          "the race's round is counted: market round " + std::to_string(before) + " -> " + std::to_string(g_state.round) +
+              " (the game still at " + std::to_string(game_round) + ")");
+    check(::fake::Game::last_line("its lights went out").find("counted as a race") != std::string::npos,
+          "the log says why: " + ::fake::Game::last_line("its lights went out"));
+    c.unload();
+}
+
+// 1.1.52: the season's results from the launcher's own call (career::standings, career ops 8) before the game's layout
+std::string g_standings_json;
+void standings_from_the_launcher(::fake::Game &g)
+{
+    begin("1.1.52: the season's results come from the launcher's standings call first");
+    // two rounds of 12 cars: each with qualifying (session 12) and the race (15); driver 100 + i finishes P(i+1) in
+    // the race, the reverse in qualifying; a third round listed but not run
+    auto rounds_of = [](int i, bool run_third) {
+        std::string r;
+        for (int k = 0; k < 2; ++k) {
+            r += std::string(k ? "," : "") + R"({"points":0,"finishes":[{"session":12,"position":)" + std::to_string(12 - i) +
+                 R"(,"status":0},{"session":15,"position":)" + std::to_string(i + 1) + R"(,"status":0}]})";
+        }
+        return r + (run_third ? R"(,{"points":0,"finishes":[]})" : "");
+    };
+    g_standings_json = R"({"season":0,"rounds":3,"drivers":[)";
+    for (int i = 0; i < 12; ++i)
+        g_standings_json += std::string(i ? "," : "") + R"({"driver":)" + std::to_string(100 + i) + R"(,"position":)" +
+                            std::to_string(i + 1) + R"(,"points":0,"rounds":[)" + rounds_of(i, true) + "]}";
+    g_standings_json += "]}";
+    g.ops_t.standings = [](char *out, size_t cap, size_t *len) {
+        *len = g_standings_json.size();
+        if (cap < g_standings_json.size())
+            return int(SWOFTY_TOO_SMALL);
+        std::memcpy(out, g_standings_json.data(), g_standings_json.size());
+        return int(SWOFTY_ASSET_OK);
+    };
+    std::vector<game_data::Round> rounds;
+    std::string why;
+    bool read = game_data::read_results(rounds, why);
+    check(read && rounds.size() == 2, "two rounds run, the third not yet (" + why + ")");
+    check(std::string(game_data::g_results_route) == "the launcher's standings", "read through the launcher's call");
+    check(!rounds.empty() && rounds[0].size() == 12 && rounds[0][0].stat == 100 && rounds[0][0].position == 1 &&
+              rounds[0][11].stat == 111,
+          "each round's race, not its qualifying, in finishing order");
+    // a round whose positions don't add up is refused, as the game's own read refuses it
+    std::string good = g_standings_json;
+    size_t at = g_standings_json.find(R"("session":15,"position":2)");
+    g_standings_json.replace(at, std::strlen(R"("session":15,"position":2)"), R"("session":15,"position":1)");
+    read = game_data::read_results(rounds, why);
+    check(!read && rounds.empty() && why.find("positions") != std::string::npos, "positions that don't add up: not read");
+    g_standings_json = good;
+    g.ops_t.standings = nullptr;
+    read = game_data::read_results(rounds, why);
+    check(std::string(game_data::g_results_route).find("older launcher") != std::string::npos,
+          "without the call: the game's own standings, as before");
+}
+
 void continue_keeps_slot(::fake::Game &g, const json::Value &baseline)
 {
     begin("1.1.51: a career loaded with Continue keeps its market under its save slot");
@@ -2399,6 +2473,8 @@ int main(int argc, char **argv)
     older_save(g, baseline);
     two_provisionals(g, baseline);
     continue_keeps_slot(g, baseline);
+    standings_from_the_launcher(g);
+    lights_out_counts_the_round(g, baseline);
     track_attempts(g, baseline);
     banner_cursor();
     press_key(g, baseline);

@@ -80,6 +80,20 @@ int main(int argc, char **argv)
             std::printf("  unnamed:%s\n", unnamed.c_str());
         check(unnamed.empty(), "no driver goes by his label");
         check(g_real_first <= 2016 || g_real_first == 2019, "the data starts in 2016 (or 2019 with an older Progressive)");
+        // 24 Nov (Progressive 0.8.x, 2010 to 2013): every driver of a real grid has his nationality and his age, not
+        // the made-up 27 years of a driver the market doesn't know (Schumacher would have been 27 in 2010)
+        std::string unknown;
+        const auto &people = real_people();
+        for (int y = g_real_first; y <= g_real_last; ++y)
+            for (const auto &[team, pair] : real_season_of(y).grid)
+                for (const std::string &id : pair) {
+                    const ss::Driver *d = g_state.driver(id);
+                    if (!id.empty() && d && d->nat.empty() && !people.count(id))
+                        unknown += " " + std::to_string(y) + ":" + id;
+                }
+        if (!unknown.empty())
+            std::printf("  without nationality or age:%s\n", unknown.c_str());
+        check(unknown.empty(), "every real driver has his nationality and age");
     }
 
     std::printf("the real year is told from the rows' looks (the driver at +0x50, his look at +0x54)\n");

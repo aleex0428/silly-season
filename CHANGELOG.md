@@ -1,3 +1,17 @@
+# 1.1.52
+
+- **The season's results come from the launcher's own standings** (`career::standings()`, launcher 1.10.0 or later), as the Addon Browser now asks addons to use the launcher's APIs. On an older launcher the game's own standings are read as before. The log says which way they came (`results: from ...`).
+- SDK headers updated to the launcher 1.10.35.
+
+From players' reports:
+- **The market no longer sits a round behind the game in Driver Career.** The core gave every session of a career weekend as practice, so a race only counted once the calendar moved on. A session whose lights went out now counts its round at the next Team HQ, and the live state's session type is read too.
+- The log names each round's results sessions once, so sprints can count in a later version.
+- A new season's rating changes go to the game four a frame instead of all at once (an fps dip at Team HQ).
+
+Compatibility (24 Nov):
+- **Progressive Career 0.8.x** (start seasons back to 2010): the drivers of 2010 to 2013 who weren't in the market yet (Schumacher, Barrichello, Heidfeld, Trulli, Kovalainen, Petrov, Glock, di Resta and others) now join it with their real nationality and age. Before, they had a name made from their id and an age of 27, which also set when they retire.
+- Checked with Progressive Career 0.8.4, F2 Revamp 0.9.2, the Swofty Seasons 2010 to 2024 and Swofty Launcher 1.10.35.
+
 # 1.1.51
 
 - **Continue no longer mixes up markets.** A career loaded with Continue from the main menu, instead of from the save list, was named after its driver rather than its save. Every career with that driver shared one market, and the same career had one market when loaded with Continue and another when loaded from the save list. Each career now keeps its market with its own save, whichever way you load it. A career you played with Continue before this version takes that market the first time you load it.

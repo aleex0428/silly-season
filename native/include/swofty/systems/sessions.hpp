@@ -30,6 +30,19 @@ struct GridRules {
 };
 SWOFTY_RECORD(GridRules, qualifying, rows, rule_107)
 
+// A points system (launcher 1.9.61): one game_setup.session_standings row the core adds at boot, a copy of the stock
+// standard_race preset with these points. A box names it in content.package rules.points; the era picker points the
+// race sessions of swofty_f1 at it when the box is pressed.
+struct Points {
+    static constexpr Version version{1, 0};
+    std::vector<int> points;                   // per finishing position, from P1; padded with 0 to 26 places
+    std::optional<int> fastest_lap;            // the fastest lap bonus (BestOfTop10); empty: none
+    std::vector<std::vector<int>> reduced;     // races stopped at 75, 50 and 25 % distance; a missing entry: the full points
+    json::Value extra;
+};
+SWOFTY_RECORD(Points, points, fastest_lap, reduced)
+inline Registry<Points> points{"session.points", {.applies = Applies::boot}};
+
 struct Rules {
     Ref<Mode> mode;
     Ref<Points> points;
@@ -43,7 +56,7 @@ struct Rules {
     std::optional<float> refuel_stint_kg;   // content.package 1.5: a pit stop fills to this; empty = race_fuel_kg, else a full tank
     std::optional<float> quali_fuel_kg;     // content.package 1.5: the fuel each car starts qualifying with; empty = the game's
     bool race_start_fuel_from_quali = false; // content.package 1.5: parc ferme, the race starts with the fuel left after qualifying
-    bool race_tyre_change = true;           // content.package 1.5: false keeps the tyres at race pit stops (damage excepted)
+    bool race_tyre_change = true;           // content.package 1.5: false keeps unpunctured tyres at race pit stops
     std::optional<int> race_time_limit_s;   // content.package 1.5: the race time limit in seconds (60..86400); empty = the mode's
     std::string weekend_mode;           // content.package 1.5: a game_setup_modes row whose weekend the box runs; empty = the mode's
     std::optional<std::string> safety_car;   // content.package 1.5: off, reduced, standard or increased; empty = the player's
@@ -52,8 +65,11 @@ struct Rules {
     std::optional<std::string> corner_cutting;   // content.package 1.5: regular or strict; empty = the player's
     std::optional<GridRules> grid;      // content.package 1.5: how the box's race grid forms; empty = the game's grid
     std::vector<std::string> qualifying_tyres;   // content.package 1.5: "softer" / "medium" / "harder" used only in qualifying
+    std::optional<bool> mandatory_tyre_change;   // content.package 1.6: two dry compounds required or not; empty = the mode's
+    std::vector<std::string> setup_locked;   // content.package 1.8: setup sliders the box locks (SWOFTY_BOX_SETUP=1)
 };
-SWOFTY_RECORD(Rules, mode, points, drs, tyre_class, rules_profile, car_profile, refuelling, race_fuel_kg, tyre_warmers, refuel_stint_kg, quali_fuel_kg, race_start_fuel_from_quali, race_tyre_change, race_time_limit_s, weekend_mode, safety_car, formation_lap, penalties, corner_cutting, grid, qualifying_tyres)
+SWOFTY_RECORD(Rules, mode, points, drs, tyre_class, rules_profile, car_profile, refuelling, race_fuel_kg, tyre_warmers, refuel_stint_kg, quali_fuel_kg, race_start_fuel_from_quali, race_tyre_change, race_time_limit_s, weekend_mode, safety_car, formation_lap, penalties, corner_cutting, grid, qualifying_tyres,
+              mandatory_tyre_change, setup_locked)
 
 inline Result set_control(cars::live::Car car, Control mode)
 {
@@ -116,6 +132,17 @@ struct PitStop {
     uint32_t size, payload_version;
     uint32_t car;
     uint32_t stops;
+};
+
+// A car's pit crew has fitted its tyres at a pit stop (notify), after the game's change (Game_PitLane_ApplyPitstopTyres).
+// kept is 1 when the box rule race_tyre_change false kept the fitted set for this stop.
+struct PitStopTyres {
+    static constexpr const char *point = "session.pit_stop.tyres";
+    static constexpr uint32_t version = 1;
+    uint32_t size, payload_version;
+    uint32_t car;
+    uint8_t kept;
+    uint8_t reserved[3];
 };
 
 }

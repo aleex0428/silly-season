@@ -28,6 +28,7 @@
 #include <swofty/events.hpp>
 #include <swofty/hub.hpp>
 #include <swofty/lang.hpp>
+#include <swofty/live.hpp>
 #include <swofty/mem.hpp>
 #include <swofty/mixin.hpp>
 #include <swofty/overlay.hpp>
@@ -228,6 +229,12 @@ int g_weekend_season = -1;     // its season index (-1: not known)
 // sessions never said their type counts only once the calendar moves on.
 bool g_race_ended = false;     // a race session ended since the last hub
 bool g_session_typed = false;  // a session since the last hub said its type
+// 1.1.52 (players' reports, 24 Nov): the core gave every session of a career weekend as practice (fixed in launcher
+// 1.10.26), so a race never said it was one and its round only counted once the calendar moved on: the market sat a
+// round behind. Lights out (race.start) in this session, or the live state's session type, now say it too.
+bool g_lights_out = false;     // the running session had its start (a race or a sprint)
+// D: the season roll's rating writes, a few a frame (22 in one Team HQ frame showed as an fps dip in a report)
+std::vector<ss::RatingChange> g_rating_queue;
 bool g_season_ended = false;
 bool g_moves_finalised = false;
 std::vector<std::pair<std::string, int>> g_results;  // driver, position
@@ -2359,6 +2366,12 @@ void read_season_results()
         }
         return;
     }
+    // 1.1.52: which way the standings came (the launcher's call, or the game's own on an older launcher), once
+    static std::string route_said;
+    if (route_said != game_data::g_results_route) {
+        route_said = game_data::g_results_route;
+        log("[silly-season] results: from %s, %zu round(s)", game_data::g_results_route, rounds.size());
+    }
     const int scheme = g_state.key_scheme;
     // the other championship's rows: still first in the table (the game added this career's races after them), or
     // gone (the game replaced the table with this career's own)
@@ -3898,10 +3911,16 @@ void note_weekend(const events::Context &ctx, const char *where)
     if (const auto &c = ctx.career())
         from_career = c->round;
     g_session_type = -1;
+    g_lights_out = false;
     // practice is also what the view says when the core doesn't fill the type (every session of a weekend
     // came as practice, the race included): only another type counts as known
     if (const auto &sv = ctx.session(); sv && sv->type != events::SessionType::practice) {
         g_session_type = static_cast<int>(sv->type);
+        g_session_typed = true;
+    } else if (auto ls = swofty::live::session();
+               ls && swofty::live::has(*ls, SWOFTY_LIVE_SHAVE_TYPE) && ls->type >= 15 && ls->type <= 17) {
+        // 1.1.52: the live state's own session type (the game's numbers: 15 to 17 are races)
+        g_session_type = static_cast<int>(events::SessionType::race);
         g_session_typed = true;
     }
     int best = std::max({from_ops, from_weekend, from_career});
@@ -3919,7 +3938,13 @@ void note_session_end(const events::Context &ctx)
     if (const auto &sv = ctx.session(); sv && sv->type != events::SessionType::practice) {
         type = static_cast<int>(sv->type);
         g_session_typed = true;
+    } else if (g_lights_out && type < 0) {
+        // 1.1.52: no type said, but the session had its start: a race (a sprint too; the standings tell them apart)
+        type = static_cast<int>(events::SessionType::race);
+        g_session_typed = true;
+        log("[silly-season] session end: no session type from the core, but its lights went out: counted as a race");
     }
+    g_lights_out = false;
     if (type == static_cast<int>(events::SessionType::race)) {
         g_race_ended = true;
         log("[silly-season] session end: the race of round %d is done", g_weekend_raced);
@@ -4419,14 +4444,10 @@ void on_hub()
             } else {
                 apply_new_season(s, changes);
             }
-            for (const ss::RatingChange &rc : ratings) {
-                career::DriverRatings dr;
-                dr.experience = rc.experience;
-                dr.racecraft = rc.racecraft;
-                dr.awareness = rc.awareness;
-                dr.pace = rc.pace;
-                career::set_driver_ratings(Ref<drivers::Identity>("game/" + rc.driver), dr);
-            }
+            // 1.1.52: written a few a frame (frame_tick), not all in this Team HQ frame
+            g_rating_queue.insert(g_rating_queue.end(), ratings.begin(), ratings.end());
+            if (!ratings.empty())
+                log("[silly-season] season %d: %zu rating update(s) queued, 4 a frame", g_state.year, ratings.size());
             g_season_ended = g_moves_finalised = false;
             read_season_results(); // the new year's standings, read once, for the new year only
         }
@@ -4589,6 +4610,22 @@ void frame_tick(double dt, void *)
 {
     Timing tm("frame", 16); // 1.1.3: which part of a slow frame was ours
     watch_track_clock();
+    {
+        // 1.1.52: the season roll's rating writes, 4 a frame
+        std::lock_guard lock(g_lock.quiet());
+        for (int n = 0; n < 4 && !g_rating_queue.empty(); ++n) {
+            const ss::RatingChange rc = g_rating_queue.front();
+            g_rating_queue.erase(g_rating_queue.begin());
+            career::DriverRatings dr;
+            dr.experience = rc.experience;
+            dr.racecraft = rc.racecraft;
+            dr.awareness = rc.awareness;
+            dr.pace = rc.pace;
+            career::set_driver_ratings(Ref<drivers::Identity>("game/" + rc.driver), dr);
+            if (g_rating_queue.empty())
+                tm.mark("ratings");
+        }
+    }
     if (g_reset_press_row) {
         g_reset_press_row = false;
         hub::set_option(kAddon, "press_answer", "-"); // ready for the next question
@@ -4967,6 +5004,7 @@ SWOFTY_ON_LOAD
     events::subscribe(SWOFTY_EVENT_RACE_START, [](const SwoftyEvent *, void *) {
         g_track_race = true;
         std::lock_guard lock(g_lock.quiet());
+        g_lights_out = true; // 1.1.52: this session is a race, whatever type the core gave it
         if (g_loaded && settings().on_track) {
             open_feed();
             g_track_told_off = false;
